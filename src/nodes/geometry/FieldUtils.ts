@@ -29,8 +29,17 @@ export class GeometryNodeAccumulateField extends GeoFieldUtil {
   static override bl_idname = 'GeometryNodeAccumulateField';
   static override bl_label = 'Accumulate Field';
   static override properties = {
+    data_type: EnumProperty({
+      items: [
+        ['FLOAT', 'Float', ''],
+        ['INT', 'Integer', ''],
+        ['FLOAT_VECTOR', 'Vector', ''],
+      ],
+      default: 'FLOAT',
+    }),
     domain: EnumProperty({ items: DOMAIN_ITEMS, default: 'POINT' }),
   };
+  declare data_type: 'FLOAT' | 'INT' | 'FLOAT_VECTOR';
   declare domain: string;
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketFloat, 'Value', { default_value: 1 });

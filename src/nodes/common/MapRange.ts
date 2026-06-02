@@ -61,11 +61,31 @@ export class MapRangeNode extends Node {
     }
     return tmn + f * (tmx - tmn);
   }
-  static computeVec(v: Vec3, ...args: unknown[]): Vec3 {
-    // Mapped per-component using the same scalar bounds. (Blender supports
-    // per-channel bounds in the FLOAT_VECTOR variant; this is the common case.)
-    void args;
-    return [v[0], v[1], v[2]];
+  static computeVec(
+    v: Vec3,
+    fmn: Vec3, fmx: Vec3, tmn: Vec3, tmx: Vec3,
+    steps: number, interp: MapRangeNode['interpolation_type'], clamp: boolean,
+  ): Vec3 {
+    return [
+      MapRangeNode.computeFloat(v[0], fmn[0], fmx[0], tmn[0], tmx[0], steps, interp, clamp),
+      MapRangeNode.computeFloat(v[1], fmn[1], fmx[1], tmn[1], tmx[1], steps, interp, clamp),
+      MapRangeNode.computeFloat(v[2], fmn[2], fmx[2], tmn[2], tmx[2], steps, interp, clamp),
+    ] as Vec3;
+  }
+  /**
+   * Per-component vector variant that accepts scalar bounds (the common
+   * Blender case where the same From/To range is applied to all three axes).
+   */
+  static computeVecScalar(
+    v: Vec3,
+    fmn: number, fmx: number, tmn: number, tmx: number,
+    steps: number, interp: MapRangeNode['interpolation_type'], clamp: boolean,
+  ): Vec3 {
+    return [
+      MapRangeNode.computeFloat(v[0], fmn, fmx, tmn, tmx, steps, interp, clamp),
+      MapRangeNode.computeFloat(v[1], fmn, fmx, tmn, tmx, steps, interp, clamp),
+      MapRangeNode.computeFloat(v[2], fmn, fmx, tmn, tmx, steps, interp, clamp),
+    ] as Vec3;
   }
 }
 

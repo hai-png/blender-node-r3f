@@ -5,7 +5,7 @@
  */
 import { Node, type NodeInitContext } from '../../core/Node';
 import { EnumProperty } from '../../core/Properties';
-import type { NodeTreeKind, Vec3 } from '../../core/types';
+import type { NodeTreeKind, Vec3, RGBA } from '../../core/types';
 import {
   NodeSocketBool, NodeSocketColor, NodeSocketFloat, NodeSocketInt, NodeSocketVector,
 } from '../../sockets';
@@ -87,6 +87,28 @@ export class CompareNode extends Node {
       case 'EQUAL': return Math.abs(a - b) <= eps;
       case 'NOT_EQUAL': return Math.abs(a - b) > eps;
     }
+  }
+
+  /** Vector comparison: compares component-wise, returns true if ALL components satisfy. */
+  static computeVec(
+    op: CompareNode['operation'],
+    a: Vec3, b: Vec3, eps = 0,
+  ): boolean {
+    for (let i = 0; i < 3; i++) {
+      if (!CompareNode.compute(op, a[i] ?? 0, b[i] ?? 0, eps)) return false;
+    }
+    return true;
+  }
+
+  /** Color comparison: compares RGBA channels with epsilon tolerance. */
+  static computeColor(
+    op: CompareNode['operation'],
+    a: RGBA, b: RGBA, eps = 0,
+  ): boolean {
+    for (let i = 0; i < 4; i++) {
+      if (!CompareNode.compute(op, a[i] ?? 0, b[i] ?? 0, eps)) return false;
+    }
+    return true;
   }
 }
 

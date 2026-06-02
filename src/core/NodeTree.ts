@@ -10,6 +10,9 @@ import { NodeLink } from './NodeLink';
 import { NodeTreeInterface } from './NodeTreeInterface';
 import { Depsgraph } from '../eval/Depsgraph';
 
+/** Sentinel empty set returned by linksFrom/linksTo for unknown nodes. */
+const EMPTY_LINK_SET: ReadonlySet<NodeLink> = new Set();
+
 export type NodeTreeListener = (tree: NodeTree, ev: NodeTreeEvent) => void;
 export type NodeTreeEvent =
   | { type: 'node_added'; node: Node }
@@ -34,6 +37,70 @@ export class NodeTree {
   private listeners = new Set<NodeTreeListener>();
   private _nameCounter = 0;
 
+  // ---------------------------------------------------------------------\
+  //  Adjacency lists — O(1) per-node fan-out / fan-in lookups.
+  //  Maintained automatically by addLink / removeLink.
+  // ---------------------------------------------------------------------/
+  /** outAdj: node → Set of links originating from that node. */
+  private outAdj = new Map<Node, Set<NodeLink>>();
+  /** inAdj: node → Set of links targeting that node. */
+  private inAdj = new Map<Node, Set<NodeLink>>();
+  /** Zone pair index: zone_id → { input, output }. */
+  private zoneIndex = new Map<string, { input: Node; output: Node }>();
+  /** Name set for O(1) unique-name generation. */
+  private nameSet = new Set<string>();
+
+  private ensureAdj(node: Node): void {
+    if (!this.outAdj.has(node)) this.outAdj.set(node, new Set());
+    if (!this.inAdj.has(node)) this.inAdj.set(node, new Set());
+  }
+
+  /**
+   * Returns all links originating from `node`. O(1) lookup + O(k) iteration
+   * where k = fan-out degree. Replaces `this.links.filter(l => l.from_node === n)`.
+   */
+  linksFrom(node: Node): ReadonlySet<NodeLink> {
+    return this.outAdj.get(node) ?? EMPTY_LINK_SET;
+  }
+
+  /**
+   * Returns all links targeting `node`. O(1) lookup + O(k) iteration.
+   */
+  linksTo(node: Node): ReadonlySet<NodeLink> {
+    return this.inAdj.get(node) ?? EMPTY_LINK_SET;
+  }
+
+  /**
+   * Look up a zone's Input/Output pair by zone_id in O(1).
+   * Replaces the O(n²) findPair() scans in zone nodes.
+   */
+  getZonePair(zone_id: string): { input: Node; output: Node } | undefined {
+    return this.zoneIndex.get(zone_id);
+  }
+
+  /** Rebuild the zone index from scratch (called after node add/remove). */
+  rebuildZoneIndex(): void {
+    this.zoneIndex.clear();
+    const inputs: Node[] = [];
+    const outputs: Node[] = [];
+    for (const n of this.nodes) {
+      const ctor = n.constructor as typeof Node & { node_kind?: string };
+      if (ctor.node_kind === 'ZONE_INPUT') inputs.push(n);
+      else if (ctor.node_kind === 'ZONE_OUTPUT') outputs.push(n);
+    }
+    for (const inp of inputs) {
+      const zid = (inp as unknown as { zone_id?: string }).zone_id;
+      if (!zid) continue;
+      const kind = (inp.constructor as typeof Node & { zone_kind?: string }).zone_kind;
+      const pair = outputs.find((o) => {
+        const ok = (o.constructor as typeof Node & { zone_kind?: string }).zone_kind;
+        const ozid = (o as unknown as { zone_id?: string }).zone_id;
+        return ok === kind && ozid === zid;
+      });
+      if (pair) this.zoneIndex.set(zid, { input: inp, output: pair });
+    }
+  }
+
   constructor(name = 'NodeTree') {
     this.name = name;
     this.depsgraph = new Depsgraph(this);
@@ -46,11 +113,17 @@ export class NodeTree {
   addNode<N extends Node>(NodeCls: NodeCtor<N>, init?: Partial<N>): N {
     const node = new NodeCls();
     node.tree = this;
-    node.name = init?.name ?? this.uniqueName(NodeCls.bl_label);
+    const name = init?.name ?? this.uniqueName(NodeCls.bl_label);
+    node.name = name;
+    this.nameSet.add(name);
     if (init?.location) node.location = init.location;
     if (init?.label) node.label = init.label;
     node.init({ tree: this });
     this.nodes.push(node);
+    this.ensureAdj(node);
+    // Rebuild zone index if this is a zone node.
+    const kind = (node.constructor as typeof Node & { node_kind?: string }).node_kind;
+    if (kind === 'ZONE_INPUT' || kind === 'ZONE_OUTPUT') this.rebuildZoneIndex();
     this.emit({ type: 'node_added', node });
     this.depsgraph.invalidate(node);
     return node;
@@ -58,21 +131,33 @@ export class NodeTree {
 
   removeNode(node: Node): void {
     // remove dependent links first
-    const dependent = this.links.filter((l) => l.from_node === node || l.to_node === node);
-    for (const l of dependent) this.removeLink(l);
+    const dependent = [...(this.outAdj.get(node) ?? []), ...(this.inAdj.get(node) ?? [])];
+    const seen = new Set<NodeLink>();
+    for (const l of dependent) {
+      if (seen.has(l)) continue;
+      seen.add(l);
+      this.removeLink(l);
+    }
     const idx = this.nodes.indexOf(node);
     if (idx >= 0) {
       this.nodes.splice(idx, 1);
+      this.outAdj.delete(node);
+      this.inAdj.delete(node);
+      this.nameSet.delete(node.name);
       node.free?.();
+      // Rebuild zone index if a zone node was removed.
+      const kind = (node.constructor as typeof Node & { node_kind?: string }).node_kind;
+      if (kind === 'ZONE_INPUT' || kind === 'ZONE_OUTPUT') this.rebuildZoneIndex();
       this.emit({ type: 'node_removed', node });
     }
   }
 
   private uniqueName(base: string): string {
     let candidate = base;
-    while (this.nodes.some((n) => n.name === candidate)) {
-      this._nameCounter += 1;
-      candidate = `${base}.${String(this._nameCounter).padStart(3, '0')}`;
+    let counter = 0;
+    while (this.nameSet.has(candidate)) {
+      counter += 1;
+      candidate = `${base}.${String(counter).padStart(3, '0')}`;
     }
     return candidate;
   }
@@ -108,6 +193,11 @@ export class NodeTree {
     this.links.push(link);
     from.links.push(link);
     to.links.push(link);
+    // Maintain adjacency lists.
+    this.ensureAdj(from.node);
+    this.ensureAdj(to.node);
+    this.outAdj.get(from.node)!.add(link);
+    this.inAdj.get(to.node)!.add(link);
     // Zone membership is structural. Adding a link can make existing nodes
     // enter/leave a zone, so refresh every link flag after the topology edit.
     this.recomputeZoneEscapes();
@@ -127,6 +217,8 @@ export class NodeTree {
    * Blender forbids graph cycles at edit-time. A new edge `fromNode -> toNode`
    * would create a cycle iff `toNode` can already reach `fromNode` through the
    * current valid link topology.
+   *
+   * Uses adjacency lists for O(k) per-node iteration instead of O(E) scan.
    */
   private wouldCreateCycle(fromNode: Node, toNode: Node): boolean {
     if (fromNode === toNode) return true;
@@ -134,8 +226,9 @@ export class NodeTree {
     const stack: Node[] = [toNode];
     while (stack.length) {
       const n = stack.pop()!;
-      for (const l of this.links) {
-        if (l.from_node !== n) continue;
+      const out = this.outAdj.get(n);
+      if (!out) continue;
+      for (const l of out) {
         if (!l.is_valid || l.escapes_zone) continue;
         if (l.to_node === fromNode) return true;
         if (!seen.has(l.to_node)) {
@@ -176,34 +269,25 @@ export class NodeTree {
     if (ctor.node_kind === 'ZONE_INPUT' || ctor.node_kind === 'ZONE_OUTPUT') {
       return (node as unknown as { zone_id?: string }).zone_id;
     }
-    for (const candidate of this.nodes) {
-      const cc = candidate.constructor as typeof Node & { node_kind?: string };
-      if (cc.node_kind !== 'ZONE_INPUT') continue;
-      const zid = (candidate as unknown as { zone_id?: string }).zone_id;
-      if (!zid) continue;
-      const pair = this.nodes.find((p) => {
-        const pc = p.constructor as typeof Node & { node_kind?: string };
-        return pc.node_kind === 'ZONE_OUTPUT'
-          && (pc as unknown as { zone_kind?: string }).zone_kind === (cc as unknown as { zone_kind?: string }).zone_kind
-          && (p as unknown as { zone_id?: string }).zone_id === zid;
-      });
-      if (!pair) continue;
-      if (this.isReachableForward(candidate, node) && this.isReachableBackward(pair, node)) {
+    // Use the pre-built zone index instead of scanning all nodes.
+    for (const [zid, { input, output }] of this.zoneIndex) {
+      if (this.isReachableForward(input, node) && this.isReachableBackward(output, node)) {
         return zid;
       }
     }
     return undefined;
   }
 
-  /** DFS: is `target` reachable forward from `from`? */
+  /** DFS: is `target` reachable forward from `from`? Uses adjacency lists. */
   private isReachableForward(from: Node, target: Node): boolean {
     if (from === target) return true;
     const seen = new Set<Node>([from]);
     const stack: Node[] = [from];
     while (stack.length) {
       const n = stack.pop()!;
-      for (const l of this.links) {
-        if (l.from_node !== n) continue;
+      const out = this.outAdj.get(n);
+      if (!out) continue;
+      for (const l of out) {
         if (l.to_node === target) return true;
         if (!seen.has(l.to_node)) { seen.add(l.to_node); stack.push(l.to_node); }
       }
@@ -216,8 +300,9 @@ export class NodeTree {
     const stack: Node[] = [from];
     while (stack.length) {
       const n = stack.pop()!;
-      for (const l of this.links) {
-        if (l.to_node !== n) continue;
+      const inc = this.inAdj.get(n);
+      if (!inc) continue;
+      for (const l of inc) {
         if (l.from_node === target) return true;
         if (!seen.has(l.from_node)) { seen.add(l.from_node); stack.push(l.from_node); }
       }
@@ -254,7 +339,8 @@ export class NodeTree {
     }
     const input = this.addNode(InputCls as unknown as Parameters<typeof this.addNode>[0]);
     const output = this.addNode(OutputCls as unknown as Parameters<typeof this.addNode>[0]);
-    // Share zone_id from input to output.
+    // Share zone_id from input to output — already done by addNode's rebuildZoneIndex,
+    // but ensure it's synced explicitly too.
     const zid = (input as unknown as { zone_id: string }).zone_id;
     (output as unknown as { zone_id: string }).zone_id = zid;
     output.location = [input.location[0] + 320, input.location[1]];
@@ -281,6 +367,9 @@ export class NodeTree {
     if (fi >= 0) link.from_socket.links.splice(fi, 1);
     const ti = link.to_socket.links.indexOf(link);
     if (ti >= 0) link.to_socket.links.splice(ti, 1);
+    // Clean adjacency lists.
+    this.outAdj.get(link.from_node)?.delete(link);
+    this.inAdj.get(link.to_node)?.delete(link);
     this.recomputeZoneEscapes();
     this.emit({ type: 'link_removed', link });
     this.depsgraph.invalidate(link.to_node);
@@ -313,19 +402,19 @@ export class NodeTree {
     while (queue.length) {
       const n = queue.shift()!;
       out.push(n);
-      for (const l of this.links) {
-        if (l.from_node !== n) continue;
-        if (!l.is_valid || l.is_muted || l.escapes_zone) continue;
-        const d = (indegree.get(l.to_node) ?? 0) - 1;
-        indegree.set(l.to_node, d);
-        if (d === 0) queue.push(l.to_node);
+      const adj = this.outAdj.get(n);
+      if (adj) {
+        for (const l of adj) {
+          if (!l.is_valid || l.is_muted || l.escapes_zone) continue;
+          const d = (indegree.get(l.to_node) ?? 0) - 1;
+          indegree.set(l.to_node, d);
+          if (d === 0) queue.push(l.to_node);
+        }
       }
     }
     if (out.length !== this.nodes.length) {
-      // Collect nodes that are part of a cycle (still have indegree > 0).
       const cycleNodes = this.nodes.filter((n) => !out.includes(n));
       out.cycleNodes = cycleNodes;
-      // Append them so evaluation can continue (with limited correctness).
       for (const n of cycleNodes) out.push(n);
     }
     return out;
@@ -398,6 +487,10 @@ export class NodeTree {
       }
     }
     this.listeners.clear();
+    this.outAdj.clear();
+    this.inAdj.clear();
+    this.zoneIndex.clear();
+    this.nameSet.clear();
     this.depsgraph.dispose();
   }
 

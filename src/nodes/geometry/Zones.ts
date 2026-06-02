@@ -16,6 +16,7 @@ import { nanoid } from 'nanoid';
 import { Node, type NodeInitContext } from '../../core/Node';
 import { EnumProperty, IntProperty, StringProperty } from '../../core/Properties';
 import type { NodeTreeKind } from '../../core/types';
+import type { NodeTree } from '../../core/NodeTree';
 import { NodeRegistry } from '../../registry/NodeRegistry';
 import type { ZoneKind, ZoneStateItem } from '../../eval/zones/types';
 import {
@@ -65,10 +66,17 @@ abstract class GeoZoneInputBase extends Node {
     this.findPair()?.rebuildSockets();
   }
 
-  /** Locate the Output partner of this zone (by zone_id) within the same tree. */
+  /** Locate the Output partner of this zone (by zone_id) within the same tree.
+   *  Uses O(1) zone index on NodeTree, falls back to O(n) scan. */
   findPair(): GeoZoneOutputBase | undefined {
-    const tree = (this as unknown as { tree?: { nodes: Node[] } }).tree;
+    const tree = (this as unknown as { tree?: NodeTree & { getZonePair?(id: string): { input: Node; output: Node } | undefined } }).tree;
     if (!tree) return undefined;
+    // Fast path: O(1) lookup via adjacency index.
+    if (typeof tree.getZonePair === 'function') {
+      const pair = tree.getZonePair(this.zone_id);
+      if (pair) return pair.output as GeoZoneOutputBase;
+    }
+    // Fallback: O(n) scan (for trees that haven't been upgraded).
     const myKind = (this.constructor as typeof GeoZoneInputBase).zone_kind;
     return tree.nodes.find((n): n is GeoZoneOutputBase =>
       (n.constructor as typeof Node & { node_kind?: string }).node_kind === 'ZONE_OUTPUT'
@@ -118,10 +126,16 @@ abstract class GeoZoneOutputBase extends Node {
     this.rebuildSockets();
   }
 
-  /** Locate the Input partner of this zone. */
+  /** Locate the Input partner of this zone. Uses O(1) zone index when available. */
   findPair(): GeoZoneInputBase | undefined {
-    const tree = (this as unknown as { tree?: { nodes: Node[] } }).tree;
+    const tree = (this as unknown as { tree?: NodeTree & { getZonePair?(id: string): { input: Node; output: Node } | undefined } }).tree;
     if (!tree) return undefined;
+    // Fast path: O(1) lookup.
+    if (typeof tree.getZonePair === 'function') {
+      const pair = tree.getZonePair(this.zone_id);
+      if (pair) return pair.input as GeoZoneInputBase;
+    }
+    // Fallback.
     const myKind = (this.constructor as typeof GeoZoneOutputBase).zone_kind;
     return tree.nodes.find((n): n is GeoZoneInputBase =>
       (n.constructor as typeof Node & { node_kind?: string }).node_kind === 'ZONE_INPUT'
