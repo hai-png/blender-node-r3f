@@ -8,4 +8,5 @@ export {
   registerEmit,
   type TSLMaterialDescriptor,
   type TSLNode,
+  type TSLShaderEvaluatorOptions,
 } from './eval/tsl/TSLShaderEvaluator';

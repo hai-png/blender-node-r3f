@@ -2,6 +2,8 @@
 
 Implementation order, sized so each milestone is independently demoable.
 
+> **Baseline note (2026-06-02):** current verified state is **90 smoke tests passing**, strict `tsc` clean, and `vite build` clean. See [`PHASE0_AUDIT_2026-06-02.md`](./PHASE0_AUDIT_2026-06-02.md) for the authoritative current audit; this roadmap describes milestone intent plus what still remains to close.
+
 ## M0 — Foundations (this commit)
 - Project scaffold, TypeScript strict, Vite app
 - `core/`: NodeTree, Node, NodeSocket, NodeLink, NodeTreeInterface, Properties
@@ -94,8 +96,13 @@ Implementation order, sized so each milestone is independently demoable.
     (eval-preserving round-trip, verified by a smoke test).
   - `autoLayout(tree)` — topological-depth column layout.
 - 3 smoke tests (autoLayout ordering, undo/redo, makeGroup↔ungroup parity).
-- Still TODO (UI chrome): copy/paste, multi-select marquee, search palette,
-  theming presets, wiring these operators to toolbar buttons + keyboard.
+- Since the original milestone write-up, the editor also gained **copy/paste**,
+  **search/filter in AddMenu**, and core **keyboard shortcuts** (undo/redo,
+  auto-layout, mute, hide, add-menu).
+- Still TODO (UI chrome / app wiring): surface **makeGroup/ungroup** in the
+  editor toolbar, improve multi-select / marquee workflows, add a dedicated
+  inspector/properties panel, preserve per-tree edits when switching demo tree
+  types, and finish theming / polish.
 
 ## Cross-cutting completed in this pass
 - **Group nodes** now recursively evaluate in **all** systems (geometry,
@@ -110,8 +117,13 @@ Implementation order, sized so each milestone is independently demoable.
 - **Compositor** completed to its M5 ship list (Color Ramp, Map Range,
   Combine/Separate Color, Posterize, Z Combine, Split Viewer) + a **CPU
   evaluator** (`cpuComposite`) so pixel math is verified headlessly.
+- **Cycle detection/reporting**: `NodeTree.topoOrder()` annotates cycle nodes
+  and `Depsgraph.evaluate()` surfaces a `__cycle__` error instead of failing
+  silently.
 - **Build hygiene**: `tsc --noEmit` in build, `dist*` git-ignored, `LICENSE`
   (MIT) added.
+- **Current limitation**: depsgraph dirty tracking exists, but evaluators still
+  perform full-tree evaluation rather than true incremental re-execution.
 
 ## Out of scope (documented, not planned)
 - Volume / OpenVDB geometry nodes (sparse grids, level sets, advection).

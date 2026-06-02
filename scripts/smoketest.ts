@@ -6,8 +6,10 @@
  * Builds several example trees, evaluates them, asserts the results, then
  * round-trips them through the JSON bridge and re-evaluates.
  *
- * Doesn't import the TSL evaluator (it depends on three/webgpu which needs
- * a browser GPU). The TSL graph emit logic is exercised in the demo.
+ * Mostly avoids the TSL evaluator because it depends on `three/webgpu`, but
+ * a small number of targeted smoke tests dynamically import it with minimal
+ * Node polyfills (`self`, `navigator`) so emitter coverage can still be
+ * checked headlessly.
  */
 /* eslint-disable no-console */
 import {
@@ -82,6 +84,16 @@ function eq<T>(a: T, b: T, msg: string): void {
 }
 function close(a: number, b: number, eps: number, msg: string): void {
   if (Math.abs(a - b) > eps) throw new Error(`${msg}: expected ~${b}, got ${a}`);
+}
+
+async function makeTSLEvaluator(
+  opts: ConstructorParameters<typeof import('../src/tsl').TSLShaderEvaluator>[0] = {},
+): Promise<import('../src/tsl').TSLShaderEvaluator> {
+  const g = globalThis as unknown as { self?: unknown; navigator?: unknown };
+  if (g.self === undefined) g.self = globalThis;
+  if (g.navigator === undefined) g.navigator = { gpu: undefined };
+  const mod = await import('../src/tsl');
+  return new mod.TSLShaderEvaluator(opts);
 }
 
 // ------------------------------ Shader ---------------------------------
@@ -1600,6 +1612,177 @@ test('shader: ShaderNodeValToRGB with custom stops uses real interpolation', asy
   close(desc.color[1]!, 0, 0.05, 'ValToRGB at t=1 → green channel ≈ 0');
 });
 
+test('tsl: shader input emitters produce meaningful nodes', async () => {
+  const ev = await makeTSLEvaluator();
+
+  // Attribute.Color -> Principled Base Color should no longer collapse to a
+  // literal float fallback.
+  {
+    const t = new ShaderNodeTree('tsl-attr');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const attr = t.addNode(NodeRegistry.getNode('ShaderNodeAttribute')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(attr.outputs.find((s) => s.identifier === 'Color')!, bsdf.inputs[0]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(attr.id), 'TSL Attribute emitter evaluates without error');
+    const desc = (r.output as { descriptor: { colorNode?: { nodeType?: string } } }).descriptor;
+    assert(desc.colorNode?.nodeType && desc.colorNode.nodeType !== 'float', `Attribute color should not fall back to float, got ${desc.colorNode?.nodeType}`);
+  }
+
+  // LightPath.Is Camera Ray should emit a constant 1, not the literal default 0 fallback.
+  {
+    const t = new ShaderNodeTree('tsl-lightpath');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const lp = t.addNode(NodeRegistry.getNode('ShaderNodeLightPath')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(lp.outputs.find((s) => s.identifier === 'Is Camera Ray')!, bsdf.inputs[2]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(lp.id), 'TSL LightPath emitter evaluates without error');
+    const desc = (r.output as { descriptor: { roughnessNode?: { value?: number } } }).descriptor;
+    eq(desc.roughnessNode?.value, 1, 'LightPath Is Camera Ray emits const 1');
+  }
+
+  // CameraData.View Distance should be a live expression node, not a literal fallback.
+  {
+    const t = new ShaderNodeTree('tsl-cameradata');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const cam = t.addNode(NodeRegistry.getNode('ShaderNodeCameraData')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(cam.outputs.find((s) => s.identifier === 'View Distance')!, bsdf.inputs[2]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(cam.id), 'TSL CameraData emitter evaluates without error');
+    const desc = (r.output as { descriptor: { roughnessNode?: { constructor?: { name?: string }; value?: number } } }).descriptor;
+    assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0, 'CameraData.View Distance is not the zero fallback');
+  }
+
+  // LayerWeight.Fresnel should also become a real expression.
+  {
+    const t = new ShaderNodeTree('tsl-layerweight');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const lw = t.addNode(NodeRegistry.getNode('ShaderNodeLayerWeight')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(lw.outputs.find((s) => s.identifier === 'Fresnel')!, bsdf.inputs[2]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(lw.id), 'TSL LayerWeight emitter evaluates without error');
+    const desc = (r.output as { descriptor: { roughnessNode?: { constructor?: { name?: string }; value?: number } } }).descriptor;
+    assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0, 'LayerWeight.Fresnel is not the zero fallback');
+  }
+
+  // ObjectInfo.Random should be a real expression node, not a zero constant fallback.
+  {
+    const t = new ShaderNodeTree('tsl-objectinfo');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const info = t.addNode(NodeRegistry.getNode('ShaderNodeObjectInfo')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(info.outputs.find((s) => s.identifier === 'Random')!, bsdf.inputs[2]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(info.id), 'TSL ObjectInfo emitter evaluates without error');
+    const desc = (r.output as { descriptor: { roughnessNode?: { constructor?: { name?: string }; value?: number } } }).descriptor;
+    assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0, 'ObjectInfo.Random is not the zero fallback');
+  }
+});
+
+test('tsl: missing texture emitters produce non-float color nodes', async () => {
+  const ev = await makeTSLEvaluator();
+  const ids = [
+    'ShaderNodeTexImage',
+    'ShaderNodeTexEnvironment',
+    'ShaderNodeTexVoronoi',
+    'ShaderNodeTexWave',
+    'ShaderNodeTexBrick',
+    'ShaderNodeTexMagic',
+  ];
+  for (const id of ids) {
+    const t = new ShaderNodeTree(`tsl-${id}`);
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const tex = t.addNode(NodeRegistry.getNode(id)! as Parameters<typeof t.addNode>[0]);
+    const colorOut = tex.outputs.find((s) => s.identifier === 'Color') ?? tex.outputs[0]!;
+    t.addLink(colorOut, bsdf.inputs[0]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(tex.id), `${id} evaluates in TSL without error`);
+    const desc = (r.output as { descriptor: { colorNode?: { nodeType?: string | null; constructor?: { name?: string }; value?: number } } }).descriptor;
+    const nodeType = desc.colorNode?.nodeType;
+    const ctor = desc.colorNode?.constructor?.name;
+    assert((nodeType !== 'float') && (ctor !== 'ConstNode' || nodeType === 'vec4'), `${id} color output should not fall back to float`);
+  }
+});
+
+test('tsl: world and light outputs are recognized as roots', async () => {
+  const ev = await makeTSLEvaluator();
+
+  {
+    const t = new ShaderNodeTree('tsl-world-output');
+    const worldOut = t.addNode(NodeRegistry.getNode('ShaderNodeOutputWorld')! as Parameters<typeof t.addNode>[0]);
+    const bg = t.addNode(NodeRegistry.getNode('ShaderNodeBackground')! as Parameters<typeof t.addNode>[0]);
+    t.addLink(bg.outputs[0]!, worldOut.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(bg.id), 'TSL World Output path evaluates without error');
+    const desc = (r.output as { descriptor: { emissiveNode?: unknown } }).descriptor;
+    assert(desc.emissiveNode !== undefined, 'World Output uses Background closure as root');
+  }
+
+  {
+    const t = new ShaderNodeTree('tsl-light-output');
+    const lightOut = t.addNode(NodeRegistry.getNode('ShaderNodeOutputLight')! as Parameters<typeof t.addNode>[0]);
+    const em = t.addNode(ShaderNodeEmission);
+    t.addLink(em.outputs[0]!, lightOut.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has(em.id), 'TSL Light Output path evaluates without error');
+    const desc = (r.output as { descriptor: { emissiveNode?: unknown } }).descriptor;
+    assert(desc.emissiveNode !== undefined, 'Light Output uses Surface closure as root');
+  }
+});
+
+test('tsl: image/environment texture resolvers are called when sources are set', async () => {
+  const THREE = await import('three');
+  const data = new Uint8Array([255, 0, 0, 255]);
+  const tex = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+  tex.needsUpdate = true;
+  const calls: Array<string> = [];
+  const ev = await makeTSLEvaluator({
+    resolveTexture: (key, kind) => {
+      calls.push(`${kind}:${key}`);
+      return tex;
+    },
+  });
+
+  {
+    const t = new ShaderNodeTree('tsl-image-resolver');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const image = t.addNode(NodeRegistry.getNode('ShaderNodeTexImage')! as Parameters<typeof t.addNode>[0]) as unknown as { image_src: string; outputs: typeof bsdf.outputs };
+    image.image_src = 'demo-image';
+    const colorOut = image.outputs.find((s) => s.identifier === 'Color')!;
+    t.addLink(colorOut, bsdf.inputs[0]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has((image as unknown as { id: string }).id), 'TSL image resolver path evaluates without error');
+  }
+
+  {
+    const t = new ShaderNodeTree('tsl-env-resolver');
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+    const env = t.addNode(NodeRegistry.getNode('ShaderNodeTexEnvironment')! as Parameters<typeof t.addNode>[0]) as unknown as { image_src: string; outputs: typeof bsdf.outputs };
+    env.image_src = 'demo-env';
+    const colorOut = env.outputs.find((s) => s.identifier === 'Color')!;
+    t.addLink(colorOut, bsdf.inputs[0]!);
+    t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+    const r = ev.evaluate(t, new Set());
+    assert(!r.errors.has((env as unknown as { id: string }).id), 'TSL environment resolver path evaluates without error');
+  }
+
+  assert(calls.includes('IMAGE:demo-image'), 'TSL image texture resolver called');
+  assert(calls.includes('ENVIRONMENT:demo-env'), 'TSL environment texture resolver called');
+});
+
 // --------------------- Phase 4: Compositor completion ------------------
 test('compositor CPU: ColorBalance brightens shadows (gain > 1)', () => {
   bootstrapBuiltins();
@@ -1725,7 +1908,6 @@ test('geom: FillCurve stub returns empty geometry', () => {
 
 test('geom: FilletCurve stub passes geometry through', () => {
   bootstrapBuiltins();
-  const { GeometryNodeFilletCurve } = require('../src/nodes/geometry/Ops');
   const t = new GeometryNodeTree('fillet-curve');
   t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
   const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);

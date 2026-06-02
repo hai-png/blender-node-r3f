@@ -9,7 +9,8 @@
     "build": "tsc -p . --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p . --noEmit",
-    "test": "tsx scripts/smoketest.ts"
+    "test": "tsx scripts/smoketest.ts",
+    "ci": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@react-three/drei": "^9.114.0",

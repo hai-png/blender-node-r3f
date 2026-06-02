@@ -37,6 +37,7 @@ import type { NodeTree } from '../../core/NodeTree';
 import type { Node } from '../../core/Node';
 import type { NodeSocket } from '../../core/NodeSocket';
 import type { SystemEvaluator, EvaluationResult } from '../Depsgraph';
+import type { Texture } from 'three';
 
 // Lazy import — only loaded by callers that pass `useTSL=true` to bootstrap.
 // Note: importing 'three/tsl' pulls in the WebGPU node system; the demo's
@@ -65,11 +66,75 @@ export interface TSLMaterialDescriptor {
   alphaTest?: TSLNode;
 }
 
-const { float, vec3, vec4, color, uv, positionLocal, positionWorld, normalWorld, mix, mul, add, sub } = TSL;
+const {
+  float, vec2, vec3, vec4, color, uv, positionLocal, positionWorld, normalWorld,
+  mix, mul, add, sub, cameraPosition, reflectVector, texture: textureNode,
+} = TSL;
 
 /* ---------------------------------------------------------------- */
 /*  Small TSL vector helpers                                         */
 /* ---------------------------------------------------------------- */
+function toVec3(v: TSLNode): TSLNode {
+  if (v?.xyz) return v.xyz;
+  if (v?.z !== undefined) return vec3(v.x, v.y, v.z);
+  if (v?.y !== undefined) return vec3(v.x, v.y, 0);
+  return vec3(v, v, v);
+}
+function scalarInputOr(node: Node, index: number, ctx: EmitContext, fallback: number): TSLNode {
+  const sock = node.inputs[index];
+  if (!sock) return float(fallback);
+  if (sock.is_linked) return ctx.input(sock);
+  if (typeof sock.default_value === 'number') return float(sock.default_value);
+  return float(fallback);
+}
+function vectorInputOr(node: Node, index: number, ctx: EmitContext, fallback: TSLNode): TSLNode {
+  const sock = node.inputs[index];
+  if (!sock) return fallback;
+  if (sock.is_linked) return toVec3(ctx.input(sock));
+  if (Array.isArray(sock.default_value) && sock.default_value.length >= 3) {
+    return vec3(sock.default_value[0]!, sock.default_value[1]!, sock.default_value[2]!);
+  }
+  return fallback;
+}
+function hash1(v: TSLNode): TSLNode {
+  return toVec3(v).dot(vec3(127.1, 311.7, 74.7)).sin().mul(43758.5453).fract();
+}
+function hash3(v: TSLNode): TSLNode {
+  const p = toVec3(v);
+  return vec3(
+    hash1(p.add(vec3(0.0, 0.0, 0.0))),
+    hash1(p.add(vec3(19.19, 73.42, 11.17))),
+    hash1(p.add(vec3(47.11, 3.17, 29.53))),
+  );
+}
+function viewVectorWorld(): TSLNode {
+  return cameraPosition.sub(positionWorld).normalize();
+}
+function viewDistanceWorld(): TSLNode {
+  return cameraPosition.sub(positionWorld).length();
+}
+function generatedVector(node: Node, index: number, ctx: EmitContext): TSLNode {
+  return vectorInputOr(node, index, ctx, positionLocal);
+}
+function wrapUv(u: TSLNode, v: TSLNode, extension: string): TSLNode {
+  switch (extension) {
+    case 'CLIP':
+    case 'EXTEND':
+      return vec2(u.clamp(0, 1), v.clamp(0, 1));
+    case 'MIRROR': {
+      const mu = float(1).sub(u.fract().mul(2).sub(1).abs());
+      const mv = float(1).sub(v.fract().mul(2).sub(1).abs());
+      return vec2(mu, mv);
+    }
+    default:
+      return vec2(u.fract(), v.fract());
+  }
+}
+function sampleResolvedTexture(ctx: EmitContext, key: string, kind: 'IMAGE' | 'ENVIRONMENT', uvNode: TSLNode): TSLNode | null {
+  const tex = ctx.resolveTexture?.(key, kind) ?? null;
+  if (!tex) return null;
+  return textureNode(tex, uvNode);
+}
 function rotateX(v: TSLNode, a: TSLNode): TSLNode {
   const c = a.cos(), s = a.sin();
   return vec3(v.x, v.y.mul(c).sub(v.z.mul(s)), v.y.mul(s).add(v.z.mul(c)));
@@ -96,10 +161,16 @@ function rotateAxisAngle(v: TSLNode, axisIn: TSLNode, angle: TSLNode): TSLNode {
 /* ---------------------------------------------------------------- */
 type Cache = Map<string /* socket.id */, TSLNode>;
 type EmitFn = (node: Node, ctx: EmitContext) => Record<string, TSLNode>;
+export interface TSLShaderEvaluatorOptions {
+  /** Optional texture hook for ShaderNodeTexImage / ShaderNodeTexEnvironment. */
+  resolveTexture?: (key: string, kind: 'IMAGE' | 'ENVIRONMENT') => Texture | null;
+}
 interface EmitContext {
   cache: Cache;
   /** Resolve an input socket to its TSL node (or default literal). */
   input: (socket: NodeSocket) => TSLNode;
+  /** Optional texture resolver for real sampled image/environment nodes. */
+  resolveTexture?: (key: string, kind: 'IMAGE' | 'ENVIRONMENT') => Texture | null;
 }
 
 const EMITTERS = new Map<string, EmitFn>();
@@ -124,6 +195,9 @@ registerEmit('ShaderNodeRGB', (n) => {
   const c = (n as unknown as { rgb: number[] }).rgb;
   return { Color: vec4(c[0]!, c[1]!, c[2]!, c[3] ?? 1) };
 });
+registerEmit('ShaderNodeOutputMaterial', () => ({}));
+registerEmit('ShaderNodeOutputWorld', () => ({}));
+registerEmit('ShaderNodeOutputLight', () => ({}));
 registerEmit('FunctionNodeInputVector', (n) => {
   const v = (n as unknown as { vector: number[] }).vector;
   return { Vector: vec3(v[0]!, v[1]!, v[2]!) };
@@ -310,12 +384,69 @@ registerEmit('ShaderNodeNewGeometry', () => ({
 }));
 registerEmit('ShaderNodeFresnel', (n, c) => {
   const ior = c.input(n.inputs[0]!);
+  const normalIn = n.inputs[1]?.is_linked ? toVec3(c.input(n.inputs[1]!)) : normalWorld;
   // Schlick approximation: f0 = ((1-ior)/(1+ior))^2
   const f0 = sub(float(1), ior).div(add(float(1), ior)).pow(2);
-  // 1 - dot(N, V)  using world normal as a stand-in
-  const fac = float(1).sub(normalWorld.dot(positionWorld.normalize().negate()).max(0));
+  const ndv = normalIn.normalize().dot(viewVectorWorld()).clamp(0, 1);
+  const fac = float(1).sub(ndv);
   return { Fac: f0.add(fac.pow(5).mul(float(1).sub(f0))) };
 });
+registerEmit('ShaderNodeAttribute', () => {
+  const u = uv();
+  const fac = u.x;
+  return {
+    Color: vec4(u.x, u.y, float(1).sub(u.x), 1),
+    Vector: vec3(u.x, u.y, 0),
+    Fac: fac,
+    Alpha: float(1),
+  };
+});
+registerEmit('ShaderNodeLayerWeight', (n, c) => {
+  const blend = scalarInputOr(n, 0, c, 0.5).clamp(0, 1);
+  const normalIn = n.inputs[1]?.is_linked ? toVec3(c.input(n.inputs[1]!)) : normalWorld;
+  const ndv = normalIn.normalize().dot(viewVectorWorld()).clamp(0, 1);
+  const exponent = float(1).add(blend.mul(4));
+  const facing = ndv.pow(exponent);
+  const fresnel = float(1).sub(facing);
+  return { Fresnel: fresnel, Facing: facing };
+});
+registerEmit('ShaderNodeObjectInfo', () => {
+  const loc = positionLocal;
+  const tint = hash3(positionLocal.floor().add(vec3(1, 3, 5))).mul(0.6).add(vec3(0.2, 0.2, 0.2));
+  const rand = hash1(positionLocal.add(vec3(17.0, 29.0, 47.0)));
+  return {
+    Location: loc,
+    Color: vec4(tint, 1),
+    Alpha: float(1),
+    'Object Index': float(0),
+    'Material Index': float(0),
+    Random: rand,
+  };
+});
+registerEmit('ShaderNodeCameraData', () => {
+  const viewVec = viewVectorWorld();
+  const delta = cameraPosition.sub(positionWorld);
+  return {
+    'View Vector': viewVec,
+    'View Z Depth': delta.z.abs(),
+    'View Distance': delta.length(),
+  };
+});
+registerEmit('ShaderNodeLightPath', () => ({
+  'Is Camera Ray': float(1),
+  'Is Shadow Ray': float(0),
+  'Is Diffuse Ray': float(0),
+  'Is Glossy Ray': float(0),
+  'Is Singular Ray': float(0),
+  'Is Reflection Ray': float(0),
+  'Is Transmission Ray': float(0),
+  'Ray Length': viewDistanceWorld(),
+  'Ray Depth': float(0),
+  'Diffuse Depth': float(0),
+  'Glossy Depth': float(0),
+  'Transparent Depth': float(0),
+  'Transmission Depth': float(0),
+}));
 
 /* ---------------------------------------------------------------- */
 /*  Procedural textures                                             */
@@ -338,6 +469,34 @@ registerEmit('ShaderNodeTexNoise', (n, c) => {
   }
   return { Fac: noise, Color: vec4(noise, noise, noise, 1) };
 });
+registerEmit('ShaderNodeTexVoronoi', (n, c) => {
+  const p = generatedVector(n, 0, c).mul(scalarInputOr(n, 1, c, 5));
+  const cell = p.floor();
+  const local = p.fract().sub(vec3(0.5, 0.5, 0.5));
+  const randomness = scalarInputOr(n, 4, c, 1).clamp(0, 1);
+  const jitter = hash3(cell).sub(vec3(0.5, 0.5, 0.5)).mul(randomness);
+  const position = cell.add(jitter);
+  const delta = local.sub(jitter);
+  const distance = delta.length().clamp(0, 1);
+  return {
+    Distance: distance,
+    Color: vec4(hash3(cell), 1),
+    Position: position,
+  };
+});
+registerEmit('ShaderNodeTexWave', (n, c) => {
+  const p = generatedVector(n, 0, c);
+  const scale = scalarInputOr(n, 1, c, 5);
+  const distortion = scalarInputOr(n, 2, c, 0);
+  const phase = scalarInputOr(n, 6, c, 0);
+  const waveType = (n as unknown as { wave_type?: string }).wave_type ?? 'BANDS';
+  const base = waveType === 'RINGS'
+    ? p.length().mul(scale)
+    : p.x.add(p.y).add(p.z).mul(scale.mul(0.3333));
+  const wobble = hash1(p.mul(scale).floor()).mul(distortion);
+  const fac = base.add(wobble).add(phase).mul(Math.PI * 2).sin().mul(0.5).add(0.5).clamp(0, 1);
+  return { Color: vec4(fac, fac, fac, 1), Fac: fac };
+});
 
 registerEmit('ShaderNodeTexChecker', (n, c) => {
   const v = c.input(n.inputs[0]!);
@@ -349,6 +508,26 @@ registerEmit('ShaderNodeTexChecker', (n, c) => {
   const c2 = c.input(n.inputs[2]!);
   const result = mix(c1, c2, parity);
   return { Color: result, Fac: parity };
+});
+registerEmit('ShaderNodeTexBrick', (n, c) => {
+  const p = generatedVector(n, 0, c);
+  const scale = scalarInputOr(n, 4, c, 5);
+  const mortarSize = scalarInputOr(n, 5, c, 0.02).clamp(0.0001, 0.45);
+  const mortarSmooth = scalarInputOr(n, 6, c, 0).max(0.0001);
+  const rowHeight = scalarInputOr(n, 9, c, 0.25).max(0.0001);
+  const brickWidth = scalarInputOr(n, 8, c, 0.5).max(0.0001);
+  const pp = vec3(p.x.div(brickWidth), p.y.div(rowHeight), p.z).mul(scale);
+  const row = pp.y.floor();
+  const brickX = pp.x.add(row.mod(2).mul(0.5));
+  const cell = vec3(brickX.floor(), row, 0);
+  const local = vec3(brickX.fract(), pp.y.fract(), 0);
+  const edge = local.x.min(float(1).sub(local.x)).min(local.y.min(float(1).sub(local.y)));
+  const brickMask = edge.smoothstep(mortarSize, mortarSize.add(mortarSmooth));
+  const parity = cell.x.add(cell.y).mod(2).abs();
+  const brickColor = mix(c.input(n.inputs[1]!), c.input(n.inputs[2]!), parity);
+  const mortarColor = c.input(n.inputs[3]!);
+  const out = mix(mortarColor, brickColor, brickMask);
+  return { Color: out, Fac: brickMask };
 });
 
 registerEmit('ShaderNodeTexGradient', (n, c) => {
@@ -372,6 +551,48 @@ registerEmit('ShaderNodeTexWhiteNoise', (n, c) => {
   const v = c.input(n.inputs[0]!);
   const seed = v.dot(vec3(127.1, 311.7, 74.7)).sin().mul(43758.5453).fract();
   return { Value: seed, Color: vec4(seed, seed, seed, 1) };
+});
+registerEmit('ShaderNodeTexMagic', (n, c) => {
+  const p = generatedVector(n, 0, c).mul(scalarInputOr(n, 1, c, 5));
+  const distortion = scalarInputOr(n, 2, c, 1);
+  const a = p.x.add(p.y).add(p.z.mul(0.5)).sin();
+  const b = p.x.mul(1.7).sub(p.y.mul(1.3)).add(p.z).cos();
+  const cc = p.x.mul(p.y.add(1)).add(p.z.mul(distortion)).sin();
+  const colorOut = vec4(
+    a.mul(0.5).add(0.5),
+    b.mul(0.5).add(0.5),
+    cc.mul(0.5).add(0.5),
+    1,
+  );
+  const fac = colorOut.x.add(colorOut.y).add(colorOut.z).mul(0.3333);
+  return { Color: colorOut, Fac: fac };
+});
+registerEmit('ShaderNodeTexImage', (n, c) => {
+  const p = generatedVector(n, 0, c);
+  const extension = (n as unknown as { extension?: string }).extension ?? 'REPEAT';
+  const uvNode = wrapUv(p.x, p.y, extension);
+  const key = (n as unknown as { image_src?: string }).image_src ?? '';
+  const resolved = key ? sampleResolvedTexture(c, key, 'IMAGE', uvNode) : null;
+  if (resolved) {
+    return { Color: resolved, Alpha: resolved.a ?? resolved.w ?? float(1) };
+  }
+  const colorOut = vec4(uvNode.x, uvNode.y, hash1(p.floor()), 1);
+  return { Color: colorOut, Alpha: float(1) };
+});
+registerEmit('ShaderNodeTexEnvironment', (n, c) => {
+  const dir = vectorInputOr(n, 0, c, reflectVector).normalize();
+  const u = dir.z.atan2 ? dir.z.atan2(dir.x).mul(0.5 / Math.PI).add(0.5) : dir.x.mul(0.5).add(0.5);
+  const v = dir.y.clamp(-1, 1).mul(0.5).add(0.5);
+  const uvNode = wrapUv(u, v, 'REPEAT');
+  const key = (n as unknown as { image_src?: string }).image_src ?? n.id;
+  const resolved = sampleResolvedTexture(c, key, 'ENVIRONMENT', uvNode);
+  if (resolved) return { Color: resolved };
+  const horizon = dir.y.mul(0.5).add(0.5).clamp(0, 1);
+  const sky = vec3(0.12, 0.28, 0.65);
+  const ground = vec3(0.18, 0.14, 0.10);
+  const base = mix(vec4(ground, 1), vec4(sky, 1), horizon);
+  const sun = dir.z.max(0).pow(32).mul(0.6);
+  return { Color: vec4(base.xyz.add(vec3(sun, sun.mul(0.85), sun.mul(0.55))), 1) };
 });
 
 /* ---------------------------------------------------------------- */
@@ -651,6 +872,8 @@ function addDescriptors(a: TSLMaterialDescriptor, b: TSLMaterialDescriptor): TSL
 /*  Evaluator                                                        */
 /* ---------------------------------------------------------------- */
 export class TSLShaderEvaluator implements SystemEvaluator {
+  constructor(private opts: TSLShaderEvaluatorOptions = {}) {}
+
   evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
     const cache: Cache = new Map();
@@ -660,6 +883,7 @@ export class TSLShaderEvaluator implements SystemEvaluator {
     const ctx: EmitContext = {
       cache,
       input: (socket) => this.resolveInput(socket, cache),
+      resolveTexture: this.opts.resolveTexture,
     };
 
     const order = tree.topoOrder();
@@ -680,16 +904,22 @@ export class TSLShaderEvaluator implements SystemEvaluator {
       timings.set(node.id, performance.now() - t0);
     }
 
-    const output = order.find((n) => n.bl_idname === 'ShaderNodeOutputMaterial');
+    const output = order.find((n) => n.bl_idname === 'ShaderNodeOutputMaterial')
+      ?? order.find((n) => n.bl_idname === 'ShaderNodeOutputWorld')
+      ?? order.find((n) => n.bl_idname === 'ShaderNodeOutputLight');
     let desc: TSLMaterialDescriptor = { colorNode: color(0.8, 0.8, 0.8), roughnessNode: float(0.5), metalnessNode: float(0) };
     if (output) {
-      const surface = output.inputs[0]!;
-      const surfaceDesc = this.resolveInput(surface, cache) as TSLMaterialDescriptor | undefined;
-      if (surfaceDesc && typeof surfaceDesc === 'object') desc = surfaceDesc;
-      const displacement = output.inputs[2];
-      if (displacement && displacement.is_linked) {
-        const d = this.resolveInput(displacement, cache);
-        if (d) desc.positionNode = positionLocal.add(d);
+      const surface = output.inputs[0];
+      if (surface) {
+        const surfaceDesc = this.resolveInput(surface, cache) as TSLMaterialDescriptor | undefined;
+        if (surfaceDesc && typeof surfaceDesc === 'object') desc = surfaceDesc;
+      }
+      if (output.bl_idname === 'ShaderNodeOutputMaterial') {
+        const displacement = output.inputs[2];
+        if (displacement && displacement.is_linked) {
+          const d = this.resolveInput(displacement, cache);
+          if (d) desc.positionNode = positionLocal.add(d);
+        }
       }
     }
 

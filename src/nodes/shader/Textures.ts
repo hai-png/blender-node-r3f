@@ -59,6 +59,10 @@ export class ShaderNodeTexImage extends TextureNode {
 export class ShaderNodeTexEnvironment extends TextureNode {
   static override bl_idname = 'ShaderNodeTexEnvironment';
   static override bl_label = 'Environment Texture';
+  static override properties = {
+    image_src: StringProperty({ default: '', name: 'Environment URL', subtype: 'FILE_PATH' }),
+  };
+  declare image_src: string;
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketVector, 'Vector');
     this.addInput(NodeSocketImage, 'Image');

@@ -1,6 +1,13 @@
 # Master Audit & Phase Plan — `blender-node-r3f`
 _Date: 2026-06-02 | Auditor: Arena Agent_
 
+> **Status note:** this document is now **partly superseded** by
+> [`PHASE0_AUDIT_2026-06-02.md`](./PHASE0_AUDIT_2026-06-02.md). Several gaps
+> recorded here have since been closed (including cycle reporting, foreach
+> selection support, texture image resolving, custom texture/compositor color
+> ramps, and portions of the UI wiring). Keep this file as historical context;
+> use the newer phase-0 audit as the authoritative current baseline.
+
 ---
 
 ## 1. Executive Summary
