@@ -27,7 +27,7 @@ import {
   CompositorNodePixelate, CompositorNodeTranslate, CompositorNodeScale,
   CompositorNodeRotate, CompositorNodeFlip, CompositorNodeCrop,
   CompositorNodeImage, CompositorNodeRGB, CompositorNodeValue, CompositorNodeRLayers,
-  CompositorNodeComposite, CompositorNodeViewer,
+  CompositorNodeComposite, CompositorNodeViewer, CompositorNodeSplitViewer,
 } from '../../nodes/compositor/Compositor';
 import { flattenTree, flatTopoOrder, type FlatLink } from '../flatten';
 import { cpuComposite } from './CpuComposite';
@@ -181,11 +181,15 @@ export class CompositorEvaluator implements SystemEvaluator {
         // Capture Composite / Viewer outputs to their dedicated targets.
         if (op.kind === 'OUTPUT') {
           const incoming = inputs.get('Image');
-          if (incoming && incoming.kind === 'IMAGE') {
+          if (op.nodes[0] instanceof CompositorNodeSplitViewer) {
+            const split = this.composeSplitViewer(op.nodes[0], inputs, refRelease);
+            viewerImage = this.captureToOwnedTarget(split, 'viewer');
+          } else if (incoming) {
+            const image = this.ensureImageResult(incoming, refRelease);
             if (op.nodes[0] instanceof CompositorNodeComposite) {
-              finalImage = this.captureToOwnedTarget(incoming, 'final');
+              finalImage = this.captureToOwnedTarget(image, 'final');
             } else if (op.nodes[0] instanceof CompositorNodeViewer) {
-              viewerImage = this.captureToOwnedTarget(incoming, 'viewer');
+              viewerImage = this.captureToOwnedTarget(image, 'viewer');
             }
           }
         }
@@ -230,9 +234,10 @@ export class CompositorEvaluator implements SystemEvaluator {
     const srcLink = (sock: NodeSocket): FlatLink | undefined => srcMap.get(sock);
     const plan: PlannerOp[] = [];
 
-    // Track which node produced which `PlannerOp`. For fused units, multiple
-    // nodes share the same op id; we map each node to (opId, outputId).
-    const nodeToOp = new Map<string, { opId: string; outId: string }>();
+    // Track which concrete output socket produced which `PlannerOp`. This
+    // matters for multi-output pixel nodes (Separate Color, ColorRamp Alpha,
+    // Z Combine's depth, etc.): links target sockets, not whole nodes.
+    const socketToOp = new Map<string /* output socket id */, { opId: string; outId: string }>();
 
     // Walk the topo order. Pixel-wise nodes get bundled greedily into a
     // chain as long as each consecutive node has at most ONE pixel-wise
@@ -258,7 +263,7 @@ export class CompositorEvaluator implements SystemEvaluator {
             const link = sl;
             const fromInChain = currentChain.includes(link.from_node);
             if (fromInChain) continue;
-            const src = nodeToOp.get(link.from_node.id);
+            const src = socketToOp.get(link.from_socket.id);
             bindings.push({
               localId: `${n.id}::${s.identifier}`,
               from: src ? { opId: src.opId, outId: src.outId } : null,
@@ -273,16 +278,17 @@ export class CompositorEvaluator implements SystemEvaluator {
           }
         }
       }
-      const outId = `${last.id}::Image`;
+      const outputs = last.outputs.map((s) => `${last.id}::${s.identifier}`);
       plan.push({
         id: opId, label: `${currentChain.map((n) => n.bl_label).join(' → ')}`,
         kind: 'PIXEL_FUSED',
         nodes: [...currentChain],
         bindings,
-        outputs: [outId],
+        outputs,
       });
-      // Each node's primary output points at the fused op's single image out.
-      for (const n of currentChain) nodeToOp.set(n.id, { opId, outId });
+      // The fused shader materialises the last node's result. Map every
+      // output socket on the last node to that op, preserving socket ids.
+      for (const s of last.outputs) socketToOp.set(s.id, { opId, outId: `${last.id}::${s.identifier}` });
       currentChain = [];
       currentChainHead = null;
     };
@@ -298,7 +304,7 @@ export class CompositorEvaluator implements SystemEvaluator {
           kind: 'INPUT_CONST', nodes: [node], bindings: [],
           outputs: node.outputs.map((s) => `${node.id}::${s.identifier}`),
         });
-        for (const s of node.outputs) nodeToOp.set(node.id, { opId, outId: `${node.id}::${s.identifier}` });
+        for (const s of node.outputs) socketToOp.set(s.id, { opId, outId: `${node.id}::${s.identifier}` });
         continue;
       }
       const kind = (node.constructor as typeof CompNode).comp_kind;
@@ -312,14 +318,14 @@ export class CompositorEvaluator implements SystemEvaluator {
           nodes: [node], bindings: [],
           outputs: node.outputs.map((s) => `${node.id}::${s.identifier}`),
         });
-        for (const s of node.outputs) nodeToOp.set(node.id, { opId, outId: `${node.id}::${s.identifier}` });
+        for (const s of node.outputs) socketToOp.set(s.id, { opId, outId: `${node.id}::${s.identifier}` });
       } else if (kind === 'OUTPUT') {
         flushChain();
         const opId = `output:${node.id}`;
         const bindings: PlannerOp['bindings'] = [];
         for (const s of node.inputs) {
           const sl = srcLink(s);
-          const src = sl ? nodeToOp.get(sl.from_node.id) : undefined;
+          const src = sl ? socketToOp.get(sl.from_socket.id) : undefined;
           bindings.push({
             localId: s.identifier,
             from: src ? { opId: src.opId, outId: src.outId } : null,
@@ -336,7 +342,7 @@ export class CompositorEvaluator implements SystemEvaluator {
         // already in the chain (so the fused fragment can chain them in one
         // shader). If its image input comes from outside the chain, start a
         // new chain.
-        const canExtend = currentChain.length > 0 && this.linksToChainMemberFlat(node, currentChain, srcMap);
+        const canExtend = currentChain.length > 0 && this.canExtendPixelChain(node, currentChain, srcMap, flat.links);
         if (!canExtend) flushChain();
         currentChain.push(node);
         currentChainHead = { opId: '', outId: '' }; // sentinel — real id assigned at flushChain
@@ -346,7 +352,7 @@ export class CompositorEvaluator implements SystemEvaluator {
         const bindings: PlannerOp['bindings'] = [];
         for (const s of node.inputs) {
           const sl = srcLink(s);
-          const src = sl ? nodeToOp.get(sl.from_node.id) : undefined;
+          const src = sl ? socketToOp.get(sl.from_socket.id) : undefined;
           bindings.push({
             localId: s.identifier,
             from: src ? { opId: src.opId, outId: src.outId } : null,
@@ -358,7 +364,7 @@ export class CompositorEvaluator implements SystemEvaluator {
           kind: 'KERNEL', nodes: [node], bindings,
           outputs: node.outputs.map((s) => `${node.id}::${s.identifier}`),
         });
-        for (const s of node.outputs) nodeToOp.set(node.id, { opId, outId: `${node.id}::${s.identifier}` });
+        for (const s of node.outputs) socketToOp.set(s.id, { opId, outId: `${node.id}::${s.identifier}` });
       }
     }
     flushChain();
@@ -366,13 +372,27 @@ export class CompositorEvaluator implements SystemEvaluator {
     return plan;
   }
 
-  /** Does `node`'s primary image input link to any node already in the chain? */
-  private linksToChainMemberFlat(node: Node, chain: Node[], srcMap: Map<NodeSocket, FlatLink>): boolean {
+  /**
+   * Can `node` extend the current pixel-fused chain without changing graph
+   * semantics? Only when it consumes the previous chain tail's primary output
+   * and that output has no other active consumers. This conservative rule
+   * prevents branch graphs from being collapsed into one linear shader whose
+   * final output would accidentally replace sibling branch outputs.
+   */
+  private canExtendPixelChain(
+    node: Node,
+    chain: Node[],
+    srcMap: Map<NodeSocket, FlatLink>,
+    links: FlatLink[],
+  ): boolean {
     const imgInput = node.inputs.find((s) => s.kind === 'RGBA' && srcMap.has(s));
     if (!imgInput) return false;
     const link = srcMap.get(imgInput);
     if (!link) return false;
-    return chain.includes(link.from_node);
+    const tail = chain[chain.length - 1];
+    if (!tail || link.from_node !== tail) return false;
+    const consumers = links.filter((l) => l.from_socket === link.from_socket).length;
+    return consumers <= 1;
   }
 
   // ============================================================
@@ -448,7 +468,9 @@ export class CompositorEvaluator implements SystemEvaluator {
     const t = this.pool!.acquire(this.width, this.height);
     keepAlive(t);
     this.renderToTarget(mat, t);
-    outs.set(op.outputs[0]!, { kind: 'IMAGE', target: t, width: this.width, height: this.height });
+    for (const outId of op.outputs) {
+      outs.set(outId, { kind: 'IMAGE', target: t, width: this.width, height: this.height, channel: channelForOutputId(outId) } as Result);
+    }
     return outs;
   }
 
@@ -457,7 +479,7 @@ export class CompositorEvaluator implements SystemEvaluator {
     keepAlive: (t: THREE.WebGLRenderTarget) => void,
   ): Map<string, Result> {
     const node = op.nodes[0]!;
-    const imgIn = inputs.get('Image') ?? defaultResultForSocket(node.inputs[0]!);
+    const imgIn = this.ensureImageResult(inputs.get('Image') ?? defaultResultForSocket(node.inputs[0]!), keepAlive);
     const inTex = this.imageTextureOf(imgIn);
     const tOut = this.pool!.acquire(this.width, this.height);
     keepAlive(tOut);
@@ -591,7 +613,9 @@ export class CompositorEvaluator implements SystemEvaluator {
       if (r.kind === 'IMAGE') {
         const uName = `u_tex_${idx}`;
         declarations.push(`uniform sampler2D ${uName};`);
-        exprByLocal.set(b.localId, `texture2D(${uName}, vUv)`);
+        const tex = `texture2D(${uName}, vUv)`;
+        const ch = (r as { channel?: 0 | 1 | 2 | 3 }).channel;
+        exprByLocal.set(b.localId, ch === undefined ? tex : `vec4(vec3(${tex}.${'rgba'[ch]}), 1.0)`);
         uniformSetters.set(uName, makeSetter(() => imageTexOf(r)));
       } else if (r.kind === 'VALUE') {
         const uName = `u_val_${idx}`;
@@ -699,6 +723,42 @@ void main() {
     r.setRenderTarget(prev);
   }
 
+  private composeSplitViewer(
+    node: CompositorNodeSplitViewer,
+    inputs: Map<string, Result>,
+    keepAlive: (t: THREE.WebGLRenderTarget) => void,
+  ): Extract<Result, { kind: 'IMAGE' }> {
+    const a = this.ensureImageResult(inputs.get('Image') ?? colorResult([0, 0, 0, 1]), keepAlive);
+    const b = this.ensureImageResult(inputs.get('Image_001') ?? colorResult([0, 0, 0, 1]), keepAlive);
+    const target = this.pool!.acquire(this.width, this.height);
+    keepAlive(target);
+    const mat = this.cachedMaterial('__split_viewer__', FULLSCREEN_VS, SPLIT_VIEWER_FS, () => ({
+      tA: { value: null },
+      tB: { value: null },
+      u_factor: { value: 0.5 },
+      u_axis: { value: 0 },
+    }));
+    mat.uniforms.tA!.value = a.target.texture;
+    mat.uniforms.tB!.value = b.target.texture;
+    mat.uniforms.u_factor!.value = Math.max(0, Math.min(1, node.factor / 100));
+    mat.uniforms.u_axis!.value = node.axis === 'Y' ? 1 : 0;
+    this.renderToTarget(mat, target);
+    return { kind: 'IMAGE', target, width: this.width, height: this.height };
+  }
+
+  private ensureImageResult(r: Result, keepAlive: (t: THREE.WebGLRenderTarget) => void): Extract<Result, { kind: 'IMAGE' }> {
+    if (r.kind === 'IMAGE') return r;
+    const target = this.pool!.acquire(this.width, this.height);
+    keepAlive(target);
+    const mat = this.cachedMaterial('__const_color__', FULLSCREEN_VS, CONST_COLOR_FS, () => ({
+      u_color: { value: new THREE.Vector4(0, 0, 0, 1) },
+    }));
+    const c = resultToRGBA(r);
+    mat.uniforms.u_color!.value.set(c[0], c[1], c[2], c[3]);
+    this.renderToTarget(mat, target);
+    return { kind: 'IMAGE', target, width: this.width, height: this.height };
+  }
+
   private imageTextureOf(r: Result): THREE.Texture | null {
     if (r.kind === 'IMAGE') return r.target.texture;
     return null;
@@ -745,6 +805,23 @@ function imageTexOf(r: Result): THREE.Texture | null {
   return null;
 }
 
+function resultToRGBA(r: Result): [number, number, number, number] {
+  if (r.kind === 'VALUE') return [r.value, r.value, r.value, 1];
+  if (r.kind === 'COLOR') return [r.value[0], r.value[1], r.value[2], r.value[3]];
+  if (r.kind === 'VECTOR') return [r.value[0], r.value[1], r.value[2], 1];
+  return [0, 0, 0, 1];
+}
+
+function channelForOutputId(outId: string): 0 | 1 | 2 | 3 | undefined {
+  const ident = outId.split('::').pop();
+  switch (ident) {
+    case 'Red': case 'R': case 'Value': case 'Val': case 'Distance': case 'Alpha': return ident === 'Alpha' ? 3 : 0;
+    case 'Green': case 'G': return 1;
+    case 'Blue': case 'B': return 2;
+    default: return undefined;
+  }
+}
+
 function defaultResultForSocket(s: NodeSocket): Result {
   switch (s.kind) {
     case 'RGBA': {
@@ -772,6 +849,23 @@ precision mediump float;
 varying vec2 vUv;
 uniform sampler2D tDiffuse;
 void main(){ gl_FragColor = texture2D(tDiffuse, vUv); }`;
+
+const CONST_COLOR_FS = /* glsl */ `
+precision mediump float;
+uniform vec4 u_color;
+void main(){ gl_FragColor = u_color; }`;
+
+const SPLIT_VIEWER_FS = /* glsl */ `
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D tA;
+uniform sampler2D tB;
+uniform float u_factor;
+uniform int u_axis;
+void main(){
+  float coord = u_axis == 1 ? vUv.y : vUv.x;
+  gl_FragColor = coord <= u_factor ? texture2D(tA, vUv) : texture2D(tB, vUv);
+}`;
 
 /** Re-exported for the demo / external consumers. */
 export type { EvaluatedComposite } from './types';

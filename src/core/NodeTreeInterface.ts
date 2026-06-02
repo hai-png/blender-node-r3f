@@ -85,8 +85,17 @@ export class NodeTreeInterface {
     return sock;
   }
 
-  new_panel(name: string, default_closed = false, description = ''): NodeTreeInterfacePanel {
+  new_panel(
+    name: string,
+    default_closed = false,
+    description = '',
+    parent?: NodeTreeInterfacePanel | undefined,
+    identifier?: string,
+  ): NodeTreeInterfacePanel {
     const panel = new NodeTreeInterfacePanel(name, default_closed, description);
+    if (identifier) (panel as unknown as { id: string }).id = identifier;
+    panel.parent = parent;
+    if (parent) parent.items.push(panel);
     this.items_tree.push(panel);
     return panel;
   }

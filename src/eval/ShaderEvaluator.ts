@@ -43,8 +43,10 @@ import {
   ShaderNodeMixShader,
 } from '../nodes/shader/Shaders';
 import {
-  ShaderNodeBsdfDiffuse, ShaderNodeBsdfGlossy, ShaderNodeBsdfGlass, ShaderNodeBsdfTransparent,
-  ShaderNodeBsdfTranslucent, ShaderNodeBackground, ShaderNodeAddShader,
+  ShaderNodeBsdfDiffuse, ShaderNodeBsdfGlossy, ShaderNodeBsdfRefraction, ShaderNodeBsdfGlass,
+  ShaderNodeBsdfTransparent, ShaderNodeBsdfTranslucent, ShaderNodeBsdfSheen, ShaderNodeBsdfToon,
+  ShaderNodeSubsurfaceScattering, ShaderNodeBackground, ShaderNodeHoldout, ShaderNodeAddShader,
+  ShaderNodeVolumeAbsorption, ShaderNodeVolumeScatter,
 } from '../nodes/shader/BSDFs';
 import { ValueNode, RGBNode, VectorNode } from '../nodes/common/Value';
 import { MathNode } from '../nodes/common/Math';
@@ -326,6 +328,14 @@ export class ShaderEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 1, roughness: r });
       return;
     }
+    if (node instanceof ShaderNodeBsdfRefraction) {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
+      const r = this.socketValue(node.inputs[1]!, cache) as number;
+      // Standard material has no true refraction slot; approximate with a
+      // transparent, low-metalness dielectric descriptor.
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: r, opacity: 0.35 });
+      return;
+    }
     if (node instanceof ShaderNodeBsdfGlass) {
       const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
       const r = this.socketValue(node.inputs[1]!, cache) as number;
@@ -342,11 +352,45 @@ export class ShaderEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, roughness: 1, opacity: 0.6 });
       return;
     }
+    if (node instanceof ShaderNodeBsdfSheen) {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
+      const r = this.socketValue(node.inputs[1]!, cache) as number;
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: Math.max(r, 0.7) });
+      return;
+    }
+    if (node instanceof ShaderNodeBsdfToon) {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
+      const smooth = this.socketValue(node.inputs[2]!, cache) as number;
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: 1 - Math.min(1, Math.max(0, smooth)) * 0.5 });
+      return;
+    }
+    if (node instanceof ShaderNodeSubsurfaceScattering) {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
+      const r = this.socketValue(node.inputs[4]!, cache) as number;
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: Math.max(r, 0.8), opacity: 0.9 });
+      return;
+    }
     if (node instanceof ShaderNodeBackground) {
       const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
       const s = this.socketValue(node.inputs[1]!, cache) as number;
       cache.set(node.outputs[0]!.id, {
         ...DEFAULT, color: [0, 0, 0, 1], emissive: [c[0], c[1], c[2]], emissive_strength: s,
+      });
+      return;
+    }
+    if (node instanceof ShaderNodeHoldout) {
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: [0, 0, 0, 1], opacity: 0 });
+      return;
+    }
+    if (node instanceof ShaderNodeVolumeAbsorption || node instanceof ShaderNodeVolumeScatter) {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
+      const density = this.socketValue(node.inputs[1]!, cache) as number;
+      cache.set(node.outputs[0]!.id, {
+        ...DEFAULT,
+        color: [0, 0, 0, 1],
+        emissive: [c[0], c[1], c[2]],
+        emissive_strength: Math.max(0, density) * 0.15,
+        opacity: Math.max(0, Math.min(1, 1 - density * 0.1)),
       });
       return;
     }

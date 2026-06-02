@@ -135,7 +135,14 @@ def _node_ref_id(node, _ids: dict[int, str]) -> str:  # noqa: ANN001
     return _ids[key]
 
 
-def _serialize_tree(tree) -> dict[str, Any]:  # noqa: ANN001
+def _tree_ref_id(tree, _ids: dict[int, str]) -> str:  # noqa: ANN001
+    key = id(tree)
+    if key not in _ids:
+        _ids[key] = uuid.uuid4().hex[:10]
+    return _ids[key]
+
+
+def _serialize_tree(tree, tree_ids: dict[int, str]) -> dict[str, Any]:  # noqa: ANN001
     node_ids: dict[int, str] = {}
     nodes_out: list[dict[str, Any]] = []
     for n in tree.nodes:
@@ -151,7 +158,7 @@ def _serialize_tree(tree) -> dict[str, Any]:  # noqa: ANN001
             "properties": _serialize_properties(n),
             "inputs": [_serialize_socket_def(s) for s in n.inputs],
             "outputs": [_serialize_socket_def(s) for s in n.outputs],
-            "node_tree": n.node_tree.name if hasattr(n, "node_tree") and n.node_tree else None,
+            "node_tree": _tree_ref_id(n.node_tree, tree_ids) if hasattr(n, "node_tree") and n.node_tree else None,
         })
     links_out = []
     for l in tree.links:
@@ -163,7 +170,7 @@ def _serialize_tree(tree) -> dict[str, Any]:  # noqa: ANN001
             "is_muted": l.is_muted or None,
         })
     return {
-        "id": uuid.uuid4().hex[:10],
+        "id": _tree_ref_id(tree, tree_ids),
         "bl_idname": tree.bl_idname,
         "name": tree.name,
         "interface": _serialize_interface(tree),
@@ -173,11 +180,13 @@ def _serialize_tree(tree) -> dict[str, Any]:  # noqa: ANN001
 
 
 def build_document(trees: Iterable) -> dict[str, Any]:  # noqa: ANN001
+    source_trees = [t for t in trees if t.bl_idname in SUPPORTED_TREE_IDS]
+    # Stable within one export document: group node references use these ids,
+    # not mutable Blender names, so the TypeScript importer can resolve them.
+    tree_ids: dict[int, str] = {id(t): uuid.uuid4().hex[:10] for t in source_trees}
     out_trees: list[dict[str, Any]] = []
-    for t in trees:
-        if t.bl_idname not in SUPPORTED_TREE_IDS:
-            continue
-        out_trees.append(_serialize_tree(t))
+    for t in source_trees:
+        out_trees.append(_serialize_tree(t, tree_ids))
     return {
         "schema": "BNG/1",
         "blender_version": bpy.app.version_string,

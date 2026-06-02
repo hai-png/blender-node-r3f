@@ -64,11 +64,26 @@ export class Node {
   tree!: NodeTree;
 
   constructor() {
-    // Install declarative properties as instance fields.
+    // Install declarative properties as reactive instance fields. Blender RNA
+    // properties call their `update` callback and tag the owning node tree for
+    // re-evaluation when assigned; mirror that for direct TS assignments such
+    // as `node.operation = 'MULTIPLY'`.
     const props = (this.constructor as typeof Node).properties;
     for (const [key, desc] of Object.entries(props)) {
-      // structuredClone preserves array defaults safely
-      (this as unknown as Record<string, unknown>)[key] = structuredClone(desc.default);
+      let value: unknown = structuredClone(desc.default);
+      Object.defineProperty(this, key, {
+        enumerable: true,
+        configurable: true,
+        get: () => value,
+        set: (next: unknown) => {
+          value = next;
+          desc.update?.(this);
+          if (this.tree) {
+            this.tree.emit({ type: 'property_changed', node: this, key });
+            this.tree.depsgraph.invalidate(this);
+          }
+        },
+      });
     }
     this.width = (this.constructor as typeof Node).bl_width_default;
   }

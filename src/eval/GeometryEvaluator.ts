@@ -30,7 +30,7 @@ import {
   radiusField, anonField, nextAnonymousId, liftToField, isField, mapField, zipField,
 } from './geometry/Field';
 import {
-  transformGeometry, joinGeometries, setPosition, storeAttributeOn, boundingBox,
+  transformGeometry, joinGeometries, setPosition, storeAttributeOn, boundingBox, convexHull,
   mergeByDistance, subdivisionSurface, meshToPoints, pointsToVertices,
   distributePointsOnFaces, instanceOnPoints, realizeInstances,
   curveToMesh, curveToPoints, resampleCurve, reverseCurve,
@@ -64,7 +64,7 @@ import {
 } from '../nodes/geometry/Primitives';
 import {
   GeometryNodeSetPosition, GeometryNodeCaptureAttribute, GeometryNodeStoreNamedAttribute,
-  GeometryNodeRemoveAttribute, GeometryNodeBoundBox, GeometryNodeMergeByDistance,
+  GeometryNodeRemoveAttribute, GeometryNodeBoundBox, GeometryNodeConvexHull, GeometryNodeMergeByDistance,
   GeometryNodeSubdivisionSurface, GeometryNodeTriangulate, GeometryNodeDistributePointsOnFaces,
   GeometryNodeMeshToPoints, GeometryNodePointsToVertices,
   GeometryNodeInstanceOnPoints, GeometryNodeRealizeInstances,
@@ -940,6 +940,11 @@ export class GeometryEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, bb.geometry);
       cache.set(node.outputs[1]!.id, constField(bb.min, 'VECTOR'));
       cache.set(node.outputs[2]!.id, constField(bb.max, 'VECTOR'));
+      return;
+    }
+    if (node instanceof GeometryNodeConvexHull) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, convexHull(geo));
       return;
     }
     if (node instanceof GeometryNodeMergeByDistance) {

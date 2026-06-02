@@ -105,11 +105,19 @@ export class NodeTree {
     this.links.push(link);
     from.links.push(link);
     to.links.push(link);
+    // Zone membership is structural. Adding a link can make existing nodes
+    // enter/leave a zone, so refresh every link flag after the topology edit.
+    this.recomputeZoneEscapes();
     this.emit({ type: 'link_added', link });
     this.depsgraph.invalidate(to.node);
     // poll for custom routing
     to.node.insert_link?.(link);
     return link;
+  }
+
+  /** Recompute zone-escape flags for all links after a topology edit. */
+  recomputeZoneEscapes(): void {
+    for (const l of this.links) l.escapes_zone = this.detectZoneEscape(l.from_node, l.to_node);
   }
 
   /**
@@ -246,6 +254,7 @@ export class NodeTree {
     if (fi >= 0) link.from_socket.links.splice(fi, 1);
     const ti = link.to_socket.links.indexOf(link);
     if (ti >= 0) link.to_socket.links.splice(ti, 1);
+    this.recomputeZoneEscapes();
     this.emit({ type: 'link_removed', link });
     this.depsgraph.invalidate(link.to_node);
   }

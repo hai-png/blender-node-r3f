@@ -68,6 +68,30 @@ export interface TSLMaterialDescriptor {
 const { float, vec3, vec4, color, uv, positionLocal, positionWorld, normalWorld, mix, mul, add, sub } = TSL;
 
 /* ---------------------------------------------------------------- */
+/*  Small TSL vector helpers                                         */
+/* ---------------------------------------------------------------- */
+function rotateX(v: TSLNode, a: TSLNode): TSLNode {
+  const c = a.cos(), s = a.sin();
+  return vec3(v.x, v.y.mul(c).sub(v.z.mul(s)), v.y.mul(s).add(v.z.mul(c)));
+}
+function rotateY(v: TSLNode, a: TSLNode): TSLNode {
+  const c = a.cos(), s = a.sin();
+  return vec3(v.x.mul(c).add(v.z.mul(s)), v.y, v.z.mul(c).sub(v.x.mul(s)));
+}
+function rotateZ(v: TSLNode, a: TSLNode): TSLNode {
+  const c = a.cos(), s = a.sin();
+  return vec3(v.x.mul(c).sub(v.y.mul(s)), v.x.mul(s).add(v.y.mul(c)), v.z);
+}
+function rotateEulerXYZ(v: TSLNode, r: TSLNode): TSLNode {
+  return rotateZ(rotateY(rotateX(v, r.x), r.y), r.z);
+}
+function rotateAxisAngle(v: TSLNode, axisIn: TSLNode, angle: TSLNode): TSLNode {
+  const axis = axisIn.normalize ? axisIn.normalize() : axisIn;
+  const c = angle.cos(), s = angle.sin(), oneMinusC = float(1).sub(c);
+  return v.mul(c).add(axis.cross(v).mul(s)).add(axis.mul(axis.dot(v)).mul(oneMinusC));
+}
+
+/* ---------------------------------------------------------------- */
 /*  Emit table — maps bl_idname -> emit function                    */
 /* ---------------------------------------------------------------- */
 type Cache = Map<string /* socket.id */, TSLNode>;
@@ -356,10 +380,11 @@ registerEmit('ShaderNodeTexWhiteNoise', (n, c) => {
 registerEmit('ShaderNodeMapping', (n, c) => {
   const v = c.input(n.inputs[0]!);
   const loc = c.input(n.inputs[1]!);
-  const _rot = c.input(n.inputs[2]!); void _rot;
+  const rot = c.input(n.inputs[2]!);
   const scl = c.input(n.inputs[3]!);
-  // S * V + T (rotation skipped in this M1 minimal — could compose mat3 from euler)
-  return { Vector: v.mul(scl).add(loc) };
+  // Blender Mapping applies scale, Euler rotation, then translation for POINT/TEXTURE modes.
+  // This approximation keeps VECTOR/NORMAL type semantics flowing while finally honoring rotation.
+  return { Vector: rotateEulerXYZ(v.mul(scl), rot).add(loc) };
 });
 
 registerEmit('ShaderNodeNormalMap', (n, c) => {
@@ -375,6 +400,41 @@ registerEmit('ShaderNodeBump', (n, c) => {
   // Stub: pass-through input normal + strength scaling.
   const normal = c.input(n.inputs[3]!);
   return { Normal: normal };
+});
+
+registerEmit('ShaderNodeVectorRotate', (n, c) => {
+  const v = c.input(n.inputs[0]!);
+  const center = c.input(n.inputs[1]!);
+  const axis = c.input(n.inputs[2]!);
+  const angle = c.input(n.inputs[3]!);
+  const rot = c.input(n.inputs[4]!);
+  const type = (n as unknown as { rotation_type?: string }).rotation_type ?? 'AXIS_ANGLE';
+  const local = v.sub(center);
+  let out: TSLNode;
+  switch (type) {
+    case 'X_AXIS': out = rotateX(local, angle); break;
+    case 'Y_AXIS': out = rotateY(local, angle); break;
+    case 'Z_AXIS': out = rotateZ(local, angle); break;
+    case 'EULER_XYZ': out = rotateEulerXYZ(local, rot); break;
+    default: out = rotateAxisAngle(local, axis, angle); break;
+  }
+  return { Vector: out.add(center) };
+});
+
+registerEmit('ShaderNodeDisplacement', (n, c) => {
+  const height = c.input(n.inputs[0]!);
+  const mid = c.input(n.inputs[1]!);
+  const scale = c.input(n.inputs[2]!);
+  const normal = c.input(n.inputs[3]!);
+  return { Displacement: normal.mul(height.sub(mid).mul(scale)) };
+});
+
+registerEmit('ShaderNodeVectorDisplacement', (n, c) => {
+  const v = c.input(n.inputs[0]!);
+  const mid = c.input(n.inputs[1]!);
+  const scale = c.input(n.inputs[2]!);
+  const xyz = v.xyz ? v.xyz : vec3(v.x, v.y, v.z);
+  return { Displacement: xyz.sub(vec3(mid, mid, mid)).mul(scale) };
 });
 
 /* ---------------------------------------------------------------- */
@@ -424,6 +484,21 @@ registerEmit('ShaderNodeBsdfGlossy', (n, c) => {
   };
 });
 
+registerEmit('ShaderNodeBsdfRefraction', (n, c) => {
+  const baseColor = c.input(n.inputs[0]!);
+  const roughness = c.input(n.inputs[1]!);
+  const ior = c.input(n.inputs[2]!);
+  return {
+    BSDF: {
+      colorNode: baseColor,
+      roughnessNode: roughness,
+      iorNode: ior,
+      transmissionNode: float(1),
+      opacityNode: float(0.35),
+    } as unknown as TSLNode,
+  };
+});
+
 registerEmit('ShaderNodeBsdfGlass', (n, c) => {
   const baseColor = c.input(n.inputs[0]!);
   const roughness = c.input(n.inputs[1]!);
@@ -450,6 +525,29 @@ registerEmit('ShaderNodeBsdfTransparent', (n, c) => {
   };
 });
 
+registerEmit('ShaderNodeBsdfTranslucent', (n, c) => {
+  const baseColor = c.input(n.inputs[0]!);
+  return { BSDF: { colorNode: baseColor, roughnessNode: float(1), opacityNode: float(0.6) } as unknown as TSLNode };
+});
+
+registerEmit('ShaderNodeBsdfSheen', (n, c) => {
+  const baseColor = c.input(n.inputs[0]!);
+  const roughness = c.input(n.inputs[1]!);
+  return { BSDF: { colorNode: baseColor, roughnessNode: roughness.max(0.7), metalnessNode: float(0) } as unknown as TSLNode };
+});
+
+registerEmit('ShaderNodeBsdfToon', (n, c) => {
+  const baseColor = c.input(n.inputs[0]!);
+  const smooth = c.input(n.inputs[2]!);
+  return { BSDF: { colorNode: baseColor, roughnessNode: float(1).sub(smooth.clamp(0, 1).mul(0.5)), metalnessNode: float(0) } as unknown as TSLNode };
+});
+
+registerEmit('ShaderNodeSubsurfaceScattering', (n, c) => {
+  const baseColor = c.input(n.inputs[0]!);
+  const roughness = c.input(n.inputs[4]!);
+  return { BSSRDF: { colorNode: baseColor, roughnessNode: roughness.max(0.8), opacityNode: float(0.9) } as unknown as TSLNode };
+});
+
 registerEmit('ShaderNodeEmission', (n, c) => {
   const col = c.input(n.inputs[0]!);
   const str = c.input(n.inputs[1]!);
@@ -468,6 +566,34 @@ registerEmit('ShaderNodeBackground', (n, c) => {
     Background: {
       colorNode: vec4(0, 0, 0, 1),
       emissiveNode: col.xyz ? col.xyz.mul(str) : mul(col, str),
+    } as unknown as TSLNode,
+  };
+});
+
+registerEmit('ShaderNodeHoldout', () => ({
+  Holdout: { colorNode: vec4(0, 0, 0, 1), opacityNode: float(0) } as unknown as TSLNode,
+}));
+
+registerEmit('ShaderNodeVolumeAbsorption', (n, c) => {
+  const col = c.input(n.inputs[0]!);
+  const density = c.input(n.inputs[1]!);
+  return {
+    Volume: {
+      colorNode: vec4(0, 0, 0, 1),
+      emissiveNode: col.xyz ? col.xyz.mul(density.mul(0.15)) : mul(col, density.mul(0.15)),
+      opacityNode: float(1).sub(density.mul(0.1)).clamp(0, 1),
+    } as unknown as TSLNode,
+  };
+});
+
+registerEmit('ShaderNodeVolumeScatter', (n, c) => {
+  const col = c.input(n.inputs[0]!);
+  const density = c.input(n.inputs[1]!);
+  return {
+    Volume: {
+      colorNode: vec4(0, 0, 0, 1),
+      emissiveNode: col.xyz ? col.xyz.mul(density.mul(0.12)) : mul(col, density.mul(0.12)),
+      opacityNode: float(1).sub(density.mul(0.08)).clamp(0, 1),
     } as unknown as TSLNode,
   };
 });

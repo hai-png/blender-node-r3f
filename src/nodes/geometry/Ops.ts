@@ -135,6 +135,16 @@ export class GeometryNodeBoundBox extends GeoDataFlow {
   }
 }
 
+export class GeometryNodeConvexHull extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeConvexHull';
+  static override bl_label = 'Convex Hull';
+  static override category = 'Geometry / Operations';
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketGeometry, 'Geometry');
+    this.addOutput(NodeSocketGeometry, 'Convex Hull');
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Merge by Distance                                                 */
 /* ------------------------------------------------------------------ */
@@ -519,6 +529,7 @@ export function registerGeometryOps(): void {
     GeometryNodeStoreNamedAttribute,
     GeometryNodeRemoveAttribute,
     GeometryNodeBoundBox,
+    GeometryNodeConvexHull,
     GeometryNodeMergeByDistance,
     GeometryNodeSubdivisionSurface,
     GeometryNodeTriangulate,

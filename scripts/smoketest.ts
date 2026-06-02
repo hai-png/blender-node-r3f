@@ -14,6 +14,7 @@ import {
   bootstrapBuiltins, ShaderNodeTree, GeometryNodeTree, TextureNodeTree, CompositorNodeTree,
   ShaderEvaluator, GeometryEvaluator, CompositorEvaluator, TextureEvaluator,
   ShaderNodeOutputMaterial, ShaderNodeBsdfPrincipled, ShaderNodeEmission, ShaderNodeMixShader,
+  ShaderNodeBsdfRefraction, ShaderNodeBsdfSheen, ShaderNodeHoldout, ShaderNodeVolumeAbsorption,
   GeometryNodeMeshCube, GeometryNodeMeshUVSphere, GeometryNodeMeshIcoSphere,
   GeometryNodeMeshGrid, GeometryNodeTransform, GeometryNodeJoinGeometry,
   GeometryNodeInputPosition, GeometryNodeInputNormal, GeometryNodeInputIndex,
@@ -23,12 +24,14 @@ import {
   GeometryNodeCurveCircle, GeometryNodeCurveToPoints, GeometryNodeCurveBezierSegment,
   GeometryNodeResampleCurve, GeometryNodeReverseCurve,
   GeometryNodeAccumulateField, GeometryNodeAttributeDomainSize, GeometryNodeFlipFaces,
+  GeometryNodeConvexHull,
   GeometryNodeFieldAtIndex, GeometryNodeInputIndex,
   NodeRegistry as _NR2,
   CompositorNodeImage, CompositorNodeBlur, CompositorNodeComposite,
   CompositorNodeRGB, CompositorNodeMixRGB, CompositorNodeInvert, CompositorNodeGamma,
   CompositorNodePosterize, CompositorNodeMapRange, CompositorNodeValue as _CV,
-  CompositorNodeCombineColor, CompositorNodeSeparateColor,
+  CompositorNodeCombineColor, CompositorNodeSeparateColor, CompositorNodeValToRGB,
+  CompositorNodeSplitViewer,
   cpuComposite, NodeRegistry,
   TextureNodeChecker, TextureNodeOutput, TextureNodeVoronoi, TextureNodeWave,
   TextureNodeMath, TextureNodeMixRGB, TextureNodeCoordinates,
@@ -119,6 +122,27 @@ test('shader: Mix Shader picks between two BSDFs', async () => {
   close(desc.color[0]!, 0.25, 1e-6, 'mixed channel');
 });
 
+test('shader: additional BSDF/volume fallback descriptors are meaningful', async () => {
+  const materialFrom = async (NodeCls: typeof ShaderNodeBsdfRefraction | typeof ShaderNodeBsdfSheen | typeof ShaderNodeHoldout | typeof ShaderNodeVolumeAbsorption) => {
+    const t = new ShaderNodeTree('m-extra');
+    t.depsgraph.setEvaluator(new ShaderEvaluator());
+    const out = t.addNode(ShaderNodeOutputMaterial);
+    const n = t.addNode(NodeCls);
+    const outSock = n.outputs[0]!;
+    t.addLink(outSock, out.inputs[0]!);
+    await new Promise((r) => setTimeout(r, 1));
+    return t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  };
+  const refr = await materialFrom(ShaderNodeBsdfRefraction);
+  assert(refr.opacity < 1, 'refraction fallback is transparent');
+  const sheen = await materialFrom(ShaderNodeBsdfSheen);
+  assert(sheen.roughness >= 0.7, 'sheen fallback is high roughness');
+  const holdout = await materialFrom(ShaderNodeHoldout);
+  close(holdout.opacity, 0, 1e-6, 'holdout opacity zero');
+  const vol = await materialFrom(ShaderNodeVolumeAbsorption);
+  assert(vol.emissive_strength > 0 || vol.opacity < 1, 'volume fallback contributes visible descriptor');
+});
+
 test('common: Math + Value drive a downstream node', async () => {
   const t = new ShaderNodeTree('m');
   t.depsgraph.setEvaluator(new ShaderEvaluator());
@@ -153,6 +177,17 @@ test('common: Color Ramp samples', () => {
   ];
   const c = ColorRampNode.sample(stops, 'LINEAR', 0.5);
   close(c[0], 0.5, 1e-6, 'midpoint');
+});
+
+test('core: declarative property assignment emits change + invalidates', async () => {
+  const t = new ShaderNodeTree('props');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const m = t.addNode(MathNode);
+  let saw = false;
+  t.subscribe((_tree, ev) => { if (ev.type === 'property_changed' && ev.node === m && ev.key === 'operation') saw = true; });
+  m.operation = 'MULTIPLY';
+  await new Promise((r) => setTimeout(r, 10));
+  assert(saw, 'property_changed event emitted');
 });
 
 test('common: Combine XYZ output', async () => {
@@ -238,6 +273,26 @@ test('compositor M5: planner fuses pixel-wise chain into a single op', async () 
   assert(plan.some((p) => p.kind === 'OUTPUT'), 'has OUTPUT op');
 });
 
+test('compositor M5: branching pixel graph is not collapsed into one fused chain', async () => {
+  const { CompositorNodeImage, CompositorNodeBrightContrast, CompositorNodeInvert,
+    CompositorNodeGamma, CompositorNodeComposite, CompositorNodeViewer } = await import('../src/nodes/compositor/Compositor');
+  const t = new CompositorNodeTree('c-branch');
+  const ev = new CompositorEvaluator({ width: 64, height: 64 });
+  const img = t.addNode(CompositorNodeImage);
+  const bc = t.addNode(CompositorNodeBrightContrast);
+  const inv = t.addNode(CompositorNodeInvert);
+  const gam = t.addNode(CompositorNodeGamma);
+  const comp = t.addNode(CompositorNodeComposite);
+  const viewer = t.addNode(CompositorNodeViewer);
+  t.addLink(img.outputs[0]!, bc.inputs[0]!);
+  t.addLink(bc.outputs[0]!, inv.inputs[1]!);
+  t.addLink(bc.outputs[0]!, gam.inputs[0]!);
+  t.addLink(inv.outputs[0]!, comp.inputs[0]!);
+  t.addLink(gam.outputs[0]!, viewer.inputs[0]!);
+  const fused = ev.planTree(t).filter((p) => p.kind === 'PIXEL_FUSED');
+  assert(fused.length >= 3, `branching graph should materialise branch point, got ${fused.length} fused ops`);
+});
+
 test('compositor M5: kernel node (Blur) breaks the fused chain', async () => {
   const { CompositorNodeImage, CompositorNodeBrightContrast, CompositorNodeBlur,
     CompositorNodeInvert, CompositorNodeComposite } = await import('../src/nodes/compositor/Compositor');
@@ -304,6 +359,52 @@ test('bridge: round-trip JSON preserves topology + properties', async () => {
   const restoredMath = restored!.nodes.find((n) => n.bl_idname === 'ShaderNodeMath') as MathNode;
   eq(restoredMath.operation, 'MULTIPLY_ADD', 'Math op preserved');
   eq(restoredMath.use_clamp, true, 'Math clamp preserved');
+});
+
+test('bridge: round-trip preserves output socket defaults on input-style nodes', () => {
+  const t = new CompositorNodeTree('rt-output-defaults');
+  const rgb = t.addNode(CompositorNodeRGB);
+  rgb.outputs[0]!.default_value = [0.25, 0.5, 0.75, 1];
+
+  const json = exportDocument([t]);
+  const [restored] = importDocument(json);
+  const restoredRgb = restored!.nodes.find((n) => n.bl_idname === 'CompositorNodeRGB') as CompositorNodeRGB;
+  const color = restoredRgb.outputs[0]!.default_value as number[];
+  close(color[0]!, 0.25, 1e-6, 'R output default preserved');
+  close(color[1]!, 0.5, 1e-6, 'G output default preserved');
+  close(color[2]!, 0.75, 1e-6, 'B output default preserved');
+});
+
+test('bridge: group node_tree references resolve by tree id', () => {
+  const child = new ShaderNodeTree('child-group');
+  child.interface.new_socket({ name: 'Surface', in_out: 'OUTPUT', socket_type: 'NodeSocketShader', identifier: 'Surface' });
+  child.addNode(NodeGroupOutput).refreshFromInterface(child);
+
+  const parent = new ShaderNodeTree('parent-group');
+  const group = parent.addNode(ShaderNodeGroup);
+  group.setNodeTree(child);
+
+  const [restoredParent, restoredChild] = importDocument(exportDocument([parent, child]));
+  const restoredGroup = restoredParent!.nodes.find((n) => n.bl_idname === 'ShaderNodeGroup') as ShaderNodeGroup;
+  assert(restoredGroup.resolvedTree === restoredChild, 'restored group resolvedTree points at exported child id');
+  eq(restoredGroup.node_tree, restoredChild!.id, 'restored group node_tree stores child id');
+});
+
+test('bridge: interface panel hierarchy round-trips', () => {
+  const t = new ShaderNodeTree('iface-panels');
+  const panel = t.interface.new_panel('Inputs', true, 'panel desc');
+  const sock = t.interface.new_socket({
+    name: 'Strength', in_out: 'INPUT', socket_type: 'NodeSocketFloat', identifier: 'Strength', parent: panel, default_value: 0.8,
+  });
+
+  const [restored] = importDocument(exportDocument([t]));
+  const restoredPanel = restored!.interface.items_tree.find((it) => it.kind === 'PANEL' && it.name === 'Inputs');
+  const restoredSock = restored!.interface.inputs().find((s) => s.identifier === 'Strength');
+  assert(restoredPanel, 'panel restored');
+  assert(restoredSock, 'socket restored');
+  assert(restoredSock.parent === restoredPanel, 'socket parent restored');
+  eq(restoredPanel.default_closed, true, 'panel default_closed preserved');
+  close(restoredSock.default_value as number, sock.default_value as number, 1e-6, 'socket default preserved');
 });
 
 // ============================ M2 / M3 ===================================
@@ -756,6 +857,21 @@ test('zone M4: Foreach Element Zone iterates over points', async () => {
   assert(g.mesh!.numVerts >= 9, `expected at least 9 verts, got ${g.mesh!.numVerts}`);
 });
 
+test('zone M4: Foreach Element Zone respects Selection input', async () => {
+  const t = new GeometryNodeTree('g-foreach-selection');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  const { input: fIn, output: fOut } = t.addZone('FOREACH');
+  fIn.inputs.find((s) => s.identifier === '__selection')!.default_value = 0;
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(grid.outputs[0]!, fIn.inputs.find((s) => s.identifier === 'in_Geometry')!);
+  t.addLink(fOut.outputs.find((s) => s.identifier === 'Geometry')!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 10));
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  assert(!g.mesh || g.mesh.numVerts === 0, `selection=0 should skip all foreach elements, got ${g.mesh?.numVerts ?? 0}`);
+});
+
 test('zone M4: zone-escape detection — interior → exterior link is flagged', async () => {
   const t = new GeometryNodeTree('g');
   t.depsgraph.setEvaluator(new GeometryEvaluator());
@@ -780,6 +896,23 @@ test('zone M4: zone-escape detection — interior → exterior link is flagged',
     xform.inputs[0]!,
   );
   eq(validLink.escapes_zone, false, 'output → exterior link is allowed');
+});
+
+test('zone M4: zone-escape flags are recomputed after topology edits', () => {
+  const t = new GeometryNodeTree('g-zone-recompute');
+  const { input: rIn, output: rOut } = t.addZone('REPEAT');
+  const xform = t.addNode(GeometryNodeTransform);
+
+  const initiallyEscaping = t.addLink(
+    rIn.outputs.find((s) => s.identifier === 'Geometry')!,
+    xform.inputs[0]!,
+  );
+  eq(initiallyEscaping.escapes_zone, true, 'xform initially outside repeat zone');
+
+  // Chain xform back to the zone output. This structurally puts xform inside
+  // the zone, so the previous link must be reclassified as valid.
+  t.addLink(xform.outputs[0]!, rOut.inputs.find((s) => s.identifier === 'in_Geometry')!);
+  eq(initiallyEscaping.escapes_zone, false, 'escape flag recomputed once xform is inside zone');
 });
 
 /** Helper: read a socket's value from the most recent evaluation. */
@@ -1002,6 +1135,60 @@ test('compositor CPU: Combine→Separate Color round-trips RGB', () => {
   close(out[0], 0.2, 1e-4, 'combine R'); close(out[1], 0.4, 1e-4, 'combine G'); close(out[2], 0.6, 1e-4, 'combine B');
 });
 
+test('compositor CPU: Color Ramp supports custom stops', () => {
+  const t = new CompositorNodeTree('cpu-ramp');
+  const ramp = t.addNode(CompositorNodeValToRGB);
+  ramp.stops = [
+    { position: 0, color: [1, 0, 0, 1] },
+    { position: 1, color: [0, 0, 1, 0.5] },
+  ];
+  ramp.inputs[0]!.default_value = 0.25;
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(ramp.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[0], 0.75, 1e-4, 'ramp custom red');
+  close(out[2], 0.25, 1e-4, 'ramp custom blue');
+  close(out[3], 0.875, 1e-4, 'ramp custom alpha');
+});
+
+test('compositor CPU: Split Viewer samples split boundary', () => {
+  const t = new CompositorNodeTree('cpu-split');
+  const a = t.addNode(CompositorNodeRGB); a.outputs[0]!.default_value = [1, 0, 0, 1];
+  const b = t.addNode(CompositorNodeRGB); b.outputs[0]!.default_value = [0, 0, 1, 1];
+  const split = t.addNode(CompositorNodeSplitViewer);
+  split.factor = 100;
+  t.addLink(a.outputs[0]!, split.inputs[0]!);
+  t.addLink(b.outputs[0]!, split.inputs[1]!);
+  const out = cpuComposite(t)!;
+  close(out[0], 1, 1e-4, 'split factor 100 uses first image at center');
+  close(out[2], 0, 1e-4, 'split factor 100 not second image at center');
+});
+
+test('compositor CPU: Separate Green can drive scalar chain', () => {
+  const t = new CompositorNodeTree('cpu5b');
+  const comb = t.addNode(CompositorNodeCombineColor);
+  (comb.inputs.find((x) => x.name === 'Red')!.default_value as number) = 0.2;
+  (comb.inputs.find((x) => x.name === 'Green')!.default_value as number) = 0.4;
+  (comb.inputs.find((x) => x.name === 'Blue')!.default_value as number) = 0.6;
+  const sep = t.addNode(CompositorNodeSeparateColor);
+  const map = t.addNode(CompositorNodeMapRange);
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(comb.outputs[0]!, sep.inputs.find((x) => x.kind === 'RGBA')!);
+  t.addLink(sep.outputs.find((x) => x.name === 'Green')!, map.inputs.find((x) => x.name === 'Value')!);
+  t.addLink(map.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[0], 0.4, 1e-4, 'separated green drives scalar map range');
+});
+
+test('compositor GLSL: Gamma and Brightness/Contrast match CPU conventions', async () => {
+  const { PIXEL_EMITTERS } = await import('../src/eval/compositor/PixelGLSL');
+  const env = { input: (id: string) => id, uniformFloat: () => '0.0', unique: (p: string) => p };
+  const gamma = PIXEL_EMITTERS.CompositorNodeGamma!({} as never, env);
+  assert(!gamma.includes('1.0 /'), 'Gamma GLSL uses pow(color, gamma), not reciprocal gamma');
+  const bc = PIXEL_EMITTERS.CompositorNodeBrightContrast!({} as never, env);
+  assert(bc.includes('/ 100.0'), 'Brightness/Contrast GLSL uses percentage scaling like CPU path');
+});
+
 test('compositor: new M5 nodes are registered', () => {
   for (const id of ['CompositorNodePosterize','CompositorNodeZcombine','CompositorNodeMapRange',
                     'CompositorNodeCombineColor','CompositorNodeSeparateColor','CompositorNodeValToRGB',
@@ -1052,6 +1239,22 @@ test('texture: Coordinates → Checker varies across UV', () => {
   const sample = ev.evaluate(t, new Set()).output as (u: number, v: number) => [number, number, number, number];
   const a = sample(0.05, 0.05), b = sample(0.25, 0.05);
   assert(a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2], 'checker alternates across U');
+});
+
+test('texture: procedural nodes respect explicit coordinate defaults', () => {
+  const t = new TextureNodeTree('tx-coords-default');
+  const chk = t.addNode(TextureNodeChecker);
+  const out = t.addNode(TextureNodeOutput);
+  // A non-zero explicit vector default pins the sample coordinates; if the
+  // evaluator ignored the Coords input, these two samples would differ.
+  chk.inputs[0]!.default_value = [0.05, 0.05, 0];
+  t.addLink(chk.outputs[0]!, out.inputs[0]!);
+  const ev = new TextureEvaluator();
+  const sample = ev.evaluate(t, new Set()).output as (u: number, v: number) => [number, number, number, number];
+  const a = sample(0.05, 0.05), b = sample(0.85, 0.05);
+  close(a[0], b[0], 1e-6, 'checker pinned coord R');
+  close(a[1], b[1], 1e-6, 'checker pinned coord G');
+  close(a[2], b[2], 1e-6, 'checker pinned coord B');
 });
 
 test('texture: bakeToDataTexture produces a size*size*4 buffer', async () => {
@@ -1126,6 +1329,25 @@ test('geom field-util: Accumulate Field leading sum over points', () => {
   for (let i = 0; i < base.mesh!.positions.length; i += 3) sumBase += base.mesh!.positions[i]!;
   const added = sumX - sumBase;
   close(added, (n * (n + 1)) / 2, 0.5, 'accumulate leading total added == n(n+1)/2');
+});
+
+test('geom op: Convex Hull emits boundary mesh for cube', () => {
+  const t = new GeometryNodeTree('hull1');
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const hull = t.addNode(GeometryNodeConvexHull);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, hull.inputs[0]!);
+  t.addLink(hull.outputs[0]!, out.inputs[0]!);
+  const ev = new GeometryEvaluator();
+  const geo = ev.evaluate(t, new Set()).output as Geometry;
+  assert(geo.mesh, 'hull produced mesh');
+  eq(geo.mesh!.numVerts, 8, 'cube hull keeps 8 unique vertices');
+  assert(geo.mesh!.numTris >= 12, `cube hull has boundary triangles, got ${geo.mesh!.numTris}`);
+  let minX = Infinity, maxX = -Infinity;
+  for (let i = 0; i < geo.mesh!.positions.length; i += 3) { minX = Math.min(minX, geo.mesh!.positions[i]!); maxX = Math.max(maxX, geo.mesh!.positions[i]!); }
+  close(minX, -1, 1e-6, 'hull min x');
+  close(maxX, 1, 1e-6, 'hull max x');
 });
 
 test('geom op: Flip Faces reverses triangle winding', () => {

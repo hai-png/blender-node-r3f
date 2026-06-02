@@ -23,7 +23,7 @@ function exportTree(tree: NodeTree): BngTreeT {
         if (it.kind === 'SOCKET') {
           const s = it as unknown as {
             in_out: 'INPUT' | 'OUTPUT'; socket_type: string; name: string; identifier: string;
-            description?: string; default_value?: unknown;
+            description?: string; default_value?: unknown; parent?: { id: string };
           };
           return {
             kind: 'socket' as const,
@@ -33,15 +33,19 @@ function exportTree(tree: NodeTree): BngTreeT {
             identifier: s.identifier,
             description: s.description,
             default_value: s.default_value,
+            parent: s.parent?.id ?? null,
           };
         }
-        const p = it as unknown as { name: string; id: string; description?: string; default_closed?: boolean };
+        const p = it as unknown as {
+          name: string; id: string; description?: string; default_closed?: boolean; parent?: { id: string };
+        };
         return {
           kind: 'panel' as const,
           name: p.name,
           identifier: p.id,
           description: p.description,
           default_closed: p.default_closed,
+          parent: p.parent?.id ?? null,
         };
       }),
     },
@@ -63,6 +67,7 @@ function exportNode(n: Node): BngNodeT {
     properties[k] = (n as unknown as Record<string, unknown>)[k];
   }
   const nodeTree = (n as unknown as { node_tree?: string }).node_tree ?? null;
+  const stateItems = (n as unknown as { state_items?: unknown }).state_items;
   return {
     id: n.id,
     bl_idname: n.bl_idname,
@@ -84,7 +89,10 @@ function exportNode(n: Node): BngNodeT {
       identifier: s.identifier,
       name: s.name,
       socket_type: s.bl_idname,
+      default_value: s.default_value,
+      hide_value: s.hide_value || undefined,
     })),
     node_tree: nodeTree,
+    ...(Array.isArray(stateItems) ? { state_items: structuredClone(stateItems) } : {}),
   };
 }

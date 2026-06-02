@@ -216,6 +216,18 @@ export function storeAttributeOn(
 /*  Bounding Box                                                      */
 /* ------------------------------------------------------------------ */
 
+function collectPositions(geo: Geometry): number[] {
+  const pts: number[] = [];
+  const add = (p?: Float32Array): void => {
+    if (!p) return;
+    for (let i = 0; i < p.length; i += 3) pts.push(p[i]!, p[i + 1]!, p[i + 2]!);
+  };
+  add(geo.mesh?.positions);
+  add(geo.points?.positions);
+  add(geo.curves?.positions);
+  return pts;
+}
+
 export function boundingBox(geo: Geometry): { min: Vec3; max: Vec3; geometry: Geometry } {
   let mnx = Infinity, mny = Infinity, mnz = Infinity;
   let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
@@ -247,6 +259,75 @@ export function boundingBox(geo: Geometry): { min: Vec3; max: Vec3; geometry: Ge
   const out = new Geometry();
   out.mesh = new MeshComponent(verts, tris);
   return { min: [mnx, mny, mnz], max: [mxx, mxy, mxz], geometry: out };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Convex Hull                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Naive 3D convex hull for modest node-graph meshes/point clouds. It tests
+ * every point triple and keeps triangles whose supporting plane has all
+ * points on one side. Coplanar faces may be over-triangulated, but the result
+ * is a valid closed hull boundary for non-degenerate input.
+ */
+export function convexHull(geo: Geometry): Geometry {
+  const raw = collectPositions(geo);
+  if (raw.length === 0) return Geometry.empty();
+
+  // Deduplicate positions so coplanar duplicate verts don't explode faces.
+  const pts: number[] = [];
+  const seen = new Set<string>();
+  const q = (x: number) => Math.round(x * 1e6) / 1e6;
+  for (let i = 0; i < raw.length; i += 3) {
+    const x = q(raw[i]!), y = q(raw[i + 1]!), z = q(raw[i + 2]!);
+    const k = `${x},${y},${z}`;
+    if (seen.has(k)) continue;
+    seen.add(k); pts.push(x, y, z);
+  }
+  const n = pts.length / 3;
+  const out = new Geometry();
+  if (n < 3) { out.mesh = new MeshComponent(new Float32Array(pts), new Uint32Array()); return out; }
+  if (n === 3) { out.mesh = new MeshComponent(new Float32Array(pts), new Uint32Array([0, 1, 2])); return out; }
+
+  const cx = (() => { let s = 0; for (let i = 0; i < n; i++) s += pts[i * 3]!; return s / n; })();
+  const cy = (() => { let s = 0; for (let i = 0; i < n; i++) s += pts[i * 3 + 1]!; return s / n; })();
+  const cz = (() => { let s = 0; for (let i = 0; i < n; i++) s += pts[i * 3 + 2]!; return s / n; })();
+
+  const tris: number[] = [];
+  const faceKeys = new Set<string>();
+  const eps = 1e-6;
+  for (let i = 0; i < n - 2; i++) for (let j = i + 1; j < n - 1; j++) for (let k = j + 1; k < n; k++) {
+    const ax = pts[i * 3]!, ay = pts[i * 3 + 1]!, az = pts[i * 3 + 2]!;
+    const bx = pts[j * 3]!, by = pts[j * 3 + 1]!, bz = pts[j * 3 + 2]!;
+    const cxp = pts[k * 3]!, cyp = pts[k * 3 + 1]!, czp = pts[k * 3 + 2]!;
+    const ux = bx - ax, uy = by - ay, uz = bz - az;
+    const vx = cxp - ax, vy = cyp - ay, vz = czp - az;
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len < eps) continue;
+    nx /= len; ny /= len; nz /= len;
+
+    let pos = false, neg = false;
+    for (let p = 0; p < n; p++) {
+      if (p === i || p === j || p === k) continue;
+      const d = nx * (pts[p * 3]! - ax) + ny * (pts[p * 3 + 1]! - ay) + nz * (pts[p * 3 + 2]! - az);
+      if (d > eps) pos = true; else if (d < -eps) neg = true;
+      if (pos && neg) break;
+    }
+    if (pos && neg) continue;
+
+    const sortedKey = [i, j, k].sort((a, b) => a - b).join('_');
+    if (faceKeys.has(sortedKey)) continue;
+    faceKeys.add(sortedKey);
+    // Orient outward: normal should point away from centroid.
+    const fcX = (ax + bx + cxp) / 3, fcY = (ay + by + cyp) / 3, fcZ = (az + bz + czp) / 3;
+    const outward = nx * (fcX - cx) + ny * (fcY - cy) + nz * (fcZ - cz) >= 0;
+    if (outward) tris.push(i, j, k); else tris.push(i, k, j);
+  }
+
+  out.mesh = new MeshComponent(new Float32Array(pts), new Uint32Array(tris));
+  return out;
 }
 
 /* ------------------------------------------------------------------ */

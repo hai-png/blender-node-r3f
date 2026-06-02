@@ -20,7 +20,7 @@ export type RGBA = [number, number, number, number];
 
 /** A single compositor value. Either an image or a constant. */
 export type Result =
-  | { kind: 'IMAGE'; target: WebGLRenderTarget; width: number; height: number }
+  | { kind: 'IMAGE'; target: WebGLRenderTarget; width: number; height: number; channel?: 0 | 1 | 2 | 3 }
   | { kind: 'VALUE'; value: number }
   | { kind: 'COLOR'; value: RGBA }
   | { kind: 'VECTOR'; value: Vec3 };

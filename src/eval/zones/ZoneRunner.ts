@@ -258,11 +258,13 @@ function runForeachZone(
   const geo: Geometry = (mainSock ? (ctx.socketValue(mainSock, cache) as Geometry) : Geometry.empty()) ?? Geometry.empty();
   const domain = input.domain;
   const N = geo.domainSize(domain);
+  const selection = foreachSelection(input, geo, domain, N, cache, ctx);
 
   // Per-iteration we collect new state values, then aggregate. For now we
   // join all geometry outputs and accumulate scalars / vectors via concat.
   const collected: ZoneState[] = [];
   for (let i = 0; i < N; i++) {
+    if (!selection[i]) continue;
     const iterCtx: ZoneIterContext = {
       zone_id: input.zone_id, zone_kind: 'FOREACH',
       iteration: i, total: N,
@@ -294,6 +296,26 @@ function runForeachZone(
     }
   }
   writeFinalState(output, items, aggregated, cache);
+}
+
+function foreachSelection(
+  input: GeometryNodeForeachGeometryElementInput,
+  geo: Geometry,
+  domain: import('./types').AttributeDomain,
+  size: number,
+  cache: Cache,
+  ctx: ZoneEvalContext,
+): boolean[] {
+  const sock = input.inputs.find((s) => s.identifier === '__selection');
+  if (!sock) return Array(size).fill(true) as boolean[];
+  const v = ctx.socketValue(sock, cache);
+  if (isFieldLike(v)) {
+    const arr = v.eval({ geometry: geo, domain, size });
+    return Array.from({ length: size }, (_, i) => Boolean(arr[i]));
+  }
+  if (typeof v === 'boolean') return Array(size).fill(v) as boolean[];
+  if (typeof v === 'number') return Array(size).fill(v !== 0) as boolean[];
+  return Array(size).fill(Boolean(sock.default_value)) as boolean[];
 }
 
 /**

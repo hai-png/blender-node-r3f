@@ -36,6 +36,12 @@ export const BngInterfaceItem = z.discriminatedUnion('kind', [
   }),
 ]);
 
+export const BngZoneStateItem = z.object({
+  identifier: z.string(),
+  name: z.string(),
+  socket_type: z.string(),
+});
+
 export const BngNode = z.object({
   id: z.string(),
   bl_idname: z.string(),
@@ -50,6 +56,8 @@ export const BngNode = z.object({
   outputs: z.array(BngSocketDef).optional(),
   /** For Group nodes: id of the referenced child tree. */
   node_tree: z.string().nullable().optional(),
+  /** For Geometry zone input nodes: dynamic state-item socket declarations. */
+  state_items: z.array(BngZoneStateItem).optional(),
 });
 
 export const BngLink = z.object({

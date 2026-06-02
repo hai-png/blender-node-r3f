@@ -74,8 +74,9 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
     const img = env.input('Image');
     const bright = env.input('Bright');
     const contrast = env.input('Contrast');
-    // Standard B/C: out = (img - 0.5) * (1 + c) + 0.5 + b
-    return `vec4(((${img}.rgb - 0.5) * (1.0 + (${contrast}).r)) + 0.5 + (${bright}).r, ${img}.a)`;
+    // Match the CPU evaluator and Blender-style percentage controls:
+    // out = img * (1 + contrast/100) + bright/100 + 0.5 * (1 - (1 + contrast/100)).
+    return `vec4(${img}.rgb * (1.0 + (${contrast}).r / 100.0) + (${bright}).r / 100.0 + 0.5 * (1.0 - (1.0 + (${contrast}).r / 100.0)), ${img}.a)`;
   },
 
   // ---------- Invert ----------
@@ -93,7 +94,7 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
   CompositorNodeGamma: (_node, env) => {
     const img = env.input('Image');
     const g = env.input('Gamma');
-    return `vec4(pow(max(${img}.rgb, vec3(0.0)), vec3(1.0 / max((${g}).r, 0.0001))), ${img}.a)`;
+    return `vec4(pow(max(${img}.rgb, vec3(0.0)), vec3(max((${g}).r, 0.0001))), ${img}.a)`;
   },
 
   // ---------- Exposure ----------
@@ -217,10 +218,10 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
     return `${img}`;
   },
 
-  // ---------- Color Ramp (black→white linear by Fac) ----------
-  CompositorNodeValToRGB: (_node, env) => {
+  // ---------- Color Ramp ----------
+  CompositorNodeValToRGB: (node, env) => {
     const f = `clamp(${env.input('Fac')}.r, 0.0, 1.0)`;
-    return `vec4(vec3(${f}), 1.0)`;
+    return rampExpression(node, f);
   },
 
   // ---------- RGB / Value (literal inputs are handled by the planner;
@@ -235,6 +236,31 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
  * emitter requires them. Add new helpers here when their callers reference
  * them by name.
  */
+function vec4Literal(c: readonly number[]): string {
+  return `vec4(${Number(c[0] ?? 0).toFixed(8)}, ${Number(c[1] ?? 0).toFixed(8)}, ${Number(c[2] ?? 0).toFixed(8)}, ${Number(c[3] ?? 1).toFixed(8)})`;
+}
+
+function rampExpression(node: Node, fExpr: string): string {
+  const raw = (node as unknown as { stops?: { position: number; color: number[] }[] }).stops;
+  const interpolation = (node as unknown as { interpolation?: string }).interpolation ?? 'LINEAR';
+  const stops = (raw && raw.length ? raw : [
+    { position: 0, color: [0, 0, 0, 1] },
+    { position: 1, color: [1, 1, 1, 1] },
+  ]).slice().sort((a, b) => a.position - b.position);
+  if (stops.length === 1) return vec4Literal(stops[0]!.color);
+  let expr = vec4Literal(stops[stops.length - 1]!.color);
+  for (let i = stops.length - 2; i >= 0; i--) {
+    const a = stops[i]!, b = stops[i + 1]!;
+    const denom = Math.max(1e-8, b.position - a.position);
+    let t = `clamp((${fExpr} - ${a.position.toFixed(8)}) / ${denom.toFixed(8)}, 0.0, 1.0)`;
+    if (interpolation === 'CONSTANT') t = '0.0';
+    else if (interpolation === 'EASE') t = `(${t} * ${t} * (3.0 - 2.0 * ${t}))`;
+    const seg = `mix(${vec4Literal(a.color)}, ${vec4Literal(b.color)}, ${t})`;
+    expr = `((${fExpr}) <= ${a.position.toFixed(8)} ? ${vec4Literal(a.color)} : ((${fExpr}) <= ${b.position.toFixed(8)} ? ${seg} : ${expr}))`;
+  }
+  return expr;
+}
+
 export const GLSL_PRELUDE = /* glsl */ `
 // rgb → hsv (https://stackoverflow.com/a/17897228)
 vec3 _rgb2hsv(vec3 c){

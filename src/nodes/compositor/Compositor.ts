@@ -12,7 +12,7 @@
  */
 import { Node, type NodeInitContext } from '../../core/Node';
 import { BoolProperty, EnumProperty, FloatProperty, StringProperty } from '../../core/Properties';
-import type { NodeTreeKind } from '../../core/types';
+import type { NodeTreeKind, RGBA } from '../../core/types';
 import {
   NodeSocketBool, NodeSocketColor, NodeSocketFloat, NodeSocketFloatFactor, NodeSocketImage,
   NodeSocketVector,
@@ -537,6 +537,11 @@ export class CompositorNodeSeparateColor extends CompNode {
   }
 }
 
+export interface CompositorColorRampStop {
+  position: number;
+  color: RGBA;
+}
+
 export class CompositorNodeValToRGB extends CompNode {
   static override bl_idname = 'CompositorNodeValToRGB';
   static override bl_label = 'Color Ramp';
@@ -544,8 +549,18 @@ export class CompositorNodeValToRGB extends CompNode {
   static override comp_kind = 'PIXEL';
   static override properties = {
     color_mode: EnumProperty({ items: [['RGB','RGB',''],['HSV','HSV','']], default: 'RGB' }),
+    interpolation: EnumProperty({
+      items: [['LINEAR','Linear',''],['CONSTANT','Constant',''],['EASE','Ease','']],
+      default: 'LINEAR', name: 'Interpolation',
+    }),
   };
-  // Two-stop black->white ramp baked into the GLSL emitter (kept simple for M5).
+  declare color_mode: string;
+  declare interpolation: 'LINEAR' | 'CONSTANT' | 'EASE';
+  /** Editable ramp stops. Defaults mirror Blender's black→white ramp. */
+  stops: CompositorColorRampStop[] = [
+    { position: 0, color: [0, 0, 0, 1] },
+    { position: 1, color: [1, 1, 1, 1] },
+  ];
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 0.5 });
     this.addOutput(NodeSocketColor, 'Image');

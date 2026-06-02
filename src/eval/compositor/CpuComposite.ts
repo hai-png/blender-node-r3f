@@ -92,6 +92,34 @@ function mixBlend(blend: string, a: RGBA, b: RGBA, f: number): RGBA {
   return [lerp(a[0], r[0]), lerp(a[1], r[1]), lerp(a[2], r[2]), a[3]];
 }
 
+function sampleRamp(stops: { position: number; color: number[] }[] | undefined, interpolation: string, tRaw: number): RGBA {
+  const t = clamp01(tRaw);
+  const sorted = (stops && stops.length ? stops : [
+    { position: 0, color: [0, 0, 0, 1] },
+    { position: 1, color: [1, 1, 1, 1] },
+  ]).slice().sort((a, b) => a.position - b.position);
+  if (sorted.length === 1) return toRGBA(sorted[0]!.color);
+  if (t <= sorted[0]!.position) return toRGBA(sorted[0]!.color);
+  if (t >= sorted[sorted.length - 1]!.position) return toRGBA(sorted[sorted.length - 1]!.color);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i]!, b = sorted[i + 1]!;
+    if (t >= a.position && t <= b.position) {
+      const denom = b.position - a.position;
+      let f = denom === 0 ? 0 : (t - a.position) / denom;
+      if (interpolation === 'CONSTANT') f = 0;
+      else if (interpolation === 'EASE') f = f * f * (3 - 2 * f);
+      const ca = toRGBA(a.color), cb = toRGBA(b.color);
+      return [
+        ca[0] + (cb[0] - ca[0]) * f,
+        ca[1] + (cb[1] - ca[1]) * f,
+        ca[2] + (cb[2] - ca[2]) * f,
+        ca[3] + (cb[3] - ca[3]) * f,
+      ];
+    }
+  }
+  return [0, 0, 0, 1];
+}
+
 function evalNode(node: Node, ctx: CpuCtx): void {
   const id = node.bl_idname;
   const set = (sockName: string, val: RGBA) => {
@@ -175,7 +203,15 @@ function evalNode(node: Node, ctx: CpuCtx): void {
       set('Val', [l, l, l, 1]); return;
     }
     case 'CompositorNodeValToRGB': {
-      const f = clamp01(scalar(node, 'Fac', ctx)); set('Image', [f, f, f, 1]); return;
+      const f = scalar(node, 'Fac', ctx);
+      const ramp = sampleRamp(
+        (node as unknown as { stops?: { position: number; color: number[] }[] }).stops,
+        (node as unknown as { interpolation?: string }).interpolation ?? 'LINEAR',
+        f,
+      );
+      set('Image', ramp);
+      set('Alpha', [ramp[3], ramp[3], ramp[3], 1]);
+      return;
     }
     case 'CompositorNodeMath': {
       const op = (node as unknown as { operation?: string }).operation ?? 'ADD';
@@ -222,7 +258,16 @@ export function cpuComposite(tree: NodeTree): RGBA | null {
     evalNode(n, ctx);
   }
   const out = order.find((n) => n.bl_idname === 'CompositorNodeComposite')
-    ?? order.find((n) => n.bl_idname === 'CompositorNodeViewer');
+    ?? order.find((n) => n.bl_idname === 'CompositorNodeViewer')
+    ?? order.find((n) => n.bl_idname === 'CompositorNodeSplitViewer');
   if (!out) return null;
+  if (out.bl_idname === 'CompositorNodeSplitViewer') {
+    const a = inputRGBA(out, 'Image', ctx);
+    const b = inputRGBA(out, 'Image_001', ctx);
+    const factor = ((out as unknown as { factor?: number }).factor ?? 50) / 100;
+    // Constant-frame shortcut: sample the centre pixel. Factor 100 => Image,
+    // factor 0 => Image_001, factor 50 chooses Image at the split boundary.
+    return 0.5 <= factor ? a : b;
+  }
   return inputRGBA(out, 'Image', ctx);
 }
