@@ -54,31 +54,161 @@ export function newAttribute(
 /*  Mesh                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * MeshComponent — now backed by *real* polygonal face/loop/edge topology
+ * (Blender's `Mesh`), while still exposing a derived `triangles` view so all
+ * existing rendering / sampling code keeps working unchanged.
+ *
+ * Topology model (mirrors Blender 4.x):
+ *   - `positions`   : POINT domain (vertices), size numVerts*3
+ *   - `faceOffsets` : CSR offsets into `cornerVerts`; face f owns corners
+ *                     [faceOffsets[f], faceOffsets[f+1]). size numFaces+1
+ *   - `cornerVerts` : CORNER domain — for each corner, the vertex it uses.
+ *                     size numCorners. Faces may be tris, quads or n-gons.
+ *   - `edges`       : EDGE domain — pairs (a,b) of vertex indices, deduped.
+ *                     size numEdges*2. Built lazily from faces if absent.
+ *   - `triangles`   : DERIVED triangulation (fan per face). Used for display /
+ *                     area / ray-style code that wants a triangle soup.
+ *
+ * Backward compatibility: `new MeshComponent(positions, triangles)` still
+ * works — when no explicit faces are supplied, every triangle becomes a face.
+ */
 export class MeshComponent {
   positions: Float32Array;
-  triangles: Uint32Array;
+  /** CSR face offsets, size = numFaces + 1. */
+  faceOffsets: Uint32Array;
+  /** Per-corner vertex index (CORNER domain), size = numCorners. */
+  cornerVerts: Uint32Array;
   attributes = new Map<string, Attribute>();
 
   /** Lazy caches. */
+  private _triangles?: Uint32Array;
+  /** Maps each derived triangle back to the originating face index. */
+  private _triToFace?: Uint32Array;
+  private _edges?: Uint32Array;
   private _normalsPoint?: Float32Array;
   private _normalsFace?: Float32Array;
   private _faceAreas?: Float32Array;
 
-  constructor(positions: Float32Array, triangles: Uint32Array) {
+  /**
+   * @param positions  flat vertex positions (numVerts*3)
+   * @param a          either a triangle index array (legacy) OR, when
+   *                   `cornerVerts` is also supplied, the CSR `faceOffsets`.
+   * @param cornerVerts when present, `a` is treated as `faceOffsets` and this
+   *                   is the per-corner vertex list (real polygonal topology).
+   */
+  constructor(positions: Float32Array, a: Uint32Array, cornerVerts?: Uint32Array) {
     this.positions = positions;
-    this.triangles = triangles;
+    if (cornerVerts) {
+      this.faceOffsets = a;
+      this.cornerVerts = cornerVerts;
+    } else {
+      const tris = a;
+      const nT = tris.length / 3;
+      this.faceOffsets = new Uint32Array(nT + 1);
+      for (let i = 0; i <= nT; i++) this.faceOffsets[i] = i * 3;
+      this.cornerVerts = tris.length ? new Uint32Array(tris) : new Uint32Array(0);
+      this._triangles = tris.length ? new Uint32Array(tris) : new Uint32Array(0);
+      const t2f = new Uint32Array(nT);
+      for (let i = 0; i < nT; i++) t2f[i] = i;
+      this._triToFace = t2f;
+    }
     this.attributes.set('position', {
       name: 'position', domain: 'POINT', dimensions: 3,
       data_type: 'VECTOR', data: positions,
     });
   }
 
+  /** Build from explicit polygonal faces (array of vertex-index arrays). */
+  static fromPolys(positions: Float32Array, polys: number[][]): MeshComponent {
+    const offsets = new Uint32Array(polys.length + 1);
+    let total = 0;
+    for (let i = 0; i < polys.length; i++) { offsets[i] = total; total += polys[i]!.length; }
+    offsets[polys.length] = total;
+    const corners = new Uint32Array(total);
+    let c = 0;
+    for (const poly of polys) for (const v of poly) corners[c++] = v;
+    return new MeshComponent(positions, offsets, corners);
+  }
+
   get numVerts() { return this.positions.length / 3; }
+  get numFaces() { return Math.max(0, this.faceOffsets.length - 1); }
+  get numCorners() { return this.cornerVerts.length; }
+  get numEdges() { return this.edges().length / 2; }
   get numTris() { return this.triangles.length / 3; }
-  /** Mesh treats triangles as faces; an n-gon would expand into multiple. */
-  get numFaces() { return this.numTris; }
-  get numEdges() { return this.numTris * 3; }      // upper bound (with duplicates)
-  get numCorners() { return this.numTris * 3; }
+
+  /** Number of corners (loops) of face f. */
+  faceSize(f: number): number {
+    return (this.faceOffsets[f + 1] ?? 0) - (this.faceOffsets[f] ?? 0);
+  }
+  /** Vertex indices of face f. */
+  faceVerts(f: number): number[] {
+    const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+    const out: number[] = [];
+    for (let i = s; i < e; i++) out.push(this.cornerVerts[i]!);
+    return out;
+  }
+
+  /** Derived fan triangulation, cached. */
+  get triangles(): Uint32Array {
+    if (this._triangles) return this._triangles;
+    const tris: number[] = [];
+    const t2f: number[] = [];
+    const nF = this.numFaces;
+    for (let f = 0; f < nF; f++) {
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      const n = e - s;
+      if (n < 3) continue;
+      const v0 = this.cornerVerts[s]!;
+      for (let k = 1; k < n - 1; k++) {
+        tris.push(v0, this.cornerVerts[s + k]!, this.cornerVerts[s + k + 1]!);
+        t2f.push(f);
+      }
+    }
+    this._triangles = new Uint32Array(tris);
+    this._triToFace = new Uint32Array(t2f);
+    return this._triangles;
+  }
+  set triangles(tris: Uint32Array) {
+    const nT = tris.length / 3;
+    this.faceOffsets = new Uint32Array(nT + 1);
+    for (let i = 0; i <= nT; i++) this.faceOffsets[i] = i * 3;
+    this.cornerVerts = new Uint32Array(tris);
+    this._triangles = new Uint32Array(tris);
+    const t2f = new Uint32Array(nT);
+    for (let i = 0; i < nT; i++) t2f[i] = i;
+    this._triToFace = t2f;
+    this._edges = undefined;
+    this.invalidateCaches();
+  }
+
+  /** Triangle → face index map (size numTris). */
+  triToFace(): Uint32Array {
+    if (!this._triToFace) { void this.triangles; }
+    return this._triToFace!;
+  }
+
+  /** Deduplicated edge list (size numEdges*2), built lazily from faces. */
+  edges(): Uint32Array {
+    if (this._edges) return this._edges;
+    const seen = new Set<number>();
+    const out: number[] = [];
+    const nF = this.numFaces;
+    const nv = this.numVerts;
+    for (let f = 0; f < nF; f++) {
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      const n = e - s;
+      for (let k = 0; k < n; k++) {
+        const a = this.cornerVerts[s + k]!;
+        const b = this.cornerVerts[s + ((k + 1) % n)]!;
+        const lo = Math.min(a, b), hi = Math.max(a, b);
+        const key = lo * nv + hi;
+        if (!seen.has(key)) { seen.add(key); out.push(lo, hi); }
+      }
+    }
+    this._edges = new Uint32Array(out);
+    return this._edges;
+  }
 
   invalidateCaches(): void {
     this._normalsPoint = undefined;
@@ -86,37 +216,56 @@ export class MeshComponent {
     this._faceAreas = undefined;
   }
 
+  /** Per-FACE normals (Newell's method — correct for n-gons). size numFaces*3 */
   faceNormals(): Float32Array {
     if (this._normalsFace) return this._normalsFace;
+    const p = this.positions;
+    const nF = this.numFaces;
+    const out = new Float32Array(nF * 3);
+    for (let f = 0; f < nF; f++) {
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      let nx = 0, ny = 0, nz = 0;
+      for (let k = s; k < e; k++) {
+        const cur = this.cornerVerts[k]! * 3;
+        const nxt = this.cornerVerts[k + 1 < e ? k + 1 : s]! * 3;
+        const cx = p[cur]!, cy = p[cur + 1]!, cz = p[cur + 2]!;
+        const dx = p[nxt]!, dy = p[nxt + 1]!, dz = p[nxt + 2]!;
+        nx += (cy - dy) * (cz + dz);
+        ny += (cz - dz) * (cx + dx);
+        nz += (cx - dx) * (cy + dy);
+      }
+      const l = Math.hypot(nx, ny, nz) || 1;
+      out[f * 3] = nx / l; out[f * 3 + 1] = ny / l; out[f * 3 + 2] = nz / l;
+    }
+    this._normalsFace = out;
+    return out;
+  }
+
+  /** Per-triangle normals (size numTris*3) — convenience for display code. */
+  triNormals(): Float32Array {
     const t = this.triangles, p = this.positions;
     const out = new Float32Array(this.numTris * 3);
     for (let i = 0; i < this.numTris; i++) {
       const a = t[i * 3]! * 3, b = t[i * 3 + 1]! * 3, c = t[i * 3 + 2]! * 3;
-      const ax = p[a]!, ay = p[a + 1]!, az = p[a + 2]!;
-      const bx = p[b]!, by = p[b + 1]!, bz = p[b + 2]!;
-      const cx = p[c]!, cy = p[c + 1]!, cz = p[c + 2]!;
-      const ux = bx - ax, uy = by - ay, uz = bz - az;
-      const vx = cx - ax, vy = cy - ay, vz = cz - az;
-      let nx = uy * vz - uz * vy;
-      let ny = uz * vx - ux * vz;
-      let nz = ux * vy - uy * vx;
+      const ux = p[b]! - p[a]!, uy = p[b + 1]! - p[a + 1]!, uz = p[b + 2]! - p[a + 2]!;
+      const vx = p[c]! - p[a]!, vy = p[c + 1]! - p[a + 1]!, vz = p[c + 2]! - p[a + 2]!;
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
       const l = Math.hypot(nx, ny, nz) || 1;
-      nx /= l; ny /= l; nz /= l;
-      out[i * 3] = nx; out[i * 3 + 1] = ny; out[i * 3 + 2] = nz;
+      out[i * 3] = nx / l; out[i * 3 + 1] = ny / l; out[i * 3 + 2] = nz / l;
     }
-    this._normalsFace = out;
     return out;
   }
 
   pointNormals(): Float32Array {
     if (this._normalsPoint) return this._normalsPoint;
     const fn = this.faceNormals();
-    const t = this.triangles;
     const out = new Float32Array(this.numVerts * 3);
-    for (let i = 0; i < this.numTris; i++) {
-      const nx = fn[i * 3]!, ny = fn[i * 3 + 1]!, nz = fn[i * 3 + 2]!;
-      for (let k = 0; k < 3; k++) {
-        const v = t[i * 3 + k]! * 3;
+    const nF = this.numFaces;
+    for (let f = 0; f < nF; f++) {
+      const nx = fn[f * 3]!, ny = fn[f * 3 + 1]!, nz = fn[f * 3 + 2]!;
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      for (let k = s; k < e; k++) {
+        const v = this.cornerVerts[k]! * 3;
         out[v] = (out[v] ?? 0) + nx;
         out[v + 1] = (out[v + 1] ?? 0) + ny;
         out[v + 2] = (out[v + 2] ?? 0) + nz;
@@ -131,25 +280,54 @@ export class MeshComponent {
     return out;
   }
 
+  /** Per-FACE areas (sum of fan-triangle areas — correct for n-gons). */
   faceAreas(): Float32Array {
     if (this._faceAreas) return this._faceAreas;
-    const t = this.triangles, p = this.positions;
-    const out = new Float32Array(this.numTris);
-    for (let i = 0; i < this.numTris; i++) {
-      const a = t[i * 3]! * 3, b = t[i * 3 + 1]! * 3, c = t[i * 3 + 2]! * 3;
-      const ux = p[b]! - p[a]!,     uy = p[b + 1]! - p[a + 1]!, uz = p[b + 2]! - p[a + 2]!;
-      const vx = p[c]! - p[a]!,     vy = p[c + 1]! - p[a + 1]!, vz = p[c + 2]! - p[a + 2]!;
-      const cx = uy * vz - uz * vy;
-      const cy = uz * vx - ux * vz;
-      const cz = ux * vy - uy * vx;
-      out[i] = 0.5 * Math.hypot(cx, cy, cz);
+    const p = this.positions;
+    const nF = this.numFaces;
+    const out = new Float32Array(nF);
+    for (let f = 0; f < nF; f++) {
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      const v0 = this.cornerVerts[s]! * 3;
+      let area = 0;
+      for (let k = s + 1; k < e - 1; k++) {
+        const a = v0, b = this.cornerVerts[k]! * 3, c = this.cornerVerts[k + 1]! * 3;
+        const ux = p[b]! - p[a]!, uy = p[b + 1]! - p[a + 1]!, uz = p[b + 2]! - p[a + 2]!;
+        const vx = p[c]! - p[a]!, vy = p[c + 1]! - p[a + 1]!, vz = p[c + 2]! - p[a + 2]!;
+        const cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
+        area += 0.5 * Math.hypot(cx, cy, cz);
+      }
+      out[f] = area;
     }
     this._faceAreas = out;
     return out;
   }
 
+  /** Face centroids (size numFaces*3). */
+  faceCenters(): Float32Array {
+    const p = this.positions;
+    const nF = this.numFaces;
+    const out = new Float32Array(nF * 3);
+    for (let f = 0; f < nF; f++) {
+      const s = this.faceOffsets[f]!, e = this.faceOffsets[f + 1]!;
+      let cx = 0, cy = 0, cz = 0;
+      for (let k = s; k < e; k++) {
+        const v = this.cornerVerts[k]! * 3;
+        cx += p[v]!; cy += p[v + 1]!; cz += p[v + 2]!;
+      }
+      const n = (e - s) || 1;
+      out[f * 3] = cx / n; out[f * 3 + 1] = cy / n; out[f * 3 + 2] = cz / n;
+    }
+    return out;
+  }
+
   clone(): MeshComponent {
-    const m = new MeshComponent(new Float32Array(this.positions), new Uint32Array(this.triangles));
+    const m = new MeshComponent(
+      new Float32Array(this.positions),
+      new Uint32Array(this.faceOffsets),
+      new Uint32Array(this.cornerVerts),
+    );
+    if (this._edges) m._edges = new Uint32Array(this._edges);
     for (const [k, attr] of this.attributes) {
       if (k === 'position') continue;
       const dataCopy =
@@ -380,16 +558,17 @@ export function buildCube(size: Vec3, position: Vec3 = [0, 0, 0]): Geometry {
     x - sx, y - sy, z + sz,   x + sx, y - sy, z + sz,
     x + sx, y + sy, z + sz,   x - sx, y + sy, z + sz,
   ]);
-  const t = new Uint32Array([
-    0, 2, 1,  0, 3, 2,
-    4, 5, 6,  4, 6, 7,
-    0, 1, 5,  0, 5, 4,
-    2, 3, 7,  2, 7, 6,
-    1, 2, 6,  1, 6, 5,
-    0, 4, 7,  0, 7, 3,
-  ]);
+  // Six quad faces (like Blender's Cube), CCW outward-facing.
+  const faces: number[][] = [
+    [0, 3, 2, 1],   // -Z
+    [4, 5, 6, 7],   // +Z
+    [0, 1, 5, 4],   // -Y
+    [2, 3, 7, 6],   // +Y
+    [1, 2, 6, 5],   // +X
+    [0, 4, 7, 3],   // -X
+  ];
   const g = new Geometry();
-  g.mesh = new MeshComponent(v, t);
+  g.mesh = MeshComponent.fromPolys(v, faces);
   return g;
 }
 
@@ -404,18 +583,24 @@ export function buildUVSphere(radius: number, rings = 16, segments = 24): Geomet
       verts.push(radius * sinT * Math.cos(phi), radius * cosT, radius * sinT * Math.sin(phi));
     }
   }
-  const tris: number[] = [];
+  // Quad bands with triangle fans at the poles (matches Blender's UV Sphere).
+  const faces: number[][] = [];
   const cols = segments + 1;
   for (let r = 0; r < rings; r++) {
     for (let s = 0; s < segments; s++) {
       const a = r * cols + s;
       const b = a + cols;
-      tris.push(a, b, a + 1);
-      tris.push(b, b + 1, a + 1);
+      if (r === 0) {
+        faces.push([a, b, b + 1]);            // top triangle fan
+      } else if (r === rings - 1) {
+        faces.push([a, b + 1, a + 1]);        // bottom triangle fan
+      } else {
+        faces.push([a, b, b + 1, a + 1]);     // mid quad
+      }
     }
   }
   const g = new Geometry();
-  g.mesh = new MeshComponent(new Float32Array(verts), new Uint32Array(tris));
+  g.mesh = MeshComponent.fromPolys(new Float32Array(verts), faces);
   return g;
 }
 
@@ -467,72 +652,71 @@ export function buildIcosphere(radius: number, subdivisions = 1): Geometry {
 
 export function buildCylinder(radius: number, depth: number, segments = 32, cap = true): Geometry {
   const verts: number[] = [];
-  const tris: number[] = [];
+  const faces: number[][] = [];
   const h = depth / 2;
-  // Side rings
-  for (let s = 0; s <= segments; s++) {
+  // Side ring vertices (no duplicate seam vertex — use modular indexing).
+  for (let s = 0; s < segments; s++) {
     const a = (s / segments) * 2 * Math.PI;
     const cx = Math.cos(a) * radius, cz = Math.sin(a) * radius;
-    verts.push(cx, -h, cz);
-    verts.push(cx,  h, cz);
+    verts.push(cx, -h, cz);   // bottom (even)
+    verts.push(cx,  h, cz);   // top    (odd)
   }
-  const stride = 2;
   for (let s = 0; s < segments; s++) {
-    const i = s * stride;
-    tris.push(i, i + 1, i + stride);
-    tris.push(i + 1, i + stride + 1, i + stride);
+    const b0 = (s * 2);
+    const t0 = b0 + 1;
+    const b1 = ((s + 1) % segments) * 2;
+    const t1 = b1 + 1;
+    faces.push([b0, b1, t1, t0]);   // side quad
   }
   if (cap) {
-    const baseBot = verts.length / 3;
-    verts.push(0, -h, 0);
-    const topBot = baseBot + 1;
-    verts.push(0,  h, 0);
-    for (let s = 0; s < segments; s++) {
-      tris.push(baseBot, s * stride + stride, s * stride);
-      tris.push(topBot,  s * stride + 1, s * stride + stride + 1);
-    }
+    // N-gon caps (Blender uses n-gon fill by default).
+    const bottom: number[] = [];
+    const top: number[] = [];
+    for (let s = 0; s < segments; s++) { bottom.push(s * 2); top.push(s * 2 + 1); }
+    faces.push(bottom.slice().reverse());  // bottom faces -Y
+    faces.push(top);                       // top faces +Y
   }
   const g = new Geometry();
-  g.mesh = new MeshComponent(new Float32Array(verts), new Uint32Array(tris));
+  g.mesh = MeshComponent.fromPolys(new Float32Array(verts), faces);
   return g;
 }
 
 export function buildCone(radiusBottom: number, radiusTop: number, depth: number, segments = 32, cap = true): Geometry {
   const verts: number[] = [];
-  const tris: number[] = [];
+  const faces: number[][] = [];
   const h = depth / 2;
-  for (let s = 0; s <= segments; s++) {
+  const pointed = radiusTop <= 1e-6;
+  for (let s = 0; s < segments; s++) {
     const a = (s / segments) * 2 * Math.PI;
     const ca = Math.cos(a), sa = Math.sin(a);
-    verts.push(ca * radiusBottom, -h, sa * radiusBottom);
-    verts.push(ca * radiusTop,    h, sa * radiusTop);
+    verts.push(ca * radiusBottom, -h, sa * radiusBottom);  // bottom (even)
+    if (!pointed) verts.push(ca * radiusTop, h, sa * radiusTop); // top (odd)
   }
-  const stride = 2;
+  const stride = pointed ? 1 : 2;
+  let apex = -1;
+  if (pointed) { apex = verts.length / 3; verts.push(0, h, 0); }
   for (let s = 0; s < segments; s++) {
-    const i = s * stride;
-    if (radiusTop > 1e-6) {
-      tris.push(i, i + 1, i + stride);
-      tris.push(i + 1, i + stride + 1, i + stride);
+    const b0 = s * stride;
+    const b1 = ((s + 1) % segments) * stride;
+    if (pointed) {
+      faces.push([b0, b1, apex]);
     } else {
-      tris.push(i, i + 1, i + stride);
+      const t0 = b0 + 1, t1 = b1 + 1;
+      faces.push([b0, b1, t1, t0]);
     }
   }
   if (cap) {
-    const baseBot = verts.length / 3;
-    verts.push(0, -h, 0);
-    for (let s = 0; s < segments; s++) {
-      tris.push(baseBot, s * stride + stride, s * stride);
-    }
-    if (radiusTop > 1e-6) {
-      const topBot = verts.length / 3;
-      verts.push(0, h, 0);
-      for (let s = 0; s < segments; s++) {
-        tris.push(topBot, s * stride + 1, s * stride + stride + 1);
-      }
+    const bottom: number[] = [];
+    for (let s = 0; s < segments; s++) bottom.push(s * stride);
+    faces.push(bottom.slice().reverse());
+    if (!pointed) {
+      const top: number[] = [];
+      for (let s = 0; s < segments; s++) top.push(s * stride + 1);
+      faces.push(top);
     }
   }
   const g = new Geometry();
-  g.mesh = new MeshComponent(new Float32Array(verts), new Uint32Array(tris));
+  g.mesh = MeshComponent.fromPolys(new Float32Array(verts), faces);
   return g;
 }
 
@@ -546,19 +730,19 @@ export function buildGrid(sizeX: number, sizeY: number, vx: number, vy: number):
       verts.push(x, 0, y);
     }
   }
-  const tris: number[] = [];
+  // Quad faces (Blender's Grid is all quads).
+  const faces: number[][] = [];
   for (let j = 0; j < vy - 1; j++) {
     for (let i = 0; i < vx - 1; i++) {
       const a = j * vx + i;
       const b = a + 1;
       const c = a + vx;
       const d = c + 1;
-      tris.push(a, c, b);
-      tris.push(b, c, d);
+      faces.push([a, c, d, b]);
     }
   }
   const g = new Geometry();
-  g.mesh = new MeshComponent(new Float32Array(verts), new Uint32Array(tris));
+  g.mesh = MeshComponent.fromPolys(new Float32Array(verts), faces);
   return g;
 }
 
@@ -586,16 +770,18 @@ export function buildMeshCircle(vertices: number, radius: number, fillType: 'NON
     const a = (i / vertices) * 2 * Math.PI;
     verts.push(Math.cos(a) * radius, 0, Math.sin(a) * radius);
   }
-  const tris: number[] = [];
-  if (fillType === 'TRIANGLE_FAN' || fillType === 'NGON') {
+  const faces: number[][] = [];
+  if (fillType === 'NGON') {
+    const ring: number[] = [];
+    for (let i = 0; i < vertices; i++) ring.push(i);
+    faces.push(ring);
+  } else if (fillType === 'TRIANGLE_FAN') {
     const center = verts.length / 3;
     verts.push(0, 0, 0);
-    for (let i = 0; i < vertices; i++) {
-      tris.push(center, i, (i + 1) % vertices);
-    }
+    for (let i = 0; i < vertices; i++) faces.push([center, i, (i + 1) % vertices]);
   }
   const g = new Geometry();
-  g.mesh = new MeshComponent(new Float32Array(verts), new Uint32Array(tris));
+  g.mesh = MeshComponent.fromPolys(new Float32Array(verts), faces);
   return g;
 }
 

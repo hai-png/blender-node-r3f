@@ -39,7 +39,7 @@ import {
   distributePointsOnFaces, instanceOnPoints, realizeInstances,
   curveToMesh, curveToPoints, resampleCurve, reverseCurve,
   sampleNearestIndex, geometryProximity, sampleCurveAtFactor, subdivideCurve,
-  fillCurve, filletCurve,
+  fillCurve, filletCurve, meshBoolean, triangulateMesh,
   translationMat4, rotationMat4, scaleMat4, transformAroundPivotMat4, mat4Mul, flipFaces,
 } from './geometry/MeshOps';
 
@@ -81,7 +81,7 @@ import {
 import {
   GeometryNodeSetPosition, GeometryNodeCaptureAttribute, GeometryNodeStoreNamedAttribute,
   GeometryNodeRemoveAttribute, GeometryNodeBoundBox, GeometryNodeConvexHull, GeometryNodeMergeByDistance,
-  GeometryNodeSubdivisionSurface, GeometryNodeTriangulate, GeometryNodeDistributePointsOnFaces,
+  GeometryNodeSubdivisionSurface, GeometryNodeTriangulate, GeometryNodeMeshBoolean, GeometryNodeDistributePointsOnFaces,
   GeometryNodeMeshToPoints, GeometryNodePointsToVertices,
   GeometryNodeInstanceOnPoints, GeometryNodeRealizeInstances,
   GeometryNodeTranslateInstances, GeometryNodeRotateInstances, GeometryNodeScaleInstances,
@@ -152,29 +152,79 @@ function valueNoise2(x: number, y: number): number {
 function valueNoise3(x: number, y: number, z: number): number {
   return (valueNoise2(x + z * 0.37, y + z * 0.61) + valueNoise2(y + x * 0.19, z + x * 0.53)) * 0.5;
 }
-function voronoiDistance(x: number, y: number, z: number, metric: string): { distance: number; position: Vec3; color: [number, number, number, number] } {
+/** Multi-octave fBm (Blender Noise Texture: octaves=detail+1, falloff=roughness). */
+function fbm3(x: number, y: number, z: number, detail: number, roughness: number): number {
+  const octaves = Math.min(8, Math.max(1, Math.round(detail) + 1));
+  let sum = 0, amp = 1, norm = 0, freq = 1;
+  for (let i = 0; i < octaves; i++) {
+    sum += valueNoise3(x * freq, y * freq, z * freq) * amp;
+    norm += amp;
+    amp *= roughness;
+    freq *= 2;
+  }
+  return norm > 0 ? sum / norm : 0;
+}
+function voronoiMetric(dx: number, dy: number, dz: number, metric: string, exponent: number): number {
+  switch (metric) {
+    case 'MANHATTAN': return Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
+    case 'CHEBYCHEV': return Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
+    case 'MINKOWSKI': {
+      const e = Math.max(0.001, exponent);
+      return (Math.abs(dx) ** e + Math.abs(dy) ** e + Math.abs(dz) ** e) ** (1 / e);
+    }
+    default: return Math.hypot(dx, dy, dz);
+  }
+}
+/**
+ * 3×3×3 cell Voronoi supporting the full Blender feature set:
+ *   F1 / F2 / SMOOTH_F1 / DISTANCE_TO_EDGE / N_SPHERE_RADIUS,
+ * metrics (Euclidean / Manhattan / Chebychev / Minkowski), Randomness,
+ * Smoothness and Exponent.
+ */
+function voronoi(
+  x: number, y: number, z: number,
+  metric: string, feature: string,
+  randomness: number, smoothness: number, exponent: number,
+): { distance: number; position: Vec3; color: [number, number, number, number] } {
   const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
-  let best = Infinity;
-  let bestPos: Vec3 = [0, 0, 0];
-  let bestColor: [number, number, number, number] = [0, 0, 0, 1];
+  let f1 = Infinity, f2 = Infinity;
+  let p1: Vec3 = [0, 0, 0]; let c1: Vec3 = [0, 0, 0];
+  let smoothAccum = 0, smoothWeight = 0;
+  const smoothPos: Vec3 = [0, 0, 0]; const smoothCol: Vec3 = [0, 0, 0];
+  const s = Math.max(1e-4, smoothness);
   for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
     const cx = xi + dx, cy = yi + dy, cz = zi + dz;
-    const px = cx + hash2(cx + cz * 13.7, cy + 0.11);
-    const py = cy + hash2(cy + cx * 7.3, cz + 0.29);
-    const pz = cz + hash2(cz + cy * 5.1, cx + 0.47);
-    const ddx = px - x, ddy = py - y, ddz = pz - z;
-    const d = metric === 'MANHATTAN'
-      ? Math.abs(ddx) + Math.abs(ddy) + Math.abs(ddz)
-      : metric === 'CHEBYCHEV'
-        ? Math.max(Math.abs(ddx), Math.abs(ddy), Math.abs(ddz))
-        : Math.hypot(ddx, ddy, ddz);
-    if (d < best) {
-      best = d;
-      bestPos = [px, py, pz];
-      bestColor = [hash2(px, py), hash2(py, pz), hash2(pz, px), 1];
-    }
+    const jx = (hash2(cx + cz * 13.7, cy + 0.11) - 0.5) * randomness + 0.5;
+    const jy = (hash2(cy + cx * 7.3, cz + 0.29) - 0.5) * randomness + 0.5;
+    const jz = (hash2(cz + cy * 5.1, cx + 0.47) - 0.5) * randomness + 0.5;
+    const px = cx + jx, py = cy + jy, pz = cz + jz;
+    const d = voronoiMetric(px - x, py - y, pz - z, metric, exponent);
+    const col: Vec3 = [hash2(px, py), hash2(py, pz), hash2(pz, px)];
+    if (d < f1) { f2 = f1; f1 = d; p1 = [px, py, pz]; c1 = col; }
+    else if (d < f2) { f2 = d; }
+    // Smooth F1 (exponential weighting).
+    const w = Math.exp(-d / s);
+    smoothAccum += d * w; smoothWeight += w;
+    smoothPos[0] += px * w; smoothPos[1] += py * w; smoothPos[2] += pz * w;
+    smoothCol[0] += col[0] * w; smoothCol[1] += col[1] * w; smoothCol[2] += col[2] * w;
   }
-  return { distance: Math.min(best, 1), position: bestPos, color: bestColor };
+  let distance: number;
+  let position = p1;
+  let color: Vec3 = c1;
+  switch (feature) {
+    case 'F2': distance = f2; break;
+    case 'SMOOTH_F1': {
+      const inv = smoothWeight > 0 ? 1 / smoothWeight : 0;
+      distance = smoothAccum * inv;
+      position = [smoothPos[0] * inv, smoothPos[1] * inv, smoothPos[2] * inv];
+      color = [smoothCol[0] * inv, smoothCol[1] * inv, smoothCol[2] * inv];
+      break;
+    }
+    case 'DISTANCE_TO_EDGE': distance = (f2 - f1) * 0.5; break;
+    case 'N_SPHERE_RADIUS': distance = f1 * 0.5; break;
+    default: distance = f1;
+  }
+  return { distance: Math.min(distance, 1), position, color: [color[0], color[1], color[2], 1] };
 }
 function sampleImageNearest(img: ImageData, u: number, v: number): [number, number, number, number] {
   const x = Math.max(0, Math.min(img.width - 1, Math.floor(clamp01(u) * img.width)));
@@ -1272,19 +1322,23 @@ export class GeometryEvaluator implements SystemEvaluator {
     if (node instanceof ShaderNodeTexNoise) {
       const vecF = this.socketField(node.inputs[0]!, cache);
       const scaleF = this.socketField(node.inputs[1]!, cache);
+      const detailF = this.socketField(node.inputs[2]!, cache);
+      const roughF = this.socketField(node.inputs[3]!, cache);
       const distortionF = this.socketField(node.inputs[4]!, cache);
       cache.set(node.outputs[0]!.id, {
         kind: 'FLOAT',
         eval(ctx) {
           const vv = vecF.eval(ctx) as Float32Array;
           const sv = scaleF.eval(ctx) as Float32Array;
+          const det = detailF.eval(ctx) as Float32Array;
+          const rgh = roughF.eval(ctx) as Float32Array;
           const dv = distortionF.eval(ctx) as Float32Array;
           const out = new Float32Array(ctx.size);
           for (let i = 0; i < ctx.size; i++) {
             const x = vv[i * 3]!, y = vv[i * 3 + 1]!, z = vv[i * 3 + 2]!;
             const s = sv[i] || 1;
             const wobble = dv[i] ? valueNoise3(x * s * 0.5 + 19.7, y * s * 0.5 + 7.1, z * s * 0.5 + 3.9) * dv[i]! : 0;
-            out[i] = valueNoise3(x * s + wobble, y * s + wobble, z * s + wobble);
+            out[i] = fbm3(x * s + wobble, y * s + wobble, z * s + wobble, det[i] ?? 2, rgh[i] ?? 0.5);
           }
           return out;
         },
@@ -1367,15 +1421,27 @@ export class GeometryEvaluator implements SystemEvaluator {
     if (node instanceof ShaderNodeTexVoronoi) {
       const vecF = this.socketField(node.inputs[0]!, cache);
       const scaleF = this.socketField(node.inputs[1]!, cache);
+      const smoothF = this.socketField(node.inputs[2]!, cache);
+      const expF = this.socketField(node.inputs[3]!, cache);
+      const randF = this.socketField(node.inputs[4]!, cache);
+      const metric = node.distance;
+      const feature = (node as unknown as { feature: string }).feature;
+      const sampleAll = (ctx: FieldContext) => {
+        const vv = vecF.eval(ctx) as Float32Array;
+        const sv = scaleF.eval(ctx) as Float32Array;
+        const sm = smoothF.eval(ctx) as Float32Array;
+        const ex = expF.eval(ctx) as Float32Array;
+        const rn = randF.eval(ctx) as Float32Array;
+        return { vv, sv, sm, ex, rn };
+      };
       cache.set(node.outputs[0]!.id, {
         kind: 'FLOAT',
         eval(ctx) {
-          const vv = vecF.eval(ctx) as Float32Array;
-          const sv = scaleF.eval(ctx) as Float32Array;
+          const { vv, sv, sm, ex, rn } = sampleAll(ctx);
           const out = new Float32Array(ctx.size);
           for (let i = 0; i < ctx.size; i++) {
-            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
-            out[i] = r.distance;
+            const sc = sv[i] || 1;
+            out[i] = voronoi(vv[i * 3]! * sc, vv[i * 3 + 1]! * sc, vv[i * 3 + 2]! * sc, metric, feature, (rn[i] ?? 1), (sm[i] ?? 1), (ex[i] ?? 0.5)).distance;
           }
           return out;
         },
@@ -1383,11 +1449,11 @@ export class GeometryEvaluator implements SystemEvaluator {
       cache.set(node.outputs[1]!.id, {
         kind: 'COLOR',
         eval(ctx) {
-          const vv = vecF.eval(ctx) as Float32Array;
-          const sv = scaleF.eval(ctx) as Float32Array;
+          const { vv, sv, sm, ex, rn } = sampleAll(ctx);
           const out = new Float32Array(ctx.size * 4);
           for (let i = 0; i < ctx.size; i++) {
-            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
+            const sc = sv[i] || 1;
+            const r = voronoi(vv[i * 3]! * sc, vv[i * 3 + 1]! * sc, vv[i * 3 + 2]! * sc, metric, feature, (rn[i] ?? 1), (sm[i] ?? 1), (ex[i] ?? 0.5));
             out[i * 4] = r.color[0]; out[i * 4 + 1] = r.color[1]; out[i * 4 + 2] = r.color[2]; out[i * 4 + 3] = 1;
           }
           return out;
@@ -1396,11 +1462,11 @@ export class GeometryEvaluator implements SystemEvaluator {
       cache.set(node.outputs[2]!.id, {
         kind: 'VECTOR',
         eval(ctx) {
-          const vv = vecF.eval(ctx) as Float32Array;
-          const sv = scaleF.eval(ctx) as Float32Array;
+          const { vv, sv, sm, ex, rn } = sampleAll(ctx);
           const out = new Float32Array(ctx.size * 3);
           for (let i = 0; i < ctx.size; i++) {
-            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
+            const sc = sv[i] || 1;
+            const r = voronoi(vv[i * 3]! * sc, vv[i * 3 + 1]! * sc, vv[i * 3 + 2]! * sc, metric, feature, (rn[i] ?? 1), (sm[i] ?? 1), (ex[i] ?? 0.5));
             out[i * 3] = r.position[0]; out[i * 3 + 1] = r.position[1]; out[i * 3 + 2] = r.position[2];
           }
           return out;
@@ -2059,9 +2125,30 @@ export class GeometryEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof GeometryNodeTriangulate) {
-      // already triangulated internally; pass-through.
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      cache.set(node.outputs[0]!.id, geo);
+      const selF = this.socketField(node.inputs[1]!, cache);
+      const minVerts = Math.max(3, this.socketSingle<number>(node.inputs[2]!, cache, geo) | 0);
+      const ctx: FieldContext = { geometry: geo, domain: 'FACE', size: geo.domainSize('FACE') };
+      const sel = node.inputs[1]!.is_linked ? (selF.eval(ctx) as ScalarTypedArray) : null;
+      cache.set(node.outputs[0]!.id, triangulateMesh(geo, sel, minVerts));
+      return;
+    }
+    if (node instanceof GeometryNodeMeshBoolean) {
+      const op = node.operation;
+      const mesh1 = node.inputs[0]!.is_linked
+        ? (this.socketValue(node.inputs[0]!, cache) as Geometry)
+        : null;
+      // Mesh 2 is multi-input — gather all linked sources in sort order.
+      const m2sock = node.inputs[1]!;
+      const others: Geometry[] = [];
+      const sorted = [...m2sock.links].sort((a, b) => a.multi_input_sort_id - b.multi_input_sort_id);
+      for (const link of sorted) {
+        if (!link.is_valid || link.is_muted) continue;
+        const g = cache.get(link.from_socket.id) as Geometry | undefined;
+        if (g) others.push(g);
+      }
+      cache.set(node.outputs[0]!.id, meshBoolean(mesh1, others, op));
+      if (node.outputs[1]) cache.set(node.outputs[1].id, constField(false, 'BOOL'));
       return;
     }
     if (node instanceof GeometryNodeDistributePointsOnFaces) {

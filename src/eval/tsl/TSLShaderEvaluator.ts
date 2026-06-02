@@ -64,6 +64,14 @@ export interface TSLMaterialDescriptor {
   iorNode?: TSLNode;
   transmissionNode?: TSLNode;
   alphaTest?: TSLNode;
+  /** MeshStandardNodeMaterial / MeshPhysicalNodeMaterial extras. */
+  clearcoatNode?: TSLNode;
+  clearcoatRoughnessNode?: TSLNode;
+  clearcoatNormalNode?: TSLNode;
+  sheenNode?: TSLNode;
+  sheenRoughnessNode?: TSLNode;
+  sheenColorNode?: TSLNode;
+  anisotropyNode?: TSLNode;
 }
 
 const {
@@ -536,36 +544,94 @@ registerEmit('ShaderNodeLightPath', () => ({
 /*  Procedural textures                                             */
 /* ---------------------------------------------------------------- */
 registerEmit('ShaderNodeTexNoise', (n, c) => {
-  const v = c.input(n.inputs[0]!);
-  const scale = c.input(n.inputs[1]!);
-  // mx_noise_float from MaterialX is shipped in three/tsl. If it isn't
-  // available at runtime, fall back to a simple hash noise (still TSL).
-  const coords = v.mul(scale);
-  let noise: TSLNode;
+  const v = generatedVector(n, 0, c);
+  const scale = scalarInputOr(n, 1, c, 5);
+  // Detail/Roughness/Distortion drive a multi-octave fBm (matches Blender's
+  // Noise Texture: octaves = Detail, amplitude falloff = Roughness, frequency
+  // doubles per octave). Detail is read as a literal property so we can unroll
+  // the octave loop on the CPU side (TSL has no dynamic loops here).
+  const detailProp = Math.max(0, (n as unknown as { detail?: number }).detail ?? 2);
+  const octaves = Math.min(8, Math.max(1, Math.round(detailProp) + 1));
+  const roughness = scalarInputOr(n, 3, c, 0.5);
+  const distortion = scalarInputOr(n, 4, c, 0);
+
   const tslAny = TSL as unknown as Record<string, unknown>;
-  if (typeof tslAny['mx_noise_float'] === 'function') {
-    noise = (tslAny['mx_noise_float'] as (c: TSLNode) => TSLNode)(coords);
-  } else if (typeof tslAny['triNoise3D'] === 'function') {
-    noise = (tslAny['triNoise3D'] as (a: TSLNode, b: TSLNode, c: TSLNode) => TSLNode)(coords, float(0.5), float(0));
-  } else {
-    // Hash-based pseudo-noise: fract(sin(dot(p, k)) * c)
-    noise = coords.dot(vec3(12.9898, 78.233, 37.719)).sin().mul(43758.5453).fract();
+  const base = (p: TSLNode): TSLNode => {
+    if (typeof tslAny['mx_noise_float'] === 'function') {
+      return (tslAny['mx_noise_float'] as (q: TSLNode) => TSLNode)(p).mul(0.5).add(0.5);
+    }
+    return toVec3(p).dot(vec3(12.9898, 78.233, 37.719)).sin().mul(43758.5453).fract();
+  };
+
+  // Optional distortion: warp the input coords with a secondary noise sample.
+  let coords = v.mul(scale);
+  const warp = base(coords.add(vec3(13.5, 7.3, 2.1))).sub(0.5).mul(distortion);
+  coords = coords.add(vec3(warp, warp, warp));
+
+  // Accumulate octaves: sum_{i} amp_i * noise(coords * freq_i), amp normalised.
+  let sum: TSLNode = float(0);
+  let amp = float(1);
+  let norm = float(0);
+  let freq = float(1);
+  for (let i = 0; i < octaves; i++) {
+    sum = sum.add(base(coords.mul(freq)).mul(amp));
+    norm = norm.add(amp);
+    amp = amp.mul(roughness);
+    freq = freq.mul(2);
   }
+  const noise = sum.div(norm.max(1e-4)).clamp(0, 1);
   return { Fac: noise, Color: vec4(noise, noise, noise, 1) };
 });
 registerEmit('ShaderNodeTexVoronoi', (n, c) => {
+  // Full 3×3×3-cell Voronoi computing F1 & F2, supporting the Feature enum
+  // (F1 / F2 / SMOOTH_F1 / DISTANCE_TO_EDGE / N_SPHERE_RADIUS) and metric.
   const p = generatedVector(n, 0, c).mul(scalarInputOr(n, 1, c, 5));
-  const cell = p.floor();
-  const local = p.fract().sub(vec3(0.5, 0.5, 0.5));
   const randomness = scalarInputOr(n, 4, c, 1).clamp(0, 1);
-  const jitter = hash3(cell).sub(vec3(0.5, 0.5, 0.5)).mul(randomness);
-  const position = cell.add(jitter);
-  const delta = local.sub(jitter);
-  const distance = delta.length().clamp(0, 1);
+  const exponent = scalarInputOr(n, 3, c, 0.5);
+  const metric = (n as unknown as { distance?: string }).distance ?? 'EUCLIDEAN';
+  const feature = (n as unknown as { feature?: string }).feature ?? 'F1';
+  const cell = p.floor();
+  const local = p.sub(cell);
+
+  const dist = (delta: TSLNode): TSLNode => {
+    if (metric === 'MANHATTAN') return delta.abs().dot(vec3(1, 1, 1));
+    if (metric === 'CHEBYCHEV') { const a = delta.abs(); return a.x.max(a.y).max(a.z); }
+    if (metric === 'MINKOWSKI') {
+      const a = delta.abs(); const e = exponent.max(0.001);
+      return a.x.pow(e).add(a.y.pow(e)).add(a.z.pow(e)).pow(e.reciprocal());
+    }
+    return delta.length();
+  };
+
+  let f1: TSLNode = float(1e6);
+  let f2: TSLNode = float(1e6);
+  let bestPos: TSLNode = cell;
+  let bestCol: TSLNode = vec3(0, 0, 0);
+  for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const off = vec3(dx, dy, dz);
+    const cc = cell.add(off);
+    const jitter = hash3(cc).sub(vec3(0.5, 0.5, 0.5)).mul(randomness).add(vec3(0.5, 0.5, 0.5));
+    const featurePos = off.add(jitter);
+    const d = dist(featurePos.sub(local));
+    const isNewF1 = d.lessThan(f1);
+    // f2 = min(f2, max(f1, d)) update order kept simple via select():
+    f2 = isNewF1.select(f1, f2.min(d));
+    bestPos = isNewF1.select(cc.add(jitter), bestPos);
+    bestCol = isNewF1.select(hash3(cc), bestCol);
+    f1 = f1.min(d);
+  }
+
+  let distance: TSLNode;
+  switch (feature) {
+    case 'F2': distance = f2; break;
+    case 'DISTANCE_TO_EDGE': distance = f2.sub(f1).mul(0.5); break;
+    case 'N_SPHERE_RADIUS': distance = f1.mul(0.5); break;
+    default: distance = f1; // F1 and SMOOTH_F1 (approximated as F1 in TSL)
+  }
   return {
-    Distance: distance,
-    Color: vec4(hash3(cell), 1),
-    Position: position,
+    Distance: distance.clamp(0, 1),
+    Color: vec4(bestCol, 1),
+    Position: bestPos,
   };
 });
 registerEmit('ShaderNodeTexWave', (n, c) => {
@@ -746,14 +812,27 @@ registerEmit('ShaderNodeVectorDisplacement', (n, c) => {
 /*  Shader closures                                                  */
 /* ---------------------------------------------------------------- */
 registerEmit('ShaderNodeBsdfPrincipled', (n, c) => {
-  const baseColor = c.input(n.inputs[0]!);
-  const metalness = c.input(n.inputs[1]!);
-  const roughness = c.input(n.inputs[2]!);
-  const ior = c.input(n.inputs[3]!);
-  const alpha = c.input(n.inputs[4]!);
-  const _normal = c.input(n.inputs[5]!); void _normal;
-  const emissiveColor = c.input(n.inputs[6]!);
-  const emissiveStrength = c.input(n.inputs[7]!);
+  // Resolve sockets by name so the full Blender 4.x input set maps correctly
+  // regardless of declaration index.
+  const byName = (name: string): TSLNode | undefined => {
+    const s = n.inputs.find((x) => x.name === name || x.identifier === name);
+    return s ? c.input(s) : undefined;
+  };
+  const baseColor = byName('Base Color') ?? color(0.8, 0.8, 0.8);
+  const metalness = byName('Metallic') ?? float(0);
+  const roughness = byName('Roughness') ?? float(0.5);
+  const ior = byName('IOR') ?? float(1.5);
+  const alpha = byName('Alpha') ?? float(1);
+  const emissiveColor = byName('Emission Color') ?? color(0, 0, 0);
+  const emissiveStrength = byName('Emission Strength') ?? float(0);
+  const transmission = byName('Transmission Weight') ?? float(0);
+  const coatWeight = byName('Coat Weight') ?? float(0);
+  const coatRough = byName('Coat Roughness') ?? float(0.03);
+  const sheenWeight = byName('Sheen Weight') ?? float(0);
+  const sheenRough = byName('Sheen Roughness') ?? float(0.5);
+  const sheenTint = byName('Sheen Tint') ?? color(1, 1, 1);
+  const anisotropic = byName('Anisotropic') ?? float(0);
+
   const desc: TSLMaterialDescriptor = {
     colorNode: baseColor,
     metalnessNode: metalness,
@@ -761,6 +840,13 @@ registerEmit('ShaderNodeBsdfPrincipled', (n, c) => {
     iorNode: ior,
     opacityNode: alpha,
     emissiveNode: emissiveColor.xyz ? emissiveColor.xyz.mul(emissiveStrength) : mul(emissiveColor, emissiveStrength),
+    transmissionNode: transmission,
+    clearcoatNode: coatWeight,
+    clearcoatRoughnessNode: coatRough,
+    sheenNode: sheenWeight,
+    sheenRoughnessNode: sheenRough,
+    sheenColorNode: sheenTint.xyz ? sheenTint.xyz : sheenTint,
+    anisotropyNode: anisotropic,
   };
   return { BSDF: desc as unknown as TSLNode };
 });
@@ -1136,7 +1222,18 @@ export class TSLShaderEvaluator implements SystemEvaluator {
     // default_value fallbacks.
     let material: TWG.MeshStandardNodeMaterial | null = null;
     try {
-      material = new TWG.MeshStandardNodeMaterial();
+      // Use a physical material when the closure carries physical-only channels
+      // (transmission / clearcoat / sheen / anisotropy / ior); otherwise the
+      // lighter MeshStandardNodeMaterial.
+      const PhysicalCtor = (TWG as unknown as { MeshPhysicalNodeMaterial?: typeof TWG.MeshStandardNodeMaterial }).MeshPhysicalNodeMaterial;
+      const needsPhysical = !!(
+        desc.transmissionNode || desc.clearcoatNode || desc.sheenNode ||
+        desc.anisotropyNode || desc.iorNode
+      ) && !!PhysicalCtor;
+      material = needsPhysical && PhysicalCtor
+        ? new PhysicalCtor()
+        : new TWG.MeshStandardNodeMaterial();
+      const mAny = material as unknown as Record<string, unknown>;
       if (desc.colorNode) material.colorNode = desc.colorNode;
       if (desc.metalnessNode) material.metalnessNode = desc.metalnessNode;
       if (desc.roughnessNode) material.roughnessNode = desc.roughnessNode;
@@ -1147,6 +1244,22 @@ export class TSLShaderEvaluator implements SystemEvaluator {
         material.transparent = true;
       }
       if (desc.positionNode) material.positionNode = desc.positionNode;
+      // Physical-only channels (assigned dynamically so the standard-material
+      // path stays untouched on non-physical materials).
+      if (needsPhysical) {
+        if (desc.iorNode) mAny['iorNode'] = desc.iorNode;
+        if (desc.transmissionNode) {
+          mAny['transmissionNode'] = desc.transmissionNode;
+          (material as unknown as { transparent: boolean }).transparent = true;
+        }
+        if (desc.clearcoatNode) mAny['clearcoatNode'] = desc.clearcoatNode;
+        if (desc.clearcoatRoughnessNode) mAny['clearcoatRoughnessNode'] = desc.clearcoatRoughnessNode;
+        if (desc.clearcoatNormalNode) mAny['clearcoatNormalNode'] = desc.clearcoatNormalNode;
+        if (desc.sheenNode) mAny['sheenNode'] = desc.sheenNode;
+        if (desc.sheenRoughnessNode) mAny['sheenRoughnessNode'] = desc.sheenRoughnessNode;
+        if (desc.sheenColorNode) mAny['sheenColorNode'] = desc.sheenColorNode;
+        if (desc.anisotropyNode) mAny['anisotropyNode'] = desc.anisotropyNode;
+      }
     } catch (e) {
       errors.set('__material__', (e as Error).message);
     }

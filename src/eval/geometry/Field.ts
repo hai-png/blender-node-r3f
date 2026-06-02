@@ -196,18 +196,21 @@ export function interpolateAttribute(
   const curves = geometry.curves;
 
   if (mesh) {
+    const fo = mesh.faceOffsets, cv = mesh.cornerVerts;
+    const nF = mesh.numFaces;
+
     if (attr.domain === 'FACE' && targetDomain === 'POINT') {
-      // Average all face values incident to each vertex.
+      // Average all (real) face values incident to each vertex.
       const out = new Float32Array(size * dims);
       const counts = new Uint32Array(size);
-      const t = mesh.triangles;
-      for (let i = 0; i < mesh.numTris; i++) {
-        for (let k = 0; k < 3; k++) {
-          const v = t[i * 3 + k]!;
+      for (let f = 0; f < nF; f++) {
+        const s = fo[f]!, e = fo[f + 1]!;
+        for (let k = s; k < e; k++) {
+          const v = cv[k]!;
           if (v >= size) continue;
           for (let d = 0; d < dims; d++) {
             const idx = v * dims + d;
-            out[idx] = (out[idx] ?? 0) + readScalar(attr.data, i * dims + d);
+            out[idx] = (out[idx] ?? 0) + readScalar(attr.data, f * dims + d);
           }
           counts[v] = (counts[v] ?? 0) + 1;
         }
@@ -222,35 +225,34 @@ export function interpolateAttribute(
       return convertKind(out, dims, outKind, size);
     }
     if (attr.domain === 'POINT' && targetDomain === 'FACE') {
-      // Average the three vertex values of each triangle.
+      // Average all corner-vertex values around each face.
       const out = new Float32Array(size * dims);
-      const t = mesh.triangles;
-      for (let i = 0; i < size; i++) {
+      for (let f = 0; f < Math.min(size, nF); f++) {
+        const s = fo[f]!, e = fo[f + 1]!;
+        const n = (e - s) || 1;
         for (let d = 0; d < dims; d++) {
-          const sum =
-            readScalar(attr.data, t[i * 3]! * dims + d) +
-            readScalar(attr.data, t[i * 3 + 1]! * dims + d) +
-            readScalar(attr.data, t[i * 3 + 2]! * dims + d);
-          out[i * dims + d] = sum / 3;
+          let sum = 0;
+          for (let k = s; k < e; k++) sum += readScalar(attr.data, cv[k]! * dims + d);
+          out[f * dims + d] = sum / n;
         }
       }
       return convertKind(out, dims, outKind, size);
     }
     if (attr.domain === 'POINT' && targetDomain === 'CORNER') {
       const out = new Float32Array(size * dims);
-      const t = mesh.triangles;
-      for (let i = 0; i < size; i++) {
-        const v = t[i] ?? 0;
+      for (let i = 0; i < Math.min(size, mesh.numCorners); i++) {
+        const v = cv[i] ?? 0;
         for (let d = 0; d < dims; d++) out[i * dims + d] = readScalar(attr.data, v * dims + d);
       }
       return convertKind(out, dims, outKind, size);
     }
     if (attr.domain === 'FACE' && targetDomain === 'CORNER') {
       const out = new Float32Array(size * dims);
-      for (let i = 0; i < mesh.numTris; i++) {
-        for (let corner = 0; corner < 3; corner++) {
-          const base = (i * 3 + corner) * dims;
-          for (let d = 0; d < dims; d++) out[base + d] = readScalar(attr.data, i * dims + d);
+      for (let f = 0; f < nF; f++) {
+        const s = fo[f]!, e = fo[f + 1]!;
+        for (let k = s; k < e; k++) {
+          const base = k * dims;
+          for (let d = 0; d < dims; d++) out[base + d] = readScalar(attr.data, f * dims + d);
         }
       }
       return convertKind(out, dims, outKind, size);
@@ -258,9 +260,8 @@ export function interpolateAttribute(
     if (attr.domain === 'CORNER' && targetDomain === 'POINT') {
       const out = new Float32Array(size * dims);
       const counts = new Uint32Array(size);
-      const t = mesh.triangles;
       for (let i = 0; i < mesh.numCorners; i++) {
-        const v = t[i] ?? 0;
+        const v = cv[i] ?? 0;
         if (v >= size) continue;
         for (let d = 0; d < dims; d++) out[(v * dims + d)]! += readScalar(attr.data, i * dims + d);
         counts[v] = (counts[v] ?? 0) + 1;
@@ -273,15 +274,46 @@ export function interpolateAttribute(
     }
     if (attr.domain === 'CORNER' && targetDomain === 'FACE') {
       const out = new Float32Array(size * dims);
-      for (let i = 0; i < size; i++) {
+      for (let f = 0; f < Math.min(size, nF); f++) {
+        const s = fo[f]!, e = fo[f + 1]!;
+        const n = (e - s) || 1;
         for (let d = 0; d < dims; d++) {
-          const base = i * 3 * dims + d;
-          out[i * dims + d] = (
-            readScalar(attr.data, base) +
-            readScalar(attr.data, base + dims) +
-            readScalar(attr.data, base + dims * 2)
-          ) / 3;
+          let sum = 0;
+          for (let k = s; k < e; k++) sum += readScalar(attr.data, k * dims + d);
+          out[f * dims + d] = sum / n;
         }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if ((attr.domain === 'POINT' || attr.domain === 'FACE') && targetDomain === 'EDGE') {
+      // POINT→EDGE: average the two endpoint values; FACE→EDGE: nearest broadcast.
+      const out = new Float32Array(size * dims);
+      const edges = mesh.edges();
+      if (attr.domain === 'POINT') {
+        for (let ei = 0; ei < size; ei++) {
+          const a = edges[ei * 2] ?? 0, b = edges[ei * 2 + 1] ?? 0;
+          for (let d = 0; d < dims; d++) {
+            out[ei * dims + d] = (readScalar(attr.data, a * dims + d) + readScalar(attr.data, b * dims + d)) / 2;
+          }
+        }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'EDGE' && targetDomain === 'POINT') {
+      const out = new Float32Array(size * dims);
+      const counts = new Uint32Array(size);
+      const edges = mesh.edges();
+      const nE = edges.length / 2;
+      for (let ei = 0; ei < nE; ei++) {
+        for (const v of [edges[ei * 2] ?? 0, edges[ei * 2 + 1] ?? 0]) {
+          if (v >= size) continue;
+          for (let d = 0; d < dims; d++) out[(v * dims + d)]! += readScalar(attr.data, ei * dims + d);
+          counts[v] = (counts[v] ?? 0) + 1;
+        }
+      }
+      for (let v = 0; v < size; v++) {
+        const c = counts[v] || 1;
+        for (let d = 0; d < dims; d++) out[(v * dims + d)]! /= c;
       }
       return convertKind(out, dims, outKind, size);
     }

@@ -449,12 +449,17 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeBsdfPrincipled) {
-      const baseColor = this.socketValue(node.inputs[0]!, cache) as RGBA;
-      const metallic = this.socketValue(node.inputs[1]!, cache) as number;
-      const roughness = this.socketValue(node.inputs[2]!, cache) as number;
-      const alpha = this.socketValue(node.inputs[4]!, cache) as number;
-      const emissiveColor = this.socketValue(node.inputs[6]!, cache) as RGBA;
-      const emissiveStrength = this.socketValue(node.inputs[7]!, cache) as number;
+      // Resolve by socket name so the full Blender 4.x input set maps correctly.
+      const sv = <T>(name: string, fallback: T): T => {
+        const s = node.inputs.find((x) => x.name === name || x.identifier === name);
+        return s ? (this.socketValue(s, cache) as T) : fallback;
+      };
+      const baseColor = sv<RGBA>('Base Color', [0.8, 0.8, 0.8, 1]);
+      const metallic = sv<number>('Metallic', 0);
+      const roughness = sv<number>('Roughness', 0.5);
+      const alpha = sv<number>('Alpha', 1);
+      const emissiveColor = sv<RGBA>('Emission Color', [0, 0, 0, 1]);
+      const emissiveStrength = sv<number>('Emission Strength', 0);
       const desc: MaterialDescriptor = {
         color: baseColor,
         metalness: metallic,

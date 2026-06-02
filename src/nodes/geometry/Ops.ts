@@ -162,7 +162,7 @@ export class GeometryNodeMergeByDistance extends GeoDataFlow {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Subdivision Surface (Loop)                                        */
+/*  Subdivision Surface (Catmull-Clark)                               */
 /* ------------------------------------------------------------------ */
 
 export class GeometryNodeSubdivisionSurface extends GeoDataFlow {
@@ -191,6 +191,43 @@ export class GeometryNodeTriangulate extends GeoDataFlow {
     this.addInput(NodeSocketBool, 'Selection', { default_value: true });
     this.addInput(NodeSocketInt, 'Minimum Vertices', { default_value: 4 });
     this.addOutput(NodeSocketGeometry, 'Mesh');
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mesh Boolean                                                      */
+/* ------------------------------------------------------------------ */
+
+export class GeometryNodeMeshBoolean extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeMeshBoolean';
+  static override bl_label = 'Mesh Boolean';
+  static override category = 'Mesh / Operations';
+  static override properties = {
+    operation: EnumProperty({
+      items: [
+        ['INTERSECT', 'Intersect', ''],
+        ['UNION', 'Union', ''],
+        ['DIFFERENCE', 'Difference', ''],
+      ],
+      default: 'DIFFERENCE', name: 'Operation',
+    }),
+    solver: EnumProperty({
+      items: [['FLOAT', 'Float', ''], ['EXACT', 'Exact', '']],
+      default: 'EXACT', name: 'Solver',
+    }),
+  };
+  declare operation: 'INTERSECT' | 'UNION' | 'DIFFERENCE';
+  declare solver: 'FLOAT' | 'EXACT';
+
+  override init(_ctx: NodeInitContext): void {
+    // DIFFERENCE has a dedicated Mesh 1; UNION/INTERSECT use a single
+    // multi-input "Mesh 2". We expose both like Blender's combined node.
+    this.addInput(NodeSocketGeometry, 'Mesh 1');
+    this.addInput(NodeSocketGeometry, 'Mesh 2', { is_multi_input: true });
+    this.addInput(NodeSocketBool, 'Self Intersection', { default_value: false });
+    this.addInput(NodeSocketBool, 'Hole Tolerant', { default_value: false });
+    this.addOutput(NodeSocketGeometry, 'Mesh');
+    this.addOutput(NodeSocketBool, 'Intersecting Edges');
   }
 }
 
@@ -596,6 +633,7 @@ export function registerGeometryOps(): void {
     GeometryNodeMergeByDistance,
     GeometryNodeSubdivisionSurface,
     GeometryNodeTriangulate,
+    GeometryNodeMeshBoolean,
     GeometryNodeDistributePointsOnFaces,
     GeometryNodeMeshToPoints,
     GeometryNodePointsToVertices,

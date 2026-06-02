@@ -501,10 +501,155 @@ export function subdivideLoopOnce(mesh: MeshComponent): MeshComponent {
   return new MeshComponent(new Float32Array(newPositions), new Uint32Array(newTris));
 }
 
+/**
+ * One Catmull-Clark subdivision step on real polygonal topology.
+ *
+ * Produces quad faces (each original n-gon face → n quads), with the standard
+ * Catmull-Clark vertex rules:
+ *   - Face point  F = average of the face's vertices
+ *   - Edge point  E = average of the two endpoints and the two adjacent face
+ *                     points (boundary edges use the edge midpoint)
+ *   - Original vertex moved to (F̄ + 2·R̄ + (n-3)·P) / n where F̄ is the average
+ *     of adjacent face points, R̄ the average of adjacent edge midpoints, P the
+ *     original position and n the vertex valence (boundary vertices use the
+ *     crease rule (R̄·? )→ midpoint-of-boundary-edges rule).
+ */
+export function subdivideCatmullClarkOnce(mesh: MeshComponent): MeshComponent {
+  const p = mesh.positions;
+  const nV = mesh.numVerts;
+  const nF = mesh.numFaces;
+  const fo = mesh.faceOffsets, cv = mesh.cornerVerts;
+
+  const get = (v: number): Vec3 => [p[v * 3]!, p[v * 3 + 1]!, p[v * 3 + 2]!];
+
+  // --- Face points ---
+  const facePoints: Vec3[] = [];
+  for (let f = 0; f < nF; f++) {
+    const s = fo[f]!, e = fo[f + 1]!;
+    let x = 0, y = 0, z = 0; const n = e - s;
+    for (let k = s; k < e; k++) { const g = get(cv[k]!); x += g[0]; y += g[1]; z += g[2]; }
+    facePoints.push([x / n, y / n, z / n]);
+  }
+
+  // --- Edge records: key "lo_hi" → {a,b, faces:[], midpoint} ---
+  interface ERec { a: number; b: number; faces: number[]; }
+  const edgeMap = new Map<string, ERec>();
+  const ekey = (a: number, b: number) => a < b ? `${a}_${b}` : `${b}_${a}`;
+  for (let f = 0; f < nF; f++) {
+    const s = fo[f]!, e = fo[f + 1]!; const n = e - s;
+    for (let k = 0; k < n; k++) {
+      const a = cv[s + k]!, b = cv[s + ((k + 1) % n)]!;
+      const key = ekey(a, b);
+      let rec = edgeMap.get(key);
+      if (!rec) { rec = { a, b, faces: [] }; edgeMap.set(key, rec); }
+      rec.faces.push(f);
+    }
+  }
+
+  // --- Edge points + edge midpoints ---
+  const edgePointIndex = new Map<string, number>();
+  const edgeMid = new Map<string, Vec3>();
+  const newPos: number[] = [];          // start empty; original verts appended later
+  const pushPt = (pt: Vec3): number => { const i = newPos.length / 3; newPos.push(pt[0], pt[1], pt[2]); return i; };
+
+  // Accumulators for moving original vertices.
+  const vFaceAvg: Vec3[] = Array.from({ length: nV }, () => [0, 0, 0]);
+  const vFaceCnt = new Uint32Array(nV);
+  const vEdgeMidAvg: Vec3[] = Array.from({ length: nV }, () => [0, 0, 0]);
+  const vEdgeCnt = new Uint32Array(nV);
+  const vBoundary = new Uint8Array(nV);
+  const vBoundaryAvg: Vec3[] = Array.from({ length: nV }, () => [0, 0, 0]);
+  const vBoundaryCnt = new Uint32Array(nV);
+
+  for (const [key, rec] of edgeMap) {
+    const A = get(rec.a), B = get(rec.b);
+    const mid: Vec3 = [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2, (A[2] + B[2]) / 2];
+    edgeMid.set(key, mid);
+    let ep: Vec3;
+    if (rec.faces.length === 2) {
+      const f0 = facePoints[rec.faces[0]!]!, f1 = facePoints[rec.faces[1]!]!;
+      ep = [(A[0] + B[0] + f0[0] + f1[0]) / 4, (A[1] + B[1] + f0[1] + f1[1]) / 4, (A[2] + B[2] + f0[2] + f1[2]) / 4];
+    } else {
+      ep = mid;                       // boundary edge
+      vBoundary[rec.a] = 1; vBoundary[rec.b] = 1;
+      const mx = mid[0]!, my = mid[1]!, mz = mid[2]!;
+      for (const v of [rec.a, rec.b]) {
+        const acc = vBoundaryAvg[v]!;
+        acc[0] = (acc[0] ?? 0) + mx; acc[1] = (acc[1] ?? 0) + my; acc[2] = (acc[2] ?? 0) + mz;
+        vBoundaryCnt[v] = (vBoundaryCnt[v] ?? 0) + 1;
+      }
+    }
+    edgePointIndex.set(key, pushPt(ep));
+    // accumulate edge midpoints for both endpoints
+    const mx = mid[0]!, my = mid[1]!, mz = mid[2]!;
+    for (const v of [rec.a, rec.b]) {
+      const acc = vEdgeMidAvg[v]!;
+      acc[0] = (acc[0] ?? 0) + mx; acc[1] = (acc[1] ?? 0) + my; acc[2] = (acc[2] ?? 0) + mz;
+      vEdgeCnt[v] = (vEdgeCnt[v] ?? 0) + 1;
+    }
+  }
+
+  // Face-point index map + accumulate face points per vertex.
+  const facePointIndex: number[] = [];
+  for (let f = 0; f < nF; f++) {
+    const fp = facePoints[f]!;
+    facePointIndex.push(pushPt(fp));
+    const s = fo[f]!, e = fo[f + 1]!;
+    const fx = fp[0]!, fy = fp[1]!, fz = fp[2]!;
+    for (let k = s; k < e; k++) {
+      const v = cv[k]!;
+      const acc = vFaceAvg[v]!;
+      acc[0] = (acc[0] ?? 0) + fx; acc[1] = (acc[1] ?? 0) + fy; acc[2] = (acc[2] ?? 0) + fz;
+      vFaceCnt[v] = (vFaceCnt[v] ?? 0) + 1;
+    }
+  }
+
+  // --- New positions of original vertices (appended after edge & face pts) ---
+  const origIndex: number[] = [];
+  for (let v = 0; v < nV; v++) {
+    const P = get(v);
+    let np: Vec3;
+    if (vBoundary[v]) {
+      // Crease/boundary rule: (P + sum(boundary edge midpoints)) weighting.
+      const c = vBoundaryCnt[v]! || 1;
+      const R: Vec3 = [vBoundaryAvg[v]![0] / c, vBoundaryAvg[v]![1] / c, vBoundaryAvg[v]![2] / c];
+      np = [(P[0] + R[0] * 2) / 3, (P[1] + R[1] * 2) / 3, (P[2] + R[2] * 2) / 3];
+    } else {
+      const n = vFaceCnt[v]! || 1;
+      const F: Vec3 = [vFaceAvg[v]![0] / n, vFaceAvg[v]![1] / n, vFaceAvg[v]![2] / n];
+      const ec = vEdgeCnt[v]! || 1;
+      const R: Vec3 = [vEdgeMidAvg[v]![0] / ec, vEdgeMidAvg[v]![1] / ec, vEdgeMidAvg[v]![2] / ec];
+      np = [
+        (F[0] + 2 * R[0] + (n - 3) * P[0]) / n,
+        (F[1] + 2 * R[1] + (n - 3) * P[1]) / n,
+        (F[2] + 2 * R[2] + (n - 3) * P[2]) / n,
+      ];
+    }
+    origIndex.push(pushPt(np));
+  }
+
+  // --- New quad faces: for each corner, (orig, edgeNext, facePt, edgePrev) ---
+  const faces: number[][] = [];
+  for (let f = 0; f < nF; f++) {
+    const s = fo[f]!, e = fo[f + 1]!; const n = e - s;
+    const fp = facePointIndex[f]!;
+    for (let k = 0; k < n; k++) {
+      const vCur = cv[s + k]!;
+      const vNext = cv[s + ((k + 1) % n)]!;
+      const vPrev = cv[s + ((k - 1 + n) % n)]!;
+      const eNext = edgePointIndex.get(ekey(vCur, vNext))!;
+      const ePrev = edgePointIndex.get(ekey(vPrev, vCur))!;
+      faces.push([origIndex[vCur]!, eNext, fp, ePrev]);
+    }
+  }
+
+  return MeshComponent.fromPolys(new Float32Array(newPos), faces);
+}
+
 export function subdivisionSurface(geo: Geometry, levels: number): Geometry {
   if (!geo.mesh || levels <= 0) return geo;
   let m = geo.mesh;
-  for (let i = 0; i < levels; i++) m = subdivideLoopOnce(m);
+  for (let i = 0; i < levels; i++) m = subdivideCatmullClarkOnce(m);
   const out = geo.copy();
   out.mesh = m;
   return out;
@@ -1840,16 +1985,271 @@ export function transformInstances(
  */
 export function flipFaces(geo: Geometry, selection?: ScalarTypedArray | null): Geometry {
   const out = geo.cloneOwning();
-  if (out.mesh) {
-    const tris = out.mesh.triangles;
-    for (let i = 0; i + 2 < tris.length; i += 3) {
-      const face = i / 3;
-      if (selection && !selection[face]) continue;
-      const tmp = tris[i + 1]!;
-      tris[i + 1] = tris[i + 2]!;
-      tris[i + 2] = tmp;
+  const m = out.mesh;
+  if (m) {
+    const fo = m.faceOffsets, cv = m.cornerVerts;
+    const nF = m.numFaces;
+    for (let f = 0; f < nF; f++) {
+      if (selection && !selection[f]) continue;
+      const s = fo[f]!, e = fo[f + 1]!;
+      // Reverse the corner order (keep first corner fixed, like Blender).
+      for (let i = s + 1, j = e - 1; i < j; i++, j--) {
+        const tmp = cv[i]!; cv[i] = cv[j]!; cv[j] = tmp;
+      }
     }
+    out.mesh = MeshComponent.fromPolys(m.positions, polysOf(m));
+    // preserve non-position attributes
+    for (const [k, a] of m.attributes) if (k !== 'position') out.mesh.attributes.set(k, a);
     out.mesh.invalidateCaches();
   }
   return out;
+}
+
+/** Extract the polygon list (array of vertex-index arrays) from a mesh. */
+export function polysOf(m: MeshComponent): number[][] {
+  const fo = m.faceOffsets, cv = m.cornerVerts;
+  const out: number[][] = [];
+  for (let f = 0; f < m.numFaces; f++) {
+    const s = fo[f]!, e = fo[f + 1]!;
+    const poly: number[] = [];
+    for (let k = s; k < e; k++) poly.push(cv[k]!);
+    out.push(poly);
+  }
+  return out;
+}
+
+/**
+ * Triangulate — split every face with > minVerts corners into triangles
+ * (fan triangulation). Faces with `selection` false are kept intact.
+ */
+export function triangulateMesh(geo: Geometry, selection: ScalarTypedArray | null, minVerts: number): Geometry {
+  const m = geo.mesh;
+  if (!m) return geo;
+  const fo = m.faceOffsets, cv = m.cornerVerts;
+  const faces: number[][] = [];
+  for (let f = 0; f < m.numFaces; f++) {
+    const s = fo[f]!, e = fo[f + 1]!;
+    const n = e - s;
+    const verts: number[] = [];
+    for (let k = s; k < e; k++) verts.push(cv[k]!);
+    const sel = selection ? !!selection[f] : true;
+    if (!sel || n <= Math.max(3, minVerts) - 1 || n <= 3) {
+      faces.push(verts);
+    } else {
+      for (let k = 1; k < n - 1; k++) faces.push([verts[0]!, verts[k]!, verts[k + 1]!]);
+    }
+  }
+  const out = geo.cloneOwning();
+  out.mesh = MeshComponent.fromPolys(new Float32Array(m.positions), faces);
+  for (const [k, a] of m.attributes) if (k !== 'position') out.mesh.attributes.set(k, a);
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mesh Boolean (BSP-based CSG on triangles)                         */
+/* ------------------------------------------------------------------ */
+
+type CsgVertex = { pos: Vec3; normal: Vec3 };
+class CsgPolygon {
+  vertices: CsgVertex[];
+  plane: { normal: Vec3; w: number };
+  constructor(vertices: CsgVertex[]) {
+    this.vertices = vertices;
+    const a = vertices[0]!.pos, b = vertices[1]!.pos, c = vertices[2]!.pos;
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    this.plane = { normal: [nx, ny, nz], w: nx * a[0] + ny * a[1] + nz * a[2] };
+  }
+  clone(): CsgPolygon { return new CsgPolygon(this.vertices.map((v) => ({ pos: [...v.pos] as Vec3, normal: [...v.normal] as Vec3 }))); }
+  flip(): void {
+    this.vertices.reverse();
+    this.plane.normal = [-this.plane.normal[0], -this.plane.normal[1], -this.plane.normal[2]];
+    this.plane.w = -this.plane.w;
+    for (const v of this.vertices) v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+  }
+}
+
+const CSG_EPS = 1e-5;
+
+function splitPolygon(
+  poly: CsgPolygon, plane: { normal: Vec3; w: number },
+  coplanarFront: CsgPolygon[], coplanarBack: CsgPolygon[],
+  front: CsgPolygon[], back: CsgPolygon[],
+): void {
+  const COPLANAR = 0, FRONT = 1, BACK = 2, SPANNING = 3;
+  let polyType = 0;
+  const types: number[] = [];
+  const n = plane.normal;
+  for (const v of poly.vertices) {
+    const t = n[0] * v.pos[0] + n[1] * v.pos[1] + n[2] * v.pos[2] - plane.w;
+    const type = t < -CSG_EPS ? BACK : t > CSG_EPS ? FRONT : COPLANAR;
+    polyType |= type;
+    types.push(type);
+  }
+  switch (polyType) {
+    case COPLANAR: {
+      const dot = n[0] * poly.plane.normal[0] + n[1] * poly.plane.normal[1] + n[2] * poly.plane.normal[2];
+      (dot > 0 ? coplanarFront : coplanarBack).push(poly);
+      break;
+    }
+    case FRONT: front.push(poly); break;
+    case BACK: back.push(poly); break;
+    default: {
+      const f: CsgVertex[] = [], b: CsgVertex[] = [];
+      for (let i = 0; i < poly.vertices.length; i++) {
+        const j = (i + 1) % poly.vertices.length;
+        const ti = types[i]!, tj = types[j]!;
+        const vi = poly.vertices[i]!, vj = poly.vertices[j]!;
+        if (ti !== BACK) f.push(vi);
+        if (ti !== FRONT) b.push(ti !== BACK ? { pos: [...vi.pos] as Vec3, normal: [...vi.normal] as Vec3 } : vi);
+        if ((ti | tj) === SPANNING) {
+          const di = n[0] * vi.pos[0] + n[1] * vi.pos[1] + n[2] * vi.pos[2] - plane.w;
+          const dd = di - (n[0] * vj.pos[0] + n[1] * vj.pos[1] + n[2] * vj.pos[2] - plane.w);
+          const t = dd === 0 ? 0 : di / dd;
+          const mid: CsgVertex = {
+            pos: [vi.pos[0] + (vj.pos[0] - vi.pos[0]) * t, vi.pos[1] + (vj.pos[1] - vi.pos[1]) * t, vi.pos[2] + (vj.pos[2] - vi.pos[2]) * t],
+            normal: [vi.normal[0] + (vj.normal[0] - vi.normal[0]) * t, vi.normal[1] + (vj.normal[1] - vi.normal[1]) * t, vi.normal[2] + (vj.normal[2] - vi.normal[2]) * t],
+          };
+          f.push({ pos: [...mid.pos] as Vec3, normal: [...mid.normal] as Vec3 });
+          b.push({ pos: [...mid.pos] as Vec3, normal: [...mid.normal] as Vec3 });
+        }
+      }
+      if (f.length >= 3) front.push(new CsgPolygon(f));
+      if (b.length >= 3) back.push(new CsgPolygon(b));
+      break;
+    }
+  }
+}
+
+class CsgNode {
+  plane?: { normal: Vec3; w: number };
+  front?: CsgNode;
+  back?: CsgNode;
+  polygons: CsgPolygon[] = [];
+  constructor(polygons?: CsgPolygon[]) { if (polygons) this.build(polygons); }
+  invert(): void {
+    for (const p of this.polygons) p.flip();
+    if (this.plane) { this.plane.normal = [-this.plane.normal[0], -this.plane.normal[1], -this.plane.normal[2]]; this.plane.w = -this.plane.w; }
+    this.front?.invert(); this.back?.invert();
+    const tmp = this.front; this.front = this.back; this.back = tmp;
+  }
+  clipPolygons(polygons: CsgPolygon[]): CsgPolygon[] {
+    if (!this.plane) return polygons.slice();
+    let front: CsgPolygon[] = [], back: CsgPolygon[] = [];
+    for (const p of polygons) splitPolygon(p, this.plane, front, back, front, back);
+    if (this.front) front = this.front.clipPolygons(front);
+    back = this.back ? this.back.clipPolygons(back) : [];
+    return front.concat(back);
+  }
+  clipTo(node: CsgNode): void {
+    this.polygons = node.clipPolygons(this.polygons);
+    this.front?.clipTo(node); this.back?.clipTo(node);
+  }
+  allPolygons(): CsgPolygon[] {
+    let out = this.polygons.slice();
+    if (this.front) out = out.concat(this.front.allPolygons());
+    if (this.back) out = out.concat(this.back.allPolygons());
+    return out;
+  }
+  build(polygons: CsgPolygon[]): void {
+    if (!polygons.length) return;
+    if (!this.plane) this.plane = { normal: [...polygons[0]!.plane.normal] as Vec3, w: polygons[0]!.plane.w };
+    const front: CsgPolygon[] = [], back: CsgPolygon[] = [];
+    for (const p of polygons) splitPolygon(p, this.plane, this.polygons, this.polygons, front, back);
+    if (front.length) { (this.front ??= new CsgNode()).build(front); }
+    if (back.length) { (this.back ??= new CsgNode()).build(back); }
+  }
+}
+
+function meshToCsg(m: MeshComponent): CsgPolygon[] {
+  const tris = m.triangles, p = m.positions;
+  const polys: CsgPolygon[] = [];
+  for (let i = 0; i < tris.length; i += 3) {
+    const verts: CsgVertex[] = [];
+    let degenerate = false;
+    for (let k = 0; k < 3; k++) {
+      const v = tris[i + k]! * 3;
+      verts.push({ pos: [p[v]!, p[v + 1]!, p[v + 2]!], normal: [0, 0, 0] });
+    }
+    // skip zero-area tris
+    const a = verts[0]!.pos, b = verts[1]!.pos, c = verts[2]!.pos;
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    const cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
+    if (Math.hypot(cx, cy, cz) < 1e-12) degenerate = true;
+    if (!degenerate) polys.push(new CsgPolygon(verts));
+  }
+  return polys;
+}
+
+function csgToMesh(polys: CsgPolygon[]): MeshComponent {
+  const positions: number[] = [];
+  const faces: number[][] = [];
+  const keyMap = new Map<string, number>();
+  const idx = (pos: Vec3): number => {
+    const key = `${Math.round(pos[0] / CSG_EPS)},${Math.round(pos[1] / CSG_EPS)},${Math.round(pos[2] / CSG_EPS)}`;
+    let i = keyMap.get(key);
+    if (i === undefined) { i = positions.length / 3; positions.push(pos[0], pos[1], pos[2]); keyMap.set(key, i); }
+    return i;
+  };
+  for (const poly of polys) {
+    if (poly.vertices.length < 3) continue;
+    const face = poly.vertices.map((v) => idx(v.pos));
+    // drop faces with repeated consecutive verts
+    const cleaned: number[] = [];
+    for (let i = 0; i < face.length; i++) if (face[i] !== face[(i + 1) % face.length]) cleaned.push(face[i]!);
+    if (cleaned.length >= 3) faces.push(cleaned);
+  }
+  return MeshComponent.fromPolys(new Float32Array(positions), faces);
+}
+
+/** CSG operation between two solids. op: 'UNION' | 'INTERSECT' | 'DIFFERENCE'. */
+function csgOperate(a: CsgPolygon[], b: CsgPolygon[], op: 'UNION' | 'INTERSECT' | 'DIFFERENCE'): CsgPolygon[] {
+  const A = new CsgNode(a.map((p) => p.clone()));
+  const B = new CsgNode(b.map((p) => p.clone()));
+  if (op === 'UNION') {
+    A.clipTo(B); B.clipTo(A); B.invert(); B.clipTo(A); B.invert();
+    A.build(B.allPolygons());
+    return A.allPolygons();
+  }
+  if (op === 'INTERSECT') {
+    A.invert(); B.clipTo(A); B.invert(); A.clipTo(B); B.clipTo(A);
+    A.build(B.allPolygons()); A.invert();
+    return A.allPolygons();
+  }
+  // DIFFERENCE: A - B
+  A.invert(); A.clipTo(B); B.clipTo(A); B.invert(); B.clipTo(A); B.invert();
+  A.build(B.allPolygons()); A.invert();
+  return A.allPolygons();
+}
+
+/**
+ * Mesh Boolean. `base` is Mesh 1 (only meaningful for DIFFERENCE); `others`
+ * are the Mesh 2 inputs which are accumulated together. Returns a new mesh.
+ */
+export function meshBoolean(
+  base: Geometry | null,
+  others: Geometry[],
+  op: 'UNION' | 'INTERSECT' | 'DIFFERENCE',
+): Geometry {
+  const meshesB = others.map((g) => g.mesh).filter((m): m is MeshComponent => !!m && m.numTris > 0);
+  if (op === 'DIFFERENCE') {
+    const baseMesh = base?.mesh;
+    if (!baseMesh || baseMesh.numTris === 0) return Geometry.empty();
+    if (meshesB.length === 0) { const g = new Geometry(); g.mesh = baseMesh.clone(); return g; }
+    let acc = meshToCsg(baseMesh);
+    for (const m of meshesB) acc = csgOperate(acc, meshToCsg(m), 'DIFFERENCE');
+    const g = new Geometry(); g.mesh = csgToMesh(acc); return g;
+  }
+  // UNION / INTERSECT: fold all inputs (Mesh 1 + Mesh 2) together.
+  const all: MeshComponent[] = [];
+  if (base?.mesh && base.mesh.numTris > 0) all.push(base.mesh);
+  all.push(...meshesB);
+  if (all.length === 0) return Geometry.empty();
+  let acc = meshToCsg(all[0]!);
+  for (let i = 1; i < all.length; i++) acc = csgOperate(acc, meshToCsg(all[i]!), op);
+  const g = new Geometry(); g.mesh = csgToMesh(acc); return g;
 }

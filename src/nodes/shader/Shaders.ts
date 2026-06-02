@@ -37,12 +37,39 @@ export class ShaderNodeBsdfPrincipled extends Node {
   static override bl_width_default = 240;
 
   override init(_ctx: NodeInitContext): void {
+    // Full Blender 4.x Principled BSDF input set (panel order preserved).
     this.addInput(NodeSocketColor, 'Base Color', { default_value: [0.8, 0.8, 0.8, 1] });
     this.addInput(NodeSocketFloatFactor, 'Metallic', { default_value: 0 });
     this.addInput(NodeSocketFloatFactor, 'Roughness', { default_value: 0.5 });
-    this.addInput(NodeSocketFloat, 'IOR', { default_value: 1.45 });
+    this.addInput(NodeSocketFloat, 'IOR', { default_value: 1.5 });
     this.addInput(NodeSocketFloatFactor, 'Alpha', { default_value: 1 });
     this.addInput(NodeSocketVector, 'Normal');
+    // Subsurface
+    this.addInput(NodeSocketFloatFactor, 'Subsurface Weight', { default_value: 0 });
+    this.addInput(NodeSocketVector, 'Subsurface Radius', { default_value: [1, 0.2, 0.1] });
+    this.addInput(NodeSocketFloat, 'Subsurface Scale', { default_value: 0.05 });
+    this.addInput(NodeSocketFloat, 'Subsurface IOR', { default_value: 1.4 });
+    this.addInput(NodeSocketFloatFactor, 'Subsurface Anisotropy', { default_value: 0 });
+    // Specular
+    this.addInput(NodeSocketFloatFactor, 'Specular IOR Level', { default_value: 0.5 });
+    this.addInput(NodeSocketColor, 'Specular Tint', { default_value: [1, 1, 1, 1] });
+    // Anisotropy
+    this.addInput(NodeSocketFloatFactor, 'Anisotropic', { default_value: 0 });
+    this.addInput(NodeSocketFloatFactor, 'Anisotropic Rotation', { default_value: 0 });
+    this.addInput(NodeSocketVector, 'Tangent');
+    // Transmission
+    this.addInput(NodeSocketFloatFactor, 'Transmission Weight', { default_value: 0 });
+    // Coat
+    this.addInput(NodeSocketFloatFactor, 'Coat Weight', { default_value: 0 });
+    this.addInput(NodeSocketFloatFactor, 'Coat Roughness', { default_value: 0.03 });
+    this.addInput(NodeSocketFloat, 'Coat IOR', { default_value: 1.5 });
+    this.addInput(NodeSocketColor, 'Coat Tint', { default_value: [1, 1, 1, 1] });
+    this.addInput(NodeSocketVector, 'Coat Normal');
+    // Sheen
+    this.addInput(NodeSocketFloatFactor, 'Sheen Weight', { default_value: 0 });
+    this.addInput(NodeSocketFloatFactor, 'Sheen Roughness', { default_value: 0.5 });
+    this.addInput(NodeSocketColor, 'Sheen Tint', { default_value: [1, 1, 1, 1] });
+    // Emission
     this.addInput(NodeSocketColor, 'Emission Color', { default_value: [0, 0, 0, 1] });
     this.addInput(NodeSocketFloat, 'Emission Strength', { default_value: 0 });
     this.addOutput(NodeSocketShader, 'BSDF');
