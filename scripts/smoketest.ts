@@ -231,6 +231,67 @@ test('common: Combine XYZ output', async () => {
   // Just assert the static method:
 });
 
+test('shader common: Compare + BooleanMath + Switch drive roughness in legacy path', async () => {
+  const t = new ShaderNodeTree('shader-common-logic');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const compare = t.addNode(NodeRegistry.getNode('FunctionNodeCompare')! as Parameters<typeof t.addNode>[0]);
+  const boolMath = t.addNode(NodeRegistry.getNode('FunctionNodeBooleanMath')! as Parameters<typeof t.addNode>[0]);
+  const sw = t.addNode(NodeRegistry.getNode('GeometryNodeSwitch')! as Parameters<typeof t.addNode>[0]);
+  (compare as unknown as { operation: string }).operation = 'GREATER_THAN';
+  compare.inputs[0]!.default_value = 1;
+  compare.inputs[1]!.default_value = 0.5;
+  (boolMath as unknown as { operation: string }).operation = 'AND';
+  boolMath.inputs[1]!.default_value = true;
+  sw.inputs.find((s) => s.identifier === 'False')!.default_value = 0.1;
+  sw.inputs.find((s) => s.identifier === 'True')!.default_value = 0.9;
+  t.addLink(compare.outputs[0]!, boolMath.inputs[0]!);
+  t.addLink(boolMath.outputs[0]!, sw.inputs[0]!);
+  t.addLink(sw.outputs[0]!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.roughness, 0.9, 1e-6, 'compare/bool/switch chain picks true branch');
+});
+
+test('shader common: CombineColor + SeparateColor execute in legacy path', async () => {
+  const t = new ShaderNodeTree('shader-common-color');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const comb = t.addNode(NodeRegistry.getNode('ShaderNodeCombineColor')! as Parameters<typeof t.addNode>[0]);
+  const sep = t.addNode(NodeRegistry.getNode('ShaderNodeSeparateColor')! as Parameters<typeof t.addNode>[0]);
+  comb.inputs[0]!.default_value = 0.1;
+  comb.inputs[1]!.default_value = 0.2;
+  comb.inputs[2]!.default_value = 0.3;
+  t.addLink(comb.outputs[0]!, sep.inputs[0]!);
+  t.addLink(comb.outputs[0]!, bsdf.inputs[0]!);
+  t.addLink(sep.outputs[1]!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.color[0]!, 0.1, 1e-6, 'combine color red channel');
+  close(desc.color[1]!, 0.2, 1e-6, 'combine color green channel');
+  close(desc.roughness, 0.2, 1e-6, 'separate color green channel drives roughness');
+});
+
+test('shader common: RandomValue float executes in legacy path', async () => {
+  const t = new ShaderNodeTree('shader-common-random');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const rv = t.addNode(NodeRegistry.getNode('FunctionNodeRandomValue')! as Parameters<typeof t.addNode>[0]);
+  (rv as unknown as { data_type: string }).data_type = 'FLOAT';
+  rv.inputs[2]!.default_value = 0.42;
+  rv.inputs[3]!.default_value = 0.42;
+  t.addLink(rv.outputs.find((s) => s.identifier === 'Value' && s.kind === 'VALUE')!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.roughness, 0.42, 1e-6, 'random value float output used in shader path');
+});
+
 // ------------------------------ Geometry --------------------------------
 test('geometry: cube + sphere + join produces a single mesh', async () => {
   const t = new GeometryNodeTree('g');
@@ -699,6 +760,72 @@ test('geom M3: VectorMath in a field — Normal × scale used as offset', async 
   }
   assert(maxR > 1.4, `expected inflated radius > 1.4, got ${maxR}`);
   assert(maxR < 1.7, `expected inflated radius < 1.7, got ${maxR}`);
+});
+
+test('geom textures: registered geometry-tree texture nodes evaluate without throw', () => {
+  const ids = [
+    'ShaderNodeTexNoise',
+    'ShaderNodeTexImage',
+    'ShaderNodeTexEnvironment',
+    'ShaderNodeTexVoronoi',
+    'ShaderNodeTexWave',
+    'ShaderNodeTexChecker',
+    'ShaderNodeTexBrick',
+    'ShaderNodeTexGradient',
+    'ShaderNodeTexMagic',
+    'ShaderNodeTexWhiteNoise',
+  ];
+  for (const id of ids) {
+    const t = new GeometryNodeTree(`geom-tex-${id}`);
+    t.depsgraph.setEvaluator(new GeometryEvaluator());
+    t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+    const grid = t.addNode(GeometryNodeMeshGrid);
+    const pos = t.addNode(GeometryNodeInputPosition);
+    const tex = t.addNode(NodeRegistry.getNode(id)! as Parameters<typeof t.addNode>[0]);
+    const out = t.addNode(NodeGroupOutput);
+    // Feed a position field into the texture node so it has meaningful coords.
+    const vecIn = tex.inputs.find((s) => s.identifier === 'Vector' || s.name === 'Vector');
+    if (vecIn) t.addLink(pos.outputs[0]!, vecIn);
+    t.addLink(grid.outputs[0]!, out.inputs[0]!);
+    const r = t.depsgraph.evaluate()!;
+    assert(!r.errors.has(tex.id), `${id} evaluates inside GeometryEvaluator`);
+    const geo = r.output as Geometry;
+    assert(geo.mesh !== undefined, `${id} tree still produces output geometry`);
+  }
+});
+
+test('geom textures: image resolver is called when ShaderNodeTexImage.image_src is set', () => {
+  let resolved = false;
+  const ev = new GeometryEvaluator({
+    resolveImage: (src) => {
+      if (src !== 'geom-image') return null;
+      resolved = true;
+      return {
+        width: 2,
+        height: 2,
+        data: new Uint8ClampedArray([
+          255, 0, 0, 255,
+          255, 0, 0, 255,
+          255, 0, 0, 255,
+          255, 0, 0, 255,
+        ]),
+      } as unknown as ImageData;
+    },
+  });
+  const t = new GeometryNodeTree('geom-tex-image-resolver');
+  t.depsgraph.setEvaluator(ev);
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  const pos = t.addNode(GeometryNodeInputPosition);
+  const img = t.addNode(NodeRegistry.getNode('ShaderNodeTexImage')! as Parameters<typeof t.addNode>[0]) as unknown as { image_src: string } & import('../src/core/Node').Node;
+  img.image_src = 'geom-image';
+  const out = t.addNode(NodeGroupOutput);
+  const vecIn = img.inputs.find((s) => s.identifier === 'Vector' || s.name === 'Vector');
+  if (vecIn) t.addLink(pos.outputs[0]!, vecIn);
+  t.addLink(grid.outputs[0]!, out.inputs[0]!);
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(img.id), 'ShaderNodeTexImage evaluates with resolver');
+  assert(resolved, 'geometry evaluator image resolver was called');
 });
 
 void {} as Field; // type-only import keep-alive
@@ -1687,6 +1814,72 @@ test('tsl: shader input emitters produce meaningful nodes', async () => {
   }
 });
 
+test('tsl: common logic emitters produce meaningful nodes', async () => {
+  const ev = await makeTSLEvaluator();
+  const t = new ShaderNodeTree('tsl-common-logic');
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const compare = t.addNode(NodeRegistry.getNode('FunctionNodeCompare')! as Parameters<typeof t.addNode>[0]);
+  const boolMath = t.addNode(NodeRegistry.getNode('FunctionNodeBooleanMath')! as Parameters<typeof t.addNode>[0]);
+  const sw = t.addNode(NodeRegistry.getNode('GeometryNodeSwitch')! as Parameters<typeof t.addNode>[0]);
+  (compare as unknown as { operation: string }).operation = 'GREATER_THAN';
+  compare.inputs[0]!.default_value = 1;
+  compare.inputs[1]!.default_value = 0.5;
+  (boolMath as unknown as { operation: string }).operation = 'AND';
+  boolMath.inputs[1]!.default_value = true;
+  sw.inputs.find((s) => s.identifier === 'False')!.default_value = 0.1;
+  sw.inputs.find((s) => s.identifier === 'True')!.default_value = 0.9;
+  t.addLink(compare.outputs[0]!, boolMath.inputs[0]!);
+  t.addLink(boolMath.outputs[0]!, sw.inputs[0]!);
+  t.addLink(sw.outputs[0]!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  const r = ev.evaluate(t, new Set());
+  assert(!r.errors.has(compare.id) && !r.errors.has(boolMath.id) && !r.errors.has(sw.id), 'TSL common logic emitters evaluate without error');
+  const desc = (r.output as { descriptor: { roughnessNode?: { value?: number; constructor?: { name?: string } } } }).descriptor;
+  assert(desc.roughnessNode !== undefined, 'TSL logic chain drives roughness');
+  assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0.5, 'TSL compare/bool/switch chain does not fall back to default roughness');
+});
+
+test('tsl: common color emitters round-trip channels', async () => {
+  const ev = await makeTSLEvaluator();
+  const t = new ShaderNodeTree('tsl-common-color');
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const comb = t.addNode(NodeRegistry.getNode('ShaderNodeCombineColor')! as Parameters<typeof t.addNode>[0]);
+  const sep = t.addNode(NodeRegistry.getNode('ShaderNodeSeparateColor')! as Parameters<typeof t.addNode>[0]);
+  comb.inputs[0]!.default_value = 0.1;
+  comb.inputs[1]!.default_value = 0.2;
+  comb.inputs[2]!.default_value = 0.3;
+  t.addLink(comb.outputs[0]!, sep.inputs[0]!);
+  t.addLink(comb.outputs[0]!, bsdf.inputs[0]!);
+  t.addLink(sep.outputs[1]!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  const r = ev.evaluate(t, new Set());
+  assert(!r.errors.has(comb.id) && !r.errors.has(sep.id), 'TSL combine/separate color emitters evaluate without error');
+  const desc = (r.output as { descriptor: { roughnessNode?: { value?: number; constructor?: { name?: string } }; colorNode?: { nodeType?: string } } }).descriptor;
+  assert(desc.roughnessNode !== undefined, 'TSL separate color drives roughness');
+  assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0.5, 'TSL separate color does not fall back to default roughness');
+  assert(desc.colorNode?.nodeType !== 'float', 'TSL combine color produces non-float color node');
+});
+
+test('tsl: common random emitter executes', async () => {
+  const ev = await makeTSLEvaluator();
+  const t = new ShaderNodeTree('tsl-common-random');
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const rv = t.addNode(NodeRegistry.getNode('FunctionNodeRandomValue')! as Parameters<typeof t.addNode>[0]);
+  (rv as unknown as { data_type: string }).data_type = 'FLOAT';
+  rv.inputs[2]!.default_value = 0.42;
+  rv.inputs[3]!.default_value = 0.42;
+  t.addLink(rv.outputs.find((s) => s.identifier === 'Value' && s.kind === 'VALUE')!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  const r = ev.evaluate(t, new Set());
+  assert(!r.errors.has(rv.id), 'TSL random value emitter evaluates without error');
+  const desc = (r.output as { descriptor: { roughnessNode?: { value?: number; constructor?: { name?: string } } } }).descriptor;
+  assert(desc.roughnessNode !== undefined, 'TSL random value drives roughness');
+  assert(desc.roughnessNode?.constructor?.name !== 'ConstNode' || desc.roughnessNode?.value !== 0.5, 'TSL random value does not fall back to default roughness');
+});
+
 test('tsl: missing texture emitters produce non-float color nodes', async () => {
   const ev = await makeTSLEvaluator();
   const ids = [
@@ -1894,60 +2087,115 @@ test('texture: image resolver is called when image_src is set', () => {
 });
 
 // --------------------- Phase 6: Geometry stubs -------------------------
-test('geom: FillCurve stub returns empty geometry', () => {
+test('geom: FillCurve fills a planar closed curve into a mesh', () => {
   bootstrapBuiltins();
   const t = new GeometryNodeTree('fill-curve');
   t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const circle = t.addNode(GeometryNodeCurveCircle as Parameters<typeof t.addNode>[0]);
+  circle.inputs.find((s) => s.identifier === 'Resolution')!.default_value = 4;
   const fill = t.addNode(GeometryNodeFillCurve as Parameters<typeof t.addNode>[0]);
   const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(circle.outputs[0]!, fill.inputs[0]!);
   t.addLink(fill.outputs[0]!, out.inputs[0]!);
   const ev = new GeometryEvaluator();
   const geo = ev.evaluate(t, new Set()).output as Geometry;
-  assert(geo !== undefined, 'FillCurve stub produces geometry output');
+  assert(geo.mesh, 'FillCurve produces mesh');
+  assert(geo.mesh!.numVerts >= 3, `FillCurve mesh has verts, got ${geo.mesh!.numVerts}`);
+  assert(geo.mesh!.numTris >= 2, `FillCurve mesh has triangles, got ${geo.mesh!.numTris}`);
 });
 
-test('geom: FilletCurve stub passes geometry through', () => {
+test('geom: FilletCurve adds points around poly-curve corners', () => {
   bootstrapBuiltins();
   const t = new GeometryNodeTree('fillet-curve');
   t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
-  const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);
+  const circle = t.addNode(GeometryNodeCurveCircle as Parameters<typeof t.addNode>[0]);
+  circle.inputs.find((s) => s.identifier === 'Resolution')!.default_value = 4; // diamond-like poly curve
   const fillet = t.addNode(GeometryNodeFilletCurve as Parameters<typeof t.addNode>[0]);
+  fillet.inputs.find((s) => s.identifier === 'Radius')!.default_value = 0.2;
   const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
-  t.addLink(line.outputs[0]!, fillet.inputs[0]!);
+  t.addLink(circle.outputs[0]!, fillet.inputs[0]!);
   t.addLink(fillet.outputs[0]!, out.inputs[0]!);
   const ev = new GeometryEvaluator();
-  const geo = ev.evaluate(t, new Set()).output as Geometry;
-  assert(geo !== undefined, 'FilletCurve stub produces geometry');
-  assert(geo.curves !== undefined, 'FilletCurve passes curve data through');
+  const original = ev.evaluate(t, new Set()).output as Geometry;
+  assert(original.curves, 'FilletCurve produces curve data');
+  assert(original.curves!.numPoints > 4, `FilletCurve should add points beyond the original 4, got ${original.curves!.numPoints}`);
 });
 
-test('geom: SampleCurve stub outputs zero fields', () => {
+test('geom: SampleCurve samples position/value along a line', () => {
   bootstrapBuiltins();
   const t = new GeometryNodeTree('sample-curve');
   t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+
+  const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);
+  // Line from z=0 to z=1 so factor 0.25 should sample z≈0.25.
+  line.inputs[0]!.default_value = [0, 0, 0];
+  line.inputs[1]!.default_value = [0, 0, 1];
   const sample = t.addNode(GeometryNodeSampleCurve as Parameters<typeof t.addNode>[0]);
-  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
-  // Just verify it evaluates without throwing
-  const ev = new GeometryEvaluator();
+  sample.inputs.find((s) => s.identifier === 'Factor')!.default_value = 0.25;
   const cube = t.addNode(GeometryNodeMeshCube);
-  t.addLink(cube.outputs[0]!, out.inputs[0]!);
+  const combine = t.addNode(CombineXYZNode);
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const idx = t.addNode(GeometryNodeInputIndex);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+
+  t.addLink(line.outputs[0]!, sample.inputs[0]!);
+  // Sample the line's point index field so sampled Value should also be ≈0.25.
+  t.addLink(idx.outputs[0]!, sample.inputs[1]!);
+  t.addLink(sample.outputs.find((s) => s.identifier === 'Value')!, combine.inputs[0]!);
+  t.addLink(cube.outputs[0]!, setp.inputs[0]!);
+  t.addLink(sample.outputs.find((s) => s.identifier === 'Position')!, setp.inputs[3]!);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
   const geo = ev.evaluate(t, new Set()).output as Geometry;
-  assert(geo !== undefined, 'tree with SampleCurve evaluates ok');
-  assert(geo.mesh !== undefined, 'cube mesh still flows through');
+  assert(geo.mesh, 'SampleCurve-driven tree produces mesh');
+  // Position output shifts every cube vertex by +0.25 on Z.
+  close(geo.mesh!.positions[2]!, -0.75, 1e-5, 'sampled position offset z≈0.25');
+
+  // Independently materialise sampled Value by feeding it into CombineXYZ.X.
+  const t2 = new GeometryNodeTree('sample-curve-value');
+  t2.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line2 = t2.addNode(GeometryNodeCurveLine as Parameters<typeof t2.addNode>[0]);
+  line2.inputs[0]!.default_value = [0, 0, 0];
+  line2.inputs[1]!.default_value = [0, 0, 1];
+  const sample2 = t2.addNode(GeometryNodeSampleCurve as Parameters<typeof t2.addNode>[0]);
+  sample2.inputs.find((s) => s.identifier === 'Factor')!.default_value = 0.25;
+  const idx2 = t2.addNode(GeometryNodeInputIndex);
+  const combine2 = t2.addNode(CombineXYZNode);
+  const cube2 = t2.addNode(GeometryNodeMeshCube);
+  const setp2 = t2.addNode(GeometryNodeSetPosition);
+  const out2 = t2.addNode(NodeGroupOutput); out2.refreshFromInterface(t2);
+  t2.addLink(line2.outputs[0]!, sample2.inputs[0]!);
+  t2.addLink(idx2.outputs[0]!, sample2.inputs[1]!);
+  t2.addLink(sample2.outputs.find((s) => s.identifier === 'Value')!, combine2.inputs[0]!);
+  t2.addLink(cube2.outputs[0]!, setp2.inputs[0]!);
+  t2.addLink(combine2.outputs[0]!, setp2.inputs[3]!);
+  t2.addLink(setp2.outputs[0]!, out2.inputs[0]!);
+  const geo2 = ev.evaluate(t2, new Set()).output as Geometry;
+  close(geo2.mesh!.positions[0]!, -0.75, 1e-5, 'sampled value interpolates index field to ≈0.25');
 });
 
-test('geom: SubdivideCurve stub passes curve through unchanged', () => {
+test('geom: SubdivideCurve inserts evenly-spaced cuts per segment', () => {
   bootstrapBuiltins();
   const t = new GeometryNodeTree('subdivide-curve');
   t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
   const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);
+  line.inputs[0]!.default_value = [0, 0, 0];
+  line.inputs[1]!.default_value = [0, 0, 1];
   const sub = t.addNode(GeometryNodeSubdivideCurve as Parameters<typeof t.addNode>[0]);
+  sub.inputs.find((s) => s.identifier === 'Cuts')!.default_value = 3;
   const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
   t.addLink(line.outputs[0]!, sub.inputs[0]!);
   t.addLink(sub.outputs[0]!, out.inputs[0]!);
   const ev = new GeometryEvaluator();
   const geo = ev.evaluate(t, new Set()).output as Geometry;
-  assert(geo?.curves !== undefined, 'SubdivideCurve passes curve data');
+  assert(geo.curves !== undefined, 'SubdivideCurve produces curve data');
+  eq(geo.curves!.numPoints, 5, '2-point line + 3 cuts = 5 points');
+  close(geo.curves!.positions[2]!, 0, 1e-6, 'first point z');
+  close(geo.curves!.positions[5]!, 0.25, 1e-6, 'first inserted point z');
+  close(geo.curves!.positions[8]!, 0.5, 1e-6, 'second inserted point z');
+  close(geo.curves!.positions[11]!, 0.75, 1e-6, 'third inserted point z');
+  close(geo.curves!.positions[14]!, 1, 1e-6, 'last point z');
 });
 
 // --------------------- Phase 7: Library / Package ----------------------

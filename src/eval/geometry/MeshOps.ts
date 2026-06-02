@@ -741,8 +741,483 @@ function transformMatBaked(geo: Geometry, m: Float32Array): void {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Curve to Mesh / Curve to Points / Resample                        */
+/*  Curve helpers / Curve to Mesh / Curve to Points / Resample        */
 /* ------------------------------------------------------------------ */
+
+const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+
+function stableCurveNormal(tx: number, ty: number, tz: number): Vec3 {
+  let rx = 0, ry = 1, rz = 0;
+  if (Math.abs(ty) > 0.9) { rx = 1; ry = 0; rz = 0; }
+  let bx = ry * tz - rz * ty;
+  let by = rz * tx - rx * tz;
+  let bz = rx * ty - ry * tx;
+  const bl = Math.hypot(bx, by, bz) || 1;
+  bx /= bl; by /= bl; bz /= bl;
+  let nx = ty * bz - tz * by;
+  let ny = tz * bx - tx * bz;
+  let nz = tx * by - ty * bx;
+  const nl = Math.hypot(nx, ny, nz) || 1;
+  nx /= nl; ny /= nl; nz /= nl;
+  return [nx, ny, nz];
+}
+
+function averagedScalarAt(data: ScalarTypedArray | undefined, dims: number, pointIndex: number): number {
+  if (!data || dims <= 0) return 0;
+  if (dims === 1) return (data[pointIndex] as number) ?? 0;
+  let sum = 0;
+  const base = pointIndex * dims;
+  for (let k = 0; k < dims; k++) sum += (data[base + k] as number) ?? 0;
+  return sum / dims;
+}
+
+export interface CurveSample {
+  position: Vec3;
+  tangent: Vec3;
+  normal: Vec3;
+  value: number;
+  index: number;
+  curveIndex: number;
+}
+
+/**
+ * Sample the input curves at a normalized factor in [0,1].
+ *
+ * Current approximation for multi-curve geometry: the factor first selects a
+ * curve by evenly partitioning [0,1] across the curve count, then samples
+ * within that curve by local factor. For single-curve inputs this matches the
+ * expected behaviour directly.
+ */
+export function sampleCurveAtFactor(
+  geo: Geometry,
+  factor: number,
+  values?: ScalarTypedArray,
+  valueDims = 1,
+): CurveSample {
+  const curves = geo.curves;
+  if (!curves || curves.numCurves === 0 || curves.numPoints === 0) {
+    return {
+      position: [0, 0, 0], tangent: [0, 0, 1], normal: [0, 1, 0], value: 0, index: 0, curveIndex: 0,
+    };
+  }
+
+  const f = clamp01(factor);
+  const curveCount = curves.numCurves;
+  const scaled = f * curveCount;
+  const curveIndex = Math.min(curveCount - 1, Math.floor(scaled));
+  const localFactor = curveCount === 1
+    ? f
+    : (f >= 1 ? 1 : scaled - curveIndex);
+
+  const start = curves.curveOffsets[curveIndex] ?? 0;
+  const end = curves.curveOffsets[curveIndex + 1] ?? start;
+  const pointCount = end - start;
+  if (pointCount <= 0) {
+    return {
+      position: [0, 0, 0], tangent: [0, 0, 1], normal: [0, 1, 0], value: 0, index: start, curveIndex,
+    };
+  }
+  if (pointCount === 1) {
+    const px = curves.positions[start * 3] ?? 0;
+    const py = curves.positions[start * 3 + 1] ?? 0;
+    const pz = curves.positions[start * 3 + 2] ?? 0;
+    return {
+      position: [px, py, pz],
+      tangent: [0, 0, 1],
+      normal: [0, 1, 0],
+      value: averagedScalarAt(values, valueDims, start),
+      index: start,
+      curveIndex,
+    };
+  }
+
+  const cyclic = !!curves.cyclic[curveIndex];
+  const segmentCount = Math.max(1, cyclic ? pointCount : pointCount - 1);
+  const segPos = localFactor * segmentCount;
+  const seg = Math.min(segmentCount - 1, Math.floor(segPos));
+  const u = localFactor >= 1 ? 1 : segPos - seg;
+  const aIndex = start + seg;
+  const bIndex = cyclic && seg === pointCount - 1 ? start : Math.min(end - 1, aIndex + 1);
+
+  const ax = curves.positions[aIndex * 3] ?? 0;
+  const ay = curves.positions[aIndex * 3 + 1] ?? 0;
+  const az = curves.positions[aIndex * 3 + 2] ?? 0;
+  const bx = curves.positions[bIndex * 3] ?? ax;
+  const by = curves.positions[bIndex * 3 + 1] ?? ay;
+  const bz = curves.positions[bIndex * 3 + 2] ?? az;
+
+  let tx = bx - ax;
+  let ty = by - ay;
+  let tz = bz - az;
+  const tl = Math.hypot(tx, ty, tz) || 1;
+  tx /= tl; ty /= tl; tz /= tl;
+
+  const valueA = averagedScalarAt(values, valueDims, aIndex);
+  const valueB = averagedScalarAt(values, valueDims, bIndex);
+  return {
+    position: [ax * (1 - u) + bx * u, ay * (1 - u) + by * u, az * (1 - u) + bz * u],
+    tangent: [tx, ty, tz],
+    normal: stableCurveNormal(tx, ty, tz),
+    value: valueA * (1 - u) + valueB * u,
+    index: aIndex,
+    curveIndex,
+  };
+}
+
+export function subdivideCurve(geo: Geometry, cuts: number): Geometry {
+  if (!geo.curves || cuts <= 0) return geo;
+  const c = geo.curves;
+  const newPositions: number[] = [];
+  const newOffsets: number[] = [0];
+  const newCyclic: number[] = [];
+  const newRes: number[] = [];
+  const newSpline: number[] = [];
+
+  for (let ci = 0; ci < c.numCurves; ci++) {
+    const start = c.curveOffsets[ci] ?? 0;
+    const end = c.curveOffsets[ci + 1] ?? start;
+    const n = end - start;
+    const cyclic = !!c.cyclic[ci];
+    if (n <= 0) {
+      newOffsets.push(newPositions.length / 3);
+      newCyclic.push(cyclic ? 1 : 0);
+      newRes.push(c.resolution[ci] ?? 12);
+      newSpline.push(c.splineType[ci] ?? 0);
+      continue;
+    }
+
+    const segmentCount = cyclic ? n : Math.max(0, n - 1);
+    for (let seg = 0; seg < segmentCount; seg++) {
+      const a = start + seg;
+      const b = cyclic && seg === n - 1 ? start : a + 1;
+      const ax = c.positions[a * 3] ?? 0;
+      const ay = c.positions[a * 3 + 1] ?? 0;
+      const az = c.positions[a * 3 + 2] ?? 0;
+      const bx = c.positions[b * 3] ?? ax;
+      const by = c.positions[b * 3 + 1] ?? ay;
+      const bz = c.positions[b * 3 + 2] ?? az;
+      newPositions.push(ax, ay, az);
+      for (let cut = 1; cut <= cuts; cut++) {
+        const t = cut / (cuts + 1);
+        newPositions.push(
+          ax * (1 - t) + bx * t,
+          ay * (1 - t) + by * t,
+          az * (1 - t) + bz * t,
+        );
+      }
+    }
+    if (!cyclic) {
+      const last = end - 1;
+      newPositions.push(
+        c.positions[last * 3] ?? 0,
+        c.positions[last * 3 + 1] ?? 0,
+        c.positions[last * 3 + 2] ?? 0,
+      );
+    }
+    newOffsets.push(newPositions.length / 3);
+    newCyclic.push(cyclic ? 1 : 0);
+    newRes.push((c.resolution[ci] ?? 12) * (cuts + 1));
+    newSpline.push(c.splineType[ci] ?? 0);
+  }
+
+  const out = geo.copy();
+  out.curves = new CurvesComponent(
+    new Float32Array(newPositions),
+    new Uint32Array(newOffsets),
+    new Uint8Array(newCyclic),
+    new Uint16Array(newRes),
+    new Uint8Array(newSpline),
+  );
+  return out;
+}
+
+export function filletCurve(geo: Geometry, radius: number): Geometry {
+  if (!geo.curves || radius <= 0) return geo;
+  const c = geo.curves;
+  const newPositions: number[] = [];
+  const newOffsets: number[] = [0];
+  const newCyclic: number[] = [];
+  const newRes: number[] = [];
+  const newSpline: number[] = [];
+
+  const getPoint = (idx: number): Vec3 => [
+    c.positions[idx * 3] ?? 0,
+    c.positions[idx * 3 + 1] ?? 0,
+    c.positions[idx * 3 + 2] ?? 0,
+  ];
+  const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const mul = (a: Vec3, s: number): Vec3 => [a[0] * s, a[1] * s, a[2] * s];
+  const dot = (a: Vec3, b: Vec3): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a: Vec3, b: Vec3): Vec3 => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const len = (a: Vec3): number => Math.hypot(a[0], a[1], a[2]);
+  const norm = (a: Vec3): Vec3 => {
+    const l = len(a) || 1;
+    return [a[0] / l, a[1] / l, a[2] / l];
+  };
+  const pushPoint = (p: Vec3): void => { newPositions.push(p[0], p[1], p[2]); };
+
+  for (let ci = 0; ci < c.numCurves; ci++) {
+    const start = c.curveOffsets[ci] ?? 0;
+    const end = c.curveOffsets[ci + 1] ?? start;
+    const n = end - start;
+    const cyclic = !!c.cyclic[ci];
+    if (n <= 0) {
+      newOffsets.push(newPositions.length / 3);
+      newCyclic.push(cyclic ? 1 : 0);
+      newRes.push(c.resolution[ci] ?? 12);
+      newSpline.push(c.splineType[ci] ?? 0);
+      continue;
+    }
+    if (!cyclic && n <= 2) {
+      for (let i = start; i < end; i++) pushPoint(getPoint(i));
+      newOffsets.push(newPositions.length / 3);
+      newCyclic.push(0);
+      newRes.push(c.resolution[ci] ?? 12);
+      newSpline.push(c.splineType[ci] ?? 0);
+      continue;
+    }
+
+    if (!cyclic) pushPoint(getPoint(start));
+
+    const cornerStart = cyclic ? 0 : 1;
+    const cornerEnd = cyclic ? n : n - 1;
+    for (let local = cornerStart; local < cornerEnd; local++) {
+      const prevIdx = start + (local - 1 + n) % n;
+      const currIdx = start + local;
+      const nextIdx = start + (local + 1) % n;
+      const A = getPoint(prevIdx);
+      const B = getPoint(currIdx);
+      const C = getPoint(nextIdx);
+
+      const v1 = sub(A, B);
+      const v2 = sub(C, B);
+      const l1 = len(v1), l2 = len(v2);
+      if (l1 < 1e-6 || l2 < 1e-6) {
+        pushPoint(B);
+        continue;
+      }
+      const d1 = norm(v1);
+      const d2 = norm(v2);
+      const cosTheta = Math.max(-1, Math.min(1, dot(d1, d2)));
+      const theta = Math.acos(cosTheta);
+      if (theta < 1e-3 || Math.abs(Math.PI - theta) < 1e-3) {
+        pushPoint(B);
+        continue;
+      }
+      const tangentDist = Math.min(radius / Math.tan(theta / 2), l1 * 0.5, l2 * 0.5);
+      if (!isFinite(tangentDist) || tangentDist <= 1e-6) {
+        pushPoint(B);
+        continue;
+      }
+
+      const t1 = add(B, mul(d1, tangentDist));
+      const t2 = add(B, mul(d2, tangentDist));
+      const bisectorRaw = add(d1, d2);
+      const bisectorLen = len(bisectorRaw);
+      if (bisectorLen < 1e-6) {
+        pushPoint(B);
+        continue;
+      }
+      const bisector = mul(bisectorRaw, 1 / bisectorLen);
+      const centerDist = radius / Math.sin(theta / 2);
+      const center = add(B, mul(bisector, centerDist));
+      const normal = norm(cross(d1, d2));
+      if (len(normal) < 1e-6) {
+        pushPoint(B);
+        continue;
+      }
+
+      const r1 = norm(sub(t1, center));
+      const r2 = norm(sub(t2, center));
+      let sweep = Math.atan2(dot(normal, cross(r1, r2)), dot(r1, r2));
+      if (Math.abs(sweep) < 1e-6) {
+        pushPoint(B);
+        continue;
+      }
+      const segments = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 8)));
+
+      pushPoint(t1);
+      for (let s = 1; s < segments; s++) {
+        const t = s / segments;
+        const ang = sweep * t;
+        const cs = Math.cos(ang), sn = Math.sin(ang);
+        const kxr = cross(normal, r1);
+        const dir: Vec3 = [
+          r1[0] * cs + kxr[0] * sn,
+          r1[1] * cs + kxr[1] * sn,
+          r1[2] * cs + kxr[2] * sn,
+        ];
+        pushPoint(add(center, mul(dir, radius)));
+      }
+      pushPoint(t2);
+    }
+
+    if (!cyclic) pushPoint(getPoint(end - 1));
+
+    newOffsets.push(newPositions.length / 3);
+    newCyclic.push(cyclic ? 1 : 0);
+    newRes.push(c.resolution[ci] ?? 12);
+    newSpline.push(c.splineType[ci] ?? 0);
+  }
+
+  const out = geo.copy();
+  out.curves = new CurvesComponent(
+    new Float32Array(newPositions),
+    new Uint32Array(newOffsets),
+    new Uint8Array(newCyclic),
+    new Uint16Array(newRes),
+    new Uint8Array(newSpline),
+  );
+  return out;
+}
+
+type Vec2 = [number, number];
+
+function newellNormal(points: Vec3[]): Vec3 {
+  let nx = 0, ny = 0, nz = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]!;
+    const b = points[(i + 1) % points.length]!;
+    nx += (a[1] - b[1]) * (a[2] + b[2]);
+    ny += (a[2] - b[2]) * (a[0] + b[0]);
+    nz += (a[0] - b[0]) * (a[1] + b[1]);
+  }
+  const l = Math.hypot(nx, ny, nz) || 1;
+  return [nx / l, ny / l, nz / l];
+}
+
+function projectPlanar(points: Vec3[]): { pts2: Vec2[]; dropAxis: 0 | 1 | 2; normal: Vec3 } {
+  const normal = newellNormal(points);
+  const ax = Math.abs(normal[0]), ay = Math.abs(normal[1]), az = Math.abs(normal[2]);
+  const dropAxis: 0 | 1 | 2 = ax >= ay && ax >= az ? 0 : ay >= az ? 1 : 2;
+  const pts2 = points.map((p) =>
+    dropAxis === 0 ? [p[1], p[2]] as Vec2 : dropAxis === 1 ? [p[0], p[2]] as Vec2 : [p[0], p[1]] as Vec2,
+  );
+  return { pts2, dropAxis, normal };
+}
+
+function polygonArea2D(points: Vec2[]): number {
+  let area = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]!;
+    const b = points[(i + 1) % points.length]!;
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  return area * 0.5;
+}
+
+function pointInTri2D(p: Vec2, a: Vec2, b: Vec2, c: Vec2): boolean {
+  const sign = (p1: Vec2, p2: Vec2, p3: Vec2) => (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1]);
+  const d1 = sign(p, a, b);
+  const d2 = sign(p, b, c);
+  const d3 = sign(p, c, a);
+  const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+  const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(hasNeg && hasPos);
+}
+
+function triangleNormal(a: Vec3, b: Vec3, c: Vec3): Vec3 {
+  const ab: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  const ac: Vec3 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+  const nx = ab[1] * ac[2] - ab[2] * ac[1];
+  const ny = ab[2] * ac[0] - ab[0] * ac[2];
+  const nz = ab[0] * ac[1] - ab[1] * ac[0];
+  const l = Math.hypot(nx, ny, nz) || 1;
+  return [nx / l, ny / l, nz / l];
+}
+
+function dot3(a: Vec3, b: Vec3): number { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+function earClipPolygon(points3: Vec3[]): number[] {
+  if (points3.length < 3) return [];
+  const { pts2, normal } = projectPlanar(points3);
+  const ccw = polygonArea2D(pts2) > 0;
+  const verts = [...Array(points3.length).keys()];
+  const tris: number[] = [];
+  const orient = (a: Vec2, b: Vec2, c: Vec2) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+
+  let guard = 0;
+  while (verts.length > 3 && guard++ < 4096) {
+    let clipped = false;
+    for (let i = 0; i < verts.length; i++) {
+      const i0 = verts[(i - 1 + verts.length) % verts.length]!;
+      const i1 = verts[i]!;
+      const i2 = verts[(i + 1) % verts.length]!;
+      const a = pts2[i0]!, b = pts2[i1]!, c = pts2[i2]!;
+      const turn = orient(a, b, c);
+      if (ccw ? turn <= 1e-8 : turn >= -1e-8) continue;
+      let contains = false;
+      for (const vi of verts) {
+        if (vi === i0 || vi === i1 || vi === i2) continue;
+        if (pointInTri2D(pts2[vi]!, a, b, c)) { contains = true; break; }
+      }
+      if (contains) continue;
+      tris.push(i0, i1, i2);
+      verts.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) break;
+  }
+  if (verts.length === 3) tris.push(verts[0]!, verts[1]!, verts[2]!);
+  if (tris.length >= 3) {
+    const tn = triangleNormal(points3[tris[0]!]!, points3[tris[1]!]!, points3[tris[2]!]!);
+    if (dot3(tn, normal) < 0) {
+      for (let i = 0; i < tris.length; i += 3) {
+        const tmp = tris[i + 1]!;
+        tris[i + 1] = tris[i + 2]!;
+        tris[i + 2] = tmp;
+      }
+    }
+  }
+  return tris;
+}
+
+export function fillCurve(geo: Geometry): Geometry {
+  if (!geo.curves) return Geometry.empty();
+  const c = geo.curves;
+  const positions: number[] = [];
+  const triangles: number[] = [];
+  let vertBase = 0;
+
+  for (let ci = 0; ci < c.numCurves; ci++) {
+    const start = c.curveOffsets[ci] ?? 0;
+    const end = c.curveOffsets[ci + 1] ?? start;
+    const cyclic = !!c.cyclic[ci];
+    const pts3: Vec3[] = [];
+    for (let i = start; i < end; i++) {
+      pts3.push([
+        c.positions[i * 3] ?? 0,
+        c.positions[i * 3 + 1] ?? 0,
+        c.positions[i * 3 + 2] ?? 0,
+      ]);
+    }
+    if (pts3.length >= 2) {
+      const first = pts3[0]!;
+      const last = pts3[pts3.length - 1]!;
+      const closeLoop = Math.hypot(first[0] - last[0], first[1] - last[1], first[2] - last[2]) < 1e-6;
+      if (closeLoop) pts3.pop();
+      if (!cyclic && !closeLoop) continue;
+    }
+    if (pts3.length < 3) continue;
+
+    const localTris = earClipPolygon(pts3);
+    if (localTris.length < 3) continue;
+    for (const p of pts3) positions.push(p[0], p[1], p[2]);
+    for (let i = 0; i < localTris.length; i++) triangles.push(localTris[i]! + vertBase);
+    vertBase += pts3.length;
+  }
+
+  if (positions.length === 0 || triangles.length === 0) return Geometry.empty();
+  const out = new Geometry();
+  out.mesh = new MeshComponent(new Float32Array(positions), new Uint32Array(triangles));
+  return out;
+}
 
 export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Geometry {
   if (!curveGeo.curves) return Geometry.empty();

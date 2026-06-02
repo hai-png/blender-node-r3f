@@ -507,17 +507,17 @@ export class GeometryNodeProximity extends GeoDataFlow {
 /* ------------------------------------------------------------------ */
 
 // -----------------------------------------------------------------------
-//  Curve ops — Fill, Fillet, Sample (stub implementations)
+//  Curve ops — remaining limited/stub implementations.
 //  NOTE: These are declared/registered so the bridge can import them.
-//  The GeometryEvaluator handles them via pass-through stubs.
+//  Fill/Fillet are still partial; Sample/Subdivide now have executable
+//  poly-curve implementations in the GeometryEvaluator / MeshOps.
 // -----------------------------------------------------------------------
 export class GeometryNodeFillCurve extends GeoDataFlow {
   static override bl_idname = 'GeometryNodeFillCurve';
   static override bl_label = 'Fill Curve';
   static override category = 'Curve / Operations';
-  /* STUB: Converts planar curves to filled mesh faces.
-   * Full implementation requires earcut/triangulation of arbitrary poly loops.
-   * Returns empty geometry until implemented. */
+  /* Limited implementation: fills simple planar closed poly-curves using
+   * ear clipping. Holes / self-intersections are not handled yet. */
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketGeometry, 'Curve');
     this.addOutput(NodeSocketGeometry, 'Mesh');
@@ -528,8 +528,8 @@ export class GeometryNodeFilletCurve extends GeoDataFlow {
   static override bl_idname = 'GeometryNodeFilletCurve';
   static override bl_label = 'Fillet Curve';
   static override category = 'Curve / Operations';
-  /* STUB: Rounds curve corners by inserting arc segments.
-   * Pass-through until full control-point arc insertion is implemented. */
+  /* Limited implementation: rounds poly-curve corners by trimming adjacent
+   * segments and inserting an approximated circular arc. */
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketGeometry, 'Curve');
     this.addInput(NodeSocketFloat, 'Radius', { default_value: 0.1 });
@@ -541,8 +541,9 @@ export class GeometryNodeSampleCurve extends GeoDataFlow {
   static override bl_idname = 'GeometryNodeSampleCurve';
   static override bl_label = 'Sample Curve';
   static override category = 'Curve / Sample';
-  /* STUB: Samples a value along the curve at a given factor.
-   * Returns zeros until curve arc-length parameterisation is implemented. */
+  /* Limited implementation: samples the current poly-curve representation at
+   * a normalized factor. Multi-curve inputs are partitioned evenly across
+   * [0,1]; future work can refine this toward Blender's exact semantics. */
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketGeometry, 'Curves');
     this.addInput(NodeSocketFloat, 'Value', { default_value: 0 });
@@ -560,7 +561,7 @@ export class GeometryNodeSubdivideCurve extends GeoDataFlow {
   static override bl_idname = 'GeometryNodeSubdivideCurve';
   static override bl_label = 'Subdivide Curve';
   static override category = 'Curve / Operations';
-  /* Uses ResampleCurve pass-through until native segment subdivision lands. */
+  /* Inserts `Cuts` evenly-spaced points into every poly-curve segment. */
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketGeometry, 'Curve');
     this.addInput(NodeSocketInt, 'Cuts', { default_value: 1 });

@@ -34,7 +34,8 @@ import {
   mergeByDistance, subdivisionSurface, meshToPoints, pointsToVertices,
   distributePointsOnFaces, instanceOnPoints, realizeInstances,
   curveToMesh, curveToPoints, resampleCurve, reverseCurve,
-  sampleNearestIndex, geometryProximity,
+  sampleNearestIndex, geometryProximity, sampleCurveAtFactor, subdivideCurve,
+  fillCurve, filletCurve,
   composeMat4, mat4Mul, flipFaces,
 } from './geometry/MeshOps';
 
@@ -56,6 +57,14 @@ import {
   GeometryNodeInputPosition, GeometryNodeInputNormal, GeometryNodeInputIndex,
   GeometryNodeInputID, GeometryNodeInputRadius, GeometryNodeInputNamedAttribute,
 } from '../nodes/geometry/FieldInputs';
+import {
+  ShaderNodeTexNoise,
+} from '../nodes/shader/Shaders';
+import {
+  ShaderNodeTexImage, ShaderNodeTexEnvironment, ShaderNodeTexVoronoi,
+  ShaderNodeTexWave, ShaderNodeTexChecker, ShaderNodeTexBrick,
+  ShaderNodeTexGradient, ShaderNodeTexMagic, ShaderNodeTexWhiteNoise,
+} from '../nodes/shader/Textures';
 import {
   GeometryNodeMeshCube, GeometryNodeMeshUVSphere, GeometryNodeMeshIcoSphere,
   GeometryNodeMeshCylinder, GeometryNodeMeshCone, GeometryNodeMeshGrid,
@@ -96,7 +105,57 @@ const fieldKindForSocket = (s: NodeSocket): FieldKind => {
   }
 };
 
+const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+const smooth = (t: number): number => t * t * (3 - 2 * t);
+const fract = (x: number): number => x - Math.floor(x);
+function hash2(x: number, y: number): number {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return fract(s);
+}
+function valueNoise2(x: number, y: number): number {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return lerp(lerp(a, b, smooth(xf)), lerp(c, d, smooth(xf)), smooth(yf));
+}
+function valueNoise3(x: number, y: number, z: number): number {
+  return (valueNoise2(x + z * 0.37, y + z * 0.61) + valueNoise2(y + x * 0.19, z + x * 0.53)) * 0.5;
+}
+function voronoiDistance(x: number, y: number, z: number, metric: string): { distance: number; position: Vec3; color: [number, number, number, number] } {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  let best = Infinity;
+  let bestPos: Vec3 = [0, 0, 0];
+  let bestColor: [number, number, number, number] = [0, 0, 0, 1];
+  for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const cx = xi + dx, cy = yi + dy, cz = zi + dz;
+    const px = cx + hash2(cx + cz * 13.7, cy + 0.11);
+    const py = cy + hash2(cy + cx * 7.3, cz + 0.29);
+    const pz = cz + hash2(cz + cy * 5.1, cx + 0.47);
+    const ddx = px - x, ddy = py - y, ddz = pz - z;
+    const d = metric === 'MANHATTAN'
+      ? Math.abs(ddx) + Math.abs(ddy) + Math.abs(ddz)
+      : metric === 'CHEBYCHEV'
+        ? Math.max(Math.abs(ddx), Math.abs(ddy), Math.abs(ddz))
+        : Math.hypot(ddx, ddy, ddz);
+    if (d < best) {
+      best = d;
+      bestPos = [px, py, pz];
+      bestColor = [hash2(px, py), hash2(py, pz), hash2(pz, px), 1];
+    }
+  }
+  return { distance: Math.min(best, 1), position: bestPos, color: bestColor };
+}
+function sampleImageNearest(img: ImageData, u: number, v: number): [number, number, number, number] {
+  const x = Math.max(0, Math.min(img.width - 1, Math.floor(clamp01(u) * img.width)));
+  const y = Math.max(0, Math.min(img.height - 1, Math.floor(clamp01(v) * img.height)));
+  const i = (y * img.width + x) * 4;
+  return [img.data[i]! / 255, img.data[i + 1]! / 255, img.data[i + 2]! / 255, img.data[i + 3]! / 255];
+}
+
 export class GeometryEvaluator implements SystemEvaluator {
+  constructor(private opts: { resolveImage?: (imageSrc: string) => ImageData | null } = {}) {}
   evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
     const timings = new Map<string, number>();
@@ -326,39 +385,67 @@ export class GeometryEvaluator implements SystemEvaluator {
     /* ---------------- Group container (recursive) ---------------- */
     if (node instanceof NodeGroupBase) { this.executeGroup(node, cache, 0); return; }
 
-    /* ---- Curve stubs (declared but full algo not yet implemented) ---- */
+    /* ---- Curve partials / remaining stubs ---- */
     if (node instanceof GeometryNodeFillCurve) {
-      /* STUB: FillCurve — converts a planar closed curve to a filled mesh.
-       * Requires earcut triangulation of arbitrary poly loops.
-       * Returns empty geometry until a triangulation pass is added. */
-      cache.set(node.outputs[0]!.id, Geometry.empty());
+      const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, fillCurve(curve));
       return;
     }
     if (node instanceof GeometryNodeFilletCurve) {
-      /* STUB: FilletCurve — rounds control-point corners with arc segments.
-       * Pass-through the curve unchanged until arc insertion is implemented. */
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      cache.set(node.outputs[0]!.id, geo);
+      const radius = Math.max(0, this.socketSingle<number>(node.inputs[1]!, cache, geo) || 0);
+      cache.set(node.outputs[0]!.id, filletCurve(geo, radius));
       return;
     }
     if (node instanceof GeometryNodeSampleCurve) {
-      /* STUB: SampleCurve — samples a field value along the arc length.
-       * Returns zero vectors/values until arc-length parameterisation is added. */
-      const zero3 = constField([0, 0, 0] as [number, number, number], 'VECTOR');
-      cache.set(node.outputs[0]!.id, zero3);   // Position
-      cache.set(node.outputs[1]!.id, constField([0, 1, 0] as [number, number, number], 'VECTOR')); // Tangent
-      cache.set(node.outputs[2]!.id, constField([0, 0, 1] as [number, number, number], 'VECTOR')); // Normal
-      cache.set(node.outputs[3]!.id, constField(0, 'FLOAT'));   // Value
-      cache.set(node.outputs[4]!.id, constField(0, 'INT'));     // Index
-      cache.set(node.outputs[5]!.id, constField(0, 'INT'));     // Curve Index
+      const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const valueField = this.socketField(node.inputs[1]!, cache);
+      const factorField = this.socketField(node.inputs[2]!, cache);
+      const pointCtx: FieldContext = { geometry: curve, domain: 'POINT', size: curve.domainSize('POINT') };
+      const sampledValues = valueField.eval(pointCtx);
+      const valueDims = valueField.kind === 'VECTOR' ? 3 : valueField.kind === 'COLOR' ? 4 : 1;
+
+      const makeVectorField = (pick: (s: ReturnType<typeof sampleCurveAtFactor>) => Vec3): Field => ({
+        kind: 'VECTOR',
+        eval(ctx) {
+          const factors = factorField.eval(ctx);
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const sample = sampleCurveAtFactor(curve, (factors[i] as number) ?? 0, sampledValues, valueDims);
+            const v = pick(sample);
+            out[i * 3] = v[0];
+            out[i * 3 + 1] = v[1];
+            out[i * 3 + 2] = v[2];
+          }
+          return out;
+        },
+      });
+      const makeScalarField = (pick: (s: ReturnType<typeof sampleCurveAtFactor>) => number, kind: 'FLOAT' | 'INT'): Field => ({
+        kind,
+        eval(ctx) {
+          const factors = factorField.eval(ctx);
+          const out = kind === 'INT' ? new Int32Array(ctx.size) : new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const sample = sampleCurveAtFactor(curve, (factors[i] as number) ?? 0, sampledValues, valueDims);
+            if (kind === 'INT') (out as Int32Array)[i] = pick(sample) | 0;
+            else (out as Float32Array)[i] = pick(sample);
+          }
+          return out;
+        },
+      });
+
+      cache.set(node.outputs[0]!.id, makeVectorField((s) => s.position));
+      cache.set(node.outputs[1]!.id, makeVectorField((s) => s.tangent));
+      cache.set(node.outputs[2]!.id, makeVectorField((s) => s.normal));
+      cache.set(node.outputs[3]!.id, makeScalarField((s) => s.value, 'FLOAT'));
+      cache.set(node.outputs[4]!.id, makeScalarField((s) => s.index, 'INT'));
+      cache.set(node.outputs[5]!.id, makeScalarField((s) => s.curveIndex, 'INT'));
       return;
     }
     if (node instanceof GeometryNodeSubdivideCurve) {
-      /* STUB: SubdivideCurve — subdivides each curve segment N times.
-       * Pass-through for now (full segment insertion not yet implemented).
-       * Use ResampleCurve as the recommended approach until this is complete. */
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      cache.set(node.outputs[0]!.id, geo);
+      const cuts = Math.max(0, Math.floor(this.socketSingle<number>(node.inputs[1]!, cache, geo) || 0));
+      cache.set(node.outputs[0]!.id, subdivideCurve(geo, cuts));
       return;
     }
 
@@ -762,6 +849,401 @@ export class GeometryEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof NodeGroupOutput) {
+      return;
+    }
+
+    /* ---------------- Geometry texture fields ---------------- */
+    if (node instanceof ShaderNodeTexNoise) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const scaleF = this.socketField(node.inputs[1]!, cache);
+      const distortionF = this.socketField(node.inputs[4]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const dv = distortionF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const x = vv[i * 3]!, y = vv[i * 3 + 1]!, z = vv[i * 3 + 2]!;
+            const s = sv[i] || 1;
+            const wobble = dv[i] ? valueNoise3(x * s * 0.5 + 19.7, y * s * 0.5 + 7.1, z * s * 0.5 + 3.9) * dv[i]! : 0;
+            out[i] = valueNoise3(x * s + wobble, y * s + wobble, z * s + wobble);
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = (cache.get(node.outputs[0]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const f = fac[i]!;
+            out[i * 4] = f; out[i * 4 + 1] = f; out[i * 4 + 2] = f; out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexImage) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const img = node.image_src && this.opts.resolveImage ? this.opts.resolveImage(node.image_src) : null;
+      const wrap = (u: number): number => {
+        switch (node.extension) {
+          case 'EXTEND': return clamp01(u);
+          case 'CLIP': return u < 0 || u > 1 ? -1 : u;
+          case 'MIRROR': {
+            const m = Math.abs(u % 2);
+            return m > 1 ? 2 - m : m;
+          }
+          default: return fract(u < 0 ? u + Math.ceil(-u) : u);
+        }
+      };
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const u = wrap(vv[i * 3]!);
+            const v = wrap(vv[i * 3 + 1]!);
+            const c = img && u >= 0 && v >= 0 ? sampleImageNearest(img, u, v) : [u < 0 || v < 0 ? 0 : u, u < 0 || v < 0 ? 0 : v, 0.5, u < 0 || v < 0 ? 0 : 1] as [number, number, number, number];
+            out[i * 4] = c[0]; out[i * 4 + 1] = c[1]; out[i * 4 + 2] = c[2]; out[i * 4 + 3] = c[3];
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const col = (cache.get(node.outputs[0]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) out[i] = col[i * 4 + 3]!;
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexEnvironment) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const img = node.image_src && this.opts.resolveImage ? this.opts.resolveImage(node.image_src) : null;
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const x = vv[i * 3]!, y = vv[i * 3 + 1]!, z = vv[i * 3 + 2]!;
+            const l = Math.hypot(x, y, z) || 1;
+            const nx = x / l, ny = y / l, nz = z / l;
+            const u = fract((Math.atan2(nz, nx) / (2 * Math.PI)) + 0.5);
+            const v = clamp01(ny * 0.5 + 0.5);
+            const c = img ? sampleImageNearest(img, u, v) : [u, v, clamp01(0.5 + ny * 0.5), 1] as [number, number, number, number];
+            out[i * 4] = c[0]; out[i * 4 + 1] = c[1]; out[i * 4 + 2] = c[2]; out[i * 4 + 3] = c[3];
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexVoronoi) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const scaleF = this.socketField(node.inputs[1]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
+            out[i] = r.distance;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
+            out[i * 4] = r.color[0]; out[i * 4 + 1] = r.color[1]; out[i * 4 + 2] = r.color[2]; out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[2]!.id, {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = voronoiDistance(vv[i * 3]! * (sv[i] || 1), vv[i * 3 + 1]! * (sv[i] || 1), vv[i * 3 + 2]! * (sv[i] || 1), node.distance);
+            out[i * 3] = r.position[0]; out[i * 3 + 1] = r.position[1]; out[i * 3 + 2] = r.position[2];
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexWave) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const scaleF = this.socketField(node.inputs[1]!, cache);
+      const distortionF = this.socketField(node.inputs[2]!, cache);
+      const phaseF = this.socketField(node.inputs[6]!, cache);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const dv = distortionF.eval(ctx) as Float32Array;
+          const pv = phaseF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const x = vv[i * 3]!, y = vv[i * 3 + 1]!, z = vv[i * 3 + 2]!;
+            const s = sv[i] || 1;
+            const base = node.wave_type === 'RINGS' ? Math.hypot(x, y, z) * s : (x + y + z) * s * 0.3333;
+            const wobble = (dv[i] || 0) * valueNoise3(x * s * 0.5 + 3.1, y * s * 0.5 + 9.7, z * s * 0.5 + 2.3);
+            out[i] = clamp01(0.5 + 0.5 * Math.sin((base + wobble + pv[i]!) * Math.PI * 2));
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = (cache.get(node.outputs[1]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const f = fac[i]!;
+            out[i * 4] = f; out[i * 4 + 1] = f; out[i * 4 + 2] = f; out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexChecker) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const c1F = this.socketField(node.inputs[1]!, cache);
+      const c2F = this.socketField(node.inputs[2]!, cache);
+      const scaleF = this.socketField(node.inputs[3]!, cache);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const s = sv[i] || 1;
+            const cx = Math.floor(vv[i * 3]! * s);
+            const cy = Math.floor(vv[i * 3 + 1]! * s);
+            const cz = Math.floor(vv[i * 3 + 2]! * s);
+            out[i] = ((cx + cy + cz) & 1) ? 1 : 0;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = (cache.get(node.outputs[1]!.id) as Field).eval(ctx) as Float32Array;
+          const a = c1F.eval(ctx) as Float32Array;
+          const b = c2F.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const src = fac[i]! >= 0.5 ? b : a;
+            out[i * 4] = src[i * 4]!;
+            out[i * 4 + 1] = src[i * 4 + 1]!;
+            out[i * 4 + 2] = src[i * 4 + 2]!;
+            out[i * 4 + 3] = src[i * 4 + 3]!;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexBrick) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const c1F = this.socketField(node.inputs[1]!, cache);
+      const c2F = this.socketField(node.inputs[2]!, cache);
+      const mortarF = this.socketField(node.inputs[3]!, cache);
+      const scaleF = this.socketField(node.inputs[4]!, cache);
+      const mortarSizeF = this.socketField(node.inputs[5]!, cache);
+      const mortarSmoothF = this.socketField(node.inputs[6]!, cache);
+      const brickWidthF = this.socketField(node.inputs[8]!, cache);
+      const rowHeightF = this.socketField(node.inputs[9]!, cache);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const msv = mortarSizeF.eval(ctx) as Float32Array;
+          const mrv = mortarSmoothF.eval(ctx) as Float32Array;
+          const bwv = brickWidthF.eval(ctx) as Float32Array;
+          const rhv = rowHeightF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const bw = Math.max(1e-4, bwv[i] || 0.5);
+            const rh = Math.max(1e-4, rhv[i] || 0.25);
+            const s = sv[i] || 1;
+            const px = (vv[i * 3]! / bw) * s;
+            const py = (vv[i * 3 + 1]! / rh) * s;
+            const row = Math.floor(py);
+            const brickX = px + ((row & 1) ? 0.5 : 0);
+            const lx = fract(brickX);
+            const ly = fract(py);
+            const edge = Math.min(Math.min(lx, 1 - lx), Math.min(ly, 1 - ly));
+            const ms = Math.max(1e-4, msv[i] || 0.02);
+            const sm = Math.max(1e-4, mrv[i] || 0);
+            const t = clamp01((edge - ms) / Math.max(1e-4, sm || 1e-4));
+            out[i] = smooth(t);
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = (cache.get(node.outputs[1]!.id) as Field).eval(ctx) as Float32Array;
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const bwv = brickWidthF.eval(ctx) as Float32Array;
+          const rhv = rowHeightF.eval(ctx) as Float32Array;
+          const a = c1F.eval(ctx) as Float32Array;
+          const b = c2F.eval(ctx) as Float32Array;
+          const m = mortarF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const bw = Math.max(1e-4, bwv[i] || 0.5);
+            const rh = Math.max(1e-4, rhv[i] || 0.25);
+            const s = sv[i] || 1;
+            const px = (vv[i * 3]! / bw) * s;
+            const py = (vv[i * 3 + 1]! / rh) * s;
+            const row = Math.floor(py);
+            const brickX = px + ((row & 1) ? 0.5 : 0);
+            const colSel = (Math.floor(brickX) + row) & 1;
+            const brick = colSel ? b : a;
+            const ff = fac[i]!;
+            out[i * 4] = lerp(m[i * 4]!, brick[i * 4]!, ff);
+            out[i * 4 + 1] = lerp(m[i * 4 + 1]!, brick[i * 4 + 1]!, ff);
+            out[i * 4 + 2] = lerp(m[i * 4 + 2]!, brick[i * 4 + 2]!, ff);
+            out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexGradient) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const x = vv[i * 3]!, y = vv[i * 3 + 1]!, z = vv[i * 3 + 2]!;
+            let f = 0;
+            switch (node.gradient_type) {
+              case 'LINEAR': f = x + 0.5; break;
+              case 'QUADRATIC': f = Math.max(0, x + 0.5) ** 2; break;
+              case 'EASING': { const t = clamp01(x + 0.5); f = t * t * (3 - 2 * t); break; }
+              case 'DIAGONAL': f = (x + y) * 0.5 + 0.5; break;
+              case 'SPHERICAL': f = Math.max(0, 1 - Math.hypot(x, y, z)); break;
+              case 'QUADRATIC_SPHERE': { const r = Math.max(0, 1 - Math.hypot(x, y, z)); f = r * r; break; }
+              case 'RADIAL': f = Math.atan2(y, x) / (2 * Math.PI) + 0.5; break;
+              default: f = x + 0.5;
+            }
+            out[i] = clamp01(f);
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = (cache.get(node.outputs[1]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const f = fac[i]!;
+            out[i * 4] = f; out[i * 4 + 1] = f; out[i * 4 + 2] = f; out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexMagic) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      const scaleF = this.socketField(node.inputs[1]!, cache);
+      const distortionF = this.socketField(node.inputs[2]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const sv = scaleF.eval(ctx) as Float32Array;
+          const dv = distortionF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const s = sv[i] || 1;
+            const d = dv[i] || 1;
+            let x = vv[i * 3]! * s;
+            let y = vv[i * 3 + 1]! * s;
+            let z = vv[i * 3 + 2]! * s;
+            const r = Math.sin(x + y + z * 0.5 * d);
+            const g = Math.cos(x * 1.7 - y * 1.3 + z);
+            const b = Math.sin((x + 1) * (y + 1) + z * d);
+            out[i * 4] = 0.5 + 0.5 * r;
+            out[i * 4 + 1] = 0.5 + 0.5 * g;
+            out[i * 4 + 2] = 0.5 + 0.5 * b;
+            out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const col = (cache.get(node.outputs[0]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) out[i] = (col[i * 4]! + col[i * 4 + 1]! + col[i * 4 + 2]!) / 3;
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeTexWhiteNoise) {
+      const vecF = this.socketField(node.inputs[0]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = fract(Math.sin(vv[i * 3]! * 127.1 + vv[i * 3 + 1]! * 311.7 + vv[i * 3 + 2]! * 74.7) * 43758.5453);
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const val = (cache.get(node.outputs[0]!.id) as Field).eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const f = val[i]!;
+            out[i * 4] = f; out[i * 4 + 1] = f; out[i * 4 + 2] = f; out[i * 4 + 3] = 1;
+          }
+          return out;
+        },
+      } satisfies Field);
       return;
     }
 

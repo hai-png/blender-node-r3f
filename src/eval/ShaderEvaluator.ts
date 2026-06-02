@@ -58,6 +58,7 @@ import { ColorRampNode } from '../nodes/common/ColorRamp';
 import {
   CombineXYZNode, SeparateXYZNode, CombineColorNode, SeparateColorNode,
 } from '../nodes/common/CombineSeparate';
+import { BooleanMathNode, CompareNode, RandomValueNode, SwitchNode } from '../nodes/common/Logic';
 import { RerouteNode, NodeGroupInput, NodeGroupOutput } from '../nodes/common';
 import { NodeGroupBase } from '../nodes/common/Group';
 import {
@@ -89,6 +90,64 @@ const DEFAULT: MaterialDescriptor = {
   emissive_strength: 0,
   opacity: 1,
 };
+
+const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+function rgb2hsv(r: number, g: number, b: number): [number, number, number] {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6;
+    if (h < 0) h += 1;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return [h, s, max];
+}
+function hsv2rgb(h: number, s: number, v: number): [number, number, number] {
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  switch (((i % 6) + 6) % 6) {
+    case 0: return [v, t, p];
+    case 1: return [q, v, p];
+    case 2: return [p, v, t];
+    case 3: return [p, q, v];
+    case 4: return [t, p, v];
+    default: return [v, p, q];
+  }
+}
+function rgb2hsl(r: number, g: number, b: number): [number, number, number] {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h = 0;
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return [h / 6, s, l];
+}
+function hue2rgb(p: number, q: number, t: number): number {
+  if (t < 0) t += 1;
+  if (t > 1) t -= 1;
+  if (t < 1 / 6) return p + (q - p) * 6 * t;
+  if (t < 1 / 2) return q;
+  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+  return p;
+}
+function hsl2rgb(h: number, s: number, l: number): [number, number, number] {
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return [
+    hue2rgb(p, q, h + 1 / 3),
+    hue2rgb(p, q, h),
+    hue2rgb(p, q, h - 1 / 3),
+  ];
+}
 
 export class ShaderEvaluator implements SystemEvaluator {
   evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
@@ -274,17 +333,76 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof CombineColorNode) {
-      const r = this.socketValue(node.inputs[0]!, cache) as number;
-      const g = this.socketValue(node.inputs[1]!, cache) as number;
-      const b = this.socketValue(node.inputs[2]!, cache) as number;
-      cache.set(node.outputs[0]!.id, [r, g, b, 1] as RGBA);
+      const a = this.socketValue(node.inputs[0]!, cache) as number;
+      const b = this.socketValue(node.inputs[1]!, cache) as number;
+      const c = this.socketValue(node.inputs[2]!, cache) as number;
+      let out: RGBA;
+      switch (node.mode) {
+        case 'HSV': {
+          const [r, g, bb] = hsv2rgb(clamp01(a), clamp01(b), clamp01(c));
+          out = [r, g, bb, 1];
+          break;
+        }
+        case 'HSL': {
+          const [r, g, bb] = hsl2rgb(clamp01(a), clamp01(b), clamp01(c));
+          out = [r, g, bb, 1];
+          break;
+        }
+        default:
+          out = [a, b, c, 1];
+      }
+      cache.set(node.outputs[0]!.id, out);
       return;
     }
     if (node instanceof SeparateColorNode) {
       const c = this.socketValue(node.inputs[0]!, cache) as RGBA;
-      cache.set(node.outputs[0]!.id, c[0]);
-      cache.set(node.outputs[1]!.id, c[1]);
-      cache.set(node.outputs[2]!.id, c[2]);
+      let a = c[0], b = c[1], d = c[2];
+      if (node.mode === 'HSV') [a, b, d] = rgb2hsv(c[0], c[1], c[2]);
+      else if (node.mode === 'HSL') [a, b, d] = rgb2hsl(c[0], c[1], c[2]);
+      cache.set(node.outputs[0]!.id, a);
+      cache.set(node.outputs[1]!.id, b);
+      cache.set(node.outputs[2]!.id, d);
+      return;
+    }
+    if (node instanceof BooleanMathNode) {
+      const a = !!(this.socketValue(node.inputs[0]!, cache) as boolean);
+      const b = !!(this.socketValue(node.inputs[1]!, cache) as boolean);
+      cache.set(node.outputs[0]!.id, BooleanMathNode.compute(node.operation, a, b));
+      return;
+    }
+    if (node instanceof CompareNode) {
+      const a = this.socketValue(node.inputs[0]!, cache) as number;
+      const b = this.socketValue(node.inputs[1]!, cache) as number;
+      const eps = this.socketValue(node.inputs[2]!, cache) as number;
+      cache.set(node.outputs[0]!.id, CompareNode.compute(node.operation, a, b, eps));
+      return;
+    }
+    if (node instanceof SwitchNode) {
+      const cond = !!(this.socketValue(node.inputs[0]!, cache) as boolean);
+      cache.set(node.outputs[0]!.id, this.socketValue(node.inputs[cond ? 2 : 1]!, cache));
+      return;
+    }
+    if (node instanceof RandomValueNode) {
+      const id = (this.socketValue(node.inputs[7]!, cache) as number) | 0;
+      const seed = (this.socketValue(node.inputs[8]!, cache) as number) | 0;
+      const r0 = RandomValueNode.hash(id, seed);
+      const r1 = RandomValueNode.hash(id + 101, seed + 17);
+      const r2 = RandomValueNode.hash(id + 211, seed + 37);
+      const minV = this.socketValue(node.inputs[0]!, cache) as Vec3;
+      const maxV = this.socketValue(node.inputs[1]!, cache) as Vec3;
+      const minF = this.socketValue(node.inputs[2]!, cache) as number;
+      const maxF = this.socketValue(node.inputs[3]!, cache) as number;
+      const minI = this.socketValue(node.inputs[4]!, cache) as number;
+      const maxI = this.socketValue(node.inputs[5]!, cache) as number;
+      const prob = this.socketValue(node.inputs[6]!, cache) as number;
+      cache.set(node.outputs[0]!.id, [
+        lerp(minV[0], maxV[0], r0),
+        lerp(minV[1], maxV[1], r1),
+        lerp(minV[2], maxV[2], r2),
+      ] as Vec3);
+      cache.set(node.outputs[1]!.id, lerp(minF, maxF, r0));
+      cache.set(node.outputs[2]!.id, Math.floor(lerp(minI, maxI + 1, r0)));
+      cache.set(node.outputs[3]!.id, r0 <= prob);
       return;
     }
     if (node instanceof ShaderNodeTexNoise) {

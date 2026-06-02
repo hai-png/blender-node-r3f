@@ -335,6 +335,90 @@ registerEmit('ShaderNodeSeparateXYZ', (n, c) => {
   const v = c.input(n.inputs[0]!);
   return { X: v.x, Y: v.y, Z: v.z };
 });
+registerEmit('ShaderNodeCombineColor', (n, c) => {
+  // Current TSL approximation: treat channels as RGB even when mode=HSV/HSL.
+  const r = c.input(n.inputs[0]!);
+  const g = c.input(n.inputs[1]!);
+  const b = c.input(n.inputs[2]!);
+  return { Color: vec4(r, g, b, 1) };
+});
+registerEmit('ShaderNodeSeparateColor', (n, c) => {
+  // Current TSL approximation: split RGB channels directly.
+  const v = c.input(n.inputs[0]!);
+  return { Red: v.x, Green: v.y, Blue: v.z };
+});
+registerEmit('FunctionNodeBooleanMath', (n, c) => {
+  const a = c.input(n.inputs[0]!).clamp(0, 1);
+  const b = c.input(n.inputs[1]!).clamp(0, 1);
+  const op = (n as unknown as { operation: string }).operation;
+  let v: TSLNode;
+  switch (op) {
+    case 'AND': v = a.mul(b); break;
+    case 'OR': v = a.add(b).clamp(0, 1); break;
+    case 'NOT': v = float(1).sub(a); break;
+    case 'NAND': v = float(1).sub(a.mul(b)).clamp(0, 1); break;
+    case 'NOR': v = float(1).sub(a.add(b).clamp(0, 1)); break;
+    case 'XNOR': v = float(1).sub(a.sub(b).abs().clamp(0, 1)); break;
+    case 'XOR': v = a.sub(b).abs().clamp(0, 1); break;
+    case 'IMPLY': v = float(1).sub(a).add(b).clamp(0, 1); break;
+    case 'NIMPLY': v = a.mul(float(1).sub(b)).clamp(0, 1); break;
+    default: v = a.mul(b); break;
+  }
+  return { Boolean: v };
+});
+registerEmit('FunctionNodeCompare', (n, c) => {
+  const a = c.input(n.inputs[0]!);
+  const b = c.input(n.inputs[1]!);
+  const eps = c.input(n.inputs[2]!);
+  const op = (n as unknown as { operation: string }).operation;
+  let v: TSLNode;
+  switch (op) {
+    case 'LESS_THAN': v = b.sub(a).sign().max(0); break;
+    case 'LESS_EQUAL': v = b.sub(a).add(eps).sign().max(0); break;
+    case 'GREATER_THAN': v = a.sub(b).sign().max(0); break;
+    case 'GREATER_EQUAL': v = a.sub(b).add(eps).sign().max(0); break;
+    case 'EQUAL': v = float(1).sub(a.sub(b).abs().div(eps.max ? eps.max(1e-6) : add(eps, 1e-6)).clamp(0, 1)); break;
+    case 'NOT_EQUAL': v = a.sub(b).abs().div(eps.max ? eps.max(1e-6) : add(eps, 1e-6)).clamp(0, 1); break;
+    default: v = a.sub(b).sign().max(0); break;
+  }
+  return { Result: v };
+});
+registerEmit('GeometryNodeSwitch', (n, c) => {
+  const cond = c.input(n.inputs[0]!).clamp(0, 1);
+  const a = c.input(n.inputs[1]!);
+  const b = c.input(n.inputs[2]!);
+  return { Output: mix(a, b, cond) };
+});
+registerEmit('FunctionNodeRandomValue', (n, c) => {
+  const dataType = (n as unknown as { data_type: string }).data_type;
+  const id = c.input(n.inputs[7]!);
+  const seed = c.input(n.inputs[8]!);
+  const rand = hash1(vec3(id, seed, id.add(seed)));
+  const rand2 = hash1(vec3(id.add(17), seed.add(23), id.add(seed).add(5)));
+  const rand3 = hash1(vec3(id.add(37), seed.add(47), id.add(seed).add(11)));
+  if (dataType === 'FLOAT_VECTOR') {
+    const minV = c.input(n.inputs[0]!);
+    const maxV = c.input(n.inputs[1]!);
+    const rv = vec3(
+      mix(minV.x, maxV.x, rand),
+      mix(minV.y, maxV.y, rand2),
+      mix(minV.z, maxV.z, rand3),
+    );
+    return { Value_Vector: rv };
+  }
+  if (dataType === 'INT') {
+    const minI = c.input(n.inputs[4]!);
+    const maxI = c.input(n.inputs[5]!);
+    return { Value_Int: mix(minI, maxI.add(1), rand).floor() };
+  }
+  if (dataType === 'BOOLEAN') {
+    const prob = c.input(n.inputs[6]!);
+    return { Value_Bool: rand.lessThan(prob) };
+  }
+  const minF = c.input(n.inputs[2]!);
+  const maxF = c.input(n.inputs[3]!);
+  return { Value: mix(minF, maxF, rand) };
+});
 
 registerEmit('ShaderNodeValToRGB', (n, c) => {
   // ColorRamp — sample stops in a TSL Fn.
