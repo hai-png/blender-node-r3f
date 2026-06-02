@@ -677,16 +677,24 @@ export function distributePointsOnFaces(
     return { points: Geometry.empty(), normals: new Float32Array(), rotations: new Float32Array() };
   }
 
-  // Estimate total count then sample per face proportional to selected,
-  // density-factor-weighted area.
-  const totalCount = Math.max(0, Math.round(weightedArea * Math.max(0, density)));
-
+  // Per-face Poisson sampling: each face independently draws
+  //   floor(expected) + Bernoulli(frac)  points
+  // where expected = faceArea * densityFactor * density.
+  //
+  // This is mathematically equivalent to a spatial Poisson process and handles
+  // meshes with many small triangles (e.g. UV spheres) correctly — the old
+  // approach used proportional rounding which caused all small faces to get 0
+  // points whenever the per-face expected count < 0.5.
+  const posDensity = Math.max(0, density);
   const positions: number[] = [];
   const normalsOut: number[] = [];
   for (const f of includedFaces) {
     const factor = densityFactor ? Math.max(0, Number(densityFactor[f] ?? 0)) : 1;
-    const faceWeight = areas[f]! * factor;
-    const facePts = Math.max(0, Math.round((faceWeight / Math.max(weightedArea, 1e-9)) * totalCount));
+    const expected = areas[f]! * factor * posDensity;
+    // Deterministic floor + probabilistic rounding of the fractional part.
+    const floor = Math.floor(expected);
+    const frac = expected - floor;
+    const facePts = floor + (rng() < frac ? 1 : 0);
     if (facePts === 0) continue;
     const a = m.triangles[f * 3]! * 3, b = m.triangles[f * 3 + 1]! * 3, c = m.triangles[f * 3 + 2]! * 3;
     const nx = faceNormals[f * 3]!, ny = faceNormals[f * 3 + 1]!, nz = faceNormals[f * 3 + 2]!;

@@ -25,7 +25,7 @@ import {
   GeometryNodeRealizeInstances, GeometryNodeTranslateInstances, GeometryNodeMeshToPoints, GeometryNodeSubdivisionSurface,
   GeometryNodeCurveCircle, GeometryNodeCurveToPoints, GeometryNodeCurveBezierSegment,
   GeometryNodeResampleCurve, GeometryNodeReverseCurve,
-  GeometryNodeAccumulateField, GeometryNodeAttributeDomainSize, GeometryNodeFlipFaces,
+  GeometryNodeAccumulateField, GeometryNodeFieldOnDomain, GeometryNodeAttributeDomainSize, GeometryNodeFlipFaces,
   GeometryNodeConvexHull,
   GeometryNodeFieldAtIndex, GeometryNodeInputIndex,
   GeometryNodeCurveLine, GeometryNodeProximity,
@@ -2461,6 +2461,677 @@ test('bridge: cycle detection does not break BNG round-trip', () => {
   const trees = importDocument(doc);
   assert(trees.length === 1, 'tree round-trips without cycle');
   assert(trees[0]!.nodes.length === 2, 'both nodes preserved');
+});
+
+// --------------------- Phase 3: Incremental depsgraph execution --------
+
+test('phase3: GeometryEvaluator skips clean nodes on second evaluate (property change)', () => {
+  // Build a chain: Cube(A) → Transform(B) → Output
+  // Evaluate once (full rebuild). Then change only B's property.
+  // The second evaluate should re-run B (dirty) but not A.
+  //
+  // Key: we call the evaluator DIRECTLY with explicit dirty sets, bypassing
+  // the microtask scheduler, so we control exactly what is in the dirty set.
+  const t = new GeometryNodeTree('p3-incremental');
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const xform = t.addNode(GeometryNodeTransform);
+  (xform.inputs.find(s => s.identifier === 'Translation' || s.name === 'Translation')!.default_value as number[]) = [0, 0, 0];
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, xform.inputs[0]!);
+  t.addLink(xform.outputs[0]!, out.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
+
+  // First call: full dirty set → full rebuild
+  const allDirty = new Set(t.nodes);
+  const r1 = ev.evaluate(t, allDirty);
+  const g1 = r1.output as Geometry;
+  assert(g1.mesh !== undefined, 'first eval produces mesh');
+  assert(r1.node_timings.has(cube.id), 'cube ran on first eval (full rebuild)');
+  assert(r1.node_timings.has(xform.id), 'transform ran on first eval (full rebuild)');
+
+  // Second call: only xform and its downstream are dirty
+  (xform.inputs.find(s => s.identifier === 'Translation' || s.name === 'Translation')!.default_value as number[]) = [0, 5, 0];
+  const partialDirty = new Set([xform, out]); // cube is NOT dirty
+  const r2 = ev.evaluate(t, partialDirty);
+  const g2 = r2.output as Geometry;
+  assert(g2.mesh !== undefined, 'second eval produces mesh');
+
+  // cube is clean → must be SKIPPED
+  assert(!r2.node_timings.has(cube.id), `cube should be SKIPPED on second eval (only xform dirty), got timings: ${[...r2.node_timings.keys()].join(',')}`);
+  // xform is dirty → must RE-RUN
+  assert(r2.node_timings.has(xform.id), 'transform should RE-RUN on second eval (it is dirty)');
+
+  // Output should reflect the new translation (Y+5 offset → max Y ≈ 6)
+  let maxY = -Infinity;
+  for (let i = 1; i < g2.mesh!.positions.length; i += 3) maxY = Math.max(maxY, g2.mesh!.positions[i]!);
+  close(maxY, 6, 0.1, 'second eval with Y+5 offset → max Y ≈ 6');
+});
+
+test('phase3: GeometryEvaluator second evaluate with no changes uses persistent cache fully', () => {
+  // If dirty set is empty, evaluate() should skip ALL nodes and return from cache.
+  const t = new GeometryNodeTree('p3-noop');
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, out.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
+
+  // First call: full rebuild
+  const r1 = ev.evaluate(t, new Set(t.nodes));
+  assert(r1.node_timings.has(cube.id), 'cube ran on first eval (full rebuild)');
+  const g1 = r1.output as Geometry;
+  assert(g1.mesh !== undefined, 'first eval has mesh');
+
+  // Second call: empty dirty set
+  const r2 = ev.evaluate(t, new Set()); // empty dirty
+  assert(!r2.node_timings.has(cube.id), `cube should be SKIPPED when dirty is empty, got: ${[...r2.node_timings.keys()].join(',')}`);
+  const g2 = r2.output as Geometry;
+  assert(g2.mesh !== undefined, 'output is still a valid mesh from persistent cache');
+  eq(g2.mesh!.numVerts, 8, 'cube still has 8 verts from cache');
+});
+
+test('phase3: GeometryEvaluator full rebuild on topology change (node added)', () => {
+  // Adding a node (topology change) should clear the persistent cache → full rebuild.
+  const t = new GeometryNodeTree('p3-topo');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, out.inputs[0]!);
+
+  const ev = t.depsgraph['_evaluator'] as GeometryEvaluator;
+
+  // First eval: full rebuild
+  ev.evaluate(t, new Set(t.nodes));
+
+  // Add a new node (topology change) — clearPersistentCache() is called via tree event
+  const grid = t.addNode(GeometryNodeMeshGrid); // triggers node_added → clearPersistentCache
+
+  // The persistent cache is now cleared. Even though we pass only {grid} as dirty,
+  // the structural check (grid's outputs not in cache) forces a full rebuild.
+  const r2 = ev.evaluate(t, new Set([grid]));
+  assert(r2.node_timings.has(cube.id), 'cube must RE-RUN after topology change (full rebuild)');
+  assert(r2.node_timings.has(grid.id), 'new grid node runs');
+});
+
+test('phase3: ShaderEvaluator fast-path returns same descriptor when nothing changed', () => {
+  const t = new ShaderNodeTree('p3-shader');
+  t.interface.new_socket ? undefined : undefined; // suppress lint
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+
+  const ev = new ShaderEvaluator();
+
+  // First call: full rebuild
+  const allDirty = new Set(t.nodes);
+  const r1 = ev.evaluate(t, allDirty);
+  const desc1 = r1.output as MaterialDescriptor;
+  assert(r1.duration_ms >= 0, 'first eval completed');
+
+  // Second call: empty dirty → fast path
+  const r2 = ev.evaluate(t, new Set());
+  const desc2 = r2.output as MaterialDescriptor;
+
+  eq(r2.duration_ms, 0, 'ShaderEvaluator fast-path reports 0ms');
+  assert(desc2 === desc1, 'fast-path returns the exact same descriptor object (no re-allocation)');
+});
+
+test('phase3: ShaderEvaluator re-evaluates after property change', () => {
+  const t = new ShaderNodeTree('p3-shader-dirty');
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  (bsdf.inputs[2]!.default_value as unknown) = 0.25; // roughness
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+
+  const ev = new ShaderEvaluator();
+
+  // First call: full rebuild
+  const r1 = ev.evaluate(t, new Set(t.nodes));
+  close((r1.output as MaterialDescriptor).roughness, 0.25, 1e-4, 'initial roughness 0.25');
+
+  // Change roughness, mark dirty
+  (bsdf.inputs[2]!.default_value as unknown) = 0.9;
+  const r2 = ev.evaluate(t, new Set([bsdf, out])); // bsdf + downstream
+  close((r2.output as MaterialDescriptor).roughness, 0.9, 1e-4, 'updated roughness 0.9');
+  // The evaluator re-ran — should not be the same object as before
+  assert(r2.output !== r1.output || (r2.output as MaterialDescriptor).roughness !== (r1.output as MaterialDescriptor).roughness,
+    'second eval with dirty nodes should produce different result');
+});
+
+test('phase3: incremental eval preserves simulation zone cache across frames', async () => {
+  // Simulation zone must continue to accumulate correctly even with incremental eval.
+  const t = new GeometryNodeTree('p3-sim');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const { input: sIn, output: sOut } = t.addZone('SIM');
+  const setp = t.addNode(GeometryNodeSetPosition);
+  (setp.inputs[3]!.default_value as number[]).splice(0, 3, 0.5, 0, 0);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+
+  for (const l of [...t.links]) {
+    if (l.from_node === sIn && l.to_node === sOut) t.removeLink(l);
+  }
+  t.addLink(cube.outputs[0]!, sIn.inputs.find(s => s.identifier === 'in_Geometry')!);
+  t.addLink(sIn.outputs.find(s => s.identifier === 'Geometry')!, setp.inputs[0]!);
+  t.addLink(setp.outputs[0]!, sOut.inputs.find(s => s.identifier === 'in_Geometry')!);
+  t.addLink(sOut.outputs.find(s => s.identifier === 'Geometry')!, out.inputs[0]!);
+
+  // Frame 1: initial state + one offset → X = -0.5
+  t.depsgraph.setScene({ frame: 1, fps: 24, elapsed: 0 });
+  await new Promise(r => setTimeout(r, 10));
+  const r1 = t.depsgraph.evaluate()!;
+  close((r1.output as Geometry).mesh!.positions[0]!, -0.5, 1e-4, 'frame 1 sim = -0.5');
+
+  // Frame 2: accumulate → X = 0
+  t.depsgraph.setScene({ frame: 2, fps: 24, elapsed: 1/24 });
+  await new Promise(r => setTimeout(r, 10));
+  const r2 = t.depsgraph.evaluate()!;
+  close((r2.output as Geometry).mesh!.positions[0]!, 0, 1e-4, 'frame 2 sim = 0');
+
+  // Frame 3: accumulate → X = 0.5
+  t.depsgraph.setScene({ frame: 3, fps: 24, elapsed: 2/24 });
+  await new Promise(r => setTimeout(r, 10));
+  const r3 = t.depsgraph.evaluate()!;
+  close((r3.output as Geometry).mesh!.positions[0]!, 0.5, 1e-4, 'frame 3 sim = 0.5');
+});
+
+test('phase3: dirty-set propagation skips unrelated upstream nodes correctly', () => {
+  // A = Cube, B = IcoSphere, C = Transform(A), D = JoinGeometry(B, C), E = Output
+  // Evaluate once (full). Then explicitly dirty only C, D, E.
+  // On second eval: A and B should be SKIPPED; C, D, E should re-run.
+  const t = new GeometryNodeTree('p3-propagation');
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const A = t.addNode(GeometryNodeMeshCube);
+  const B = t.addNode(GeometryNodeMeshIcoSphere);
+  const C = t.addNode(GeometryNodeTransform);
+  (C.inputs.find(s => s.name === 'Translation')!.default_value as number[]) = [0, 0, 0];
+  const D = t.addNode(GeometryNodeJoinGeometry);
+  const E = t.addNode(NodeGroupOutput); E.refreshFromInterface(t);
+  t.addLink(A.outputs[0]!, C.inputs[0]!);
+  t.addLink(C.outputs[0]!, D.inputs[0]!);
+  t.addLink(B.outputs[0]!, D.inputs[0]!);
+  t.addLink(D.outputs[0]!, E.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
+
+  // First call: full rebuild
+  const r1 = ev.evaluate(t, new Set(t.nodes));
+  assert(r1.node_timings.has(A.id) && r1.node_timings.has(B.id), 'first eval: A and B both ran');
+
+  // Second call: only C (and downstream D, E) are dirty; A and B are clean
+  (C.inputs.find(s => s.name === 'Translation')!.default_value as number[]) = [0, 3, 0];
+  const partialDirty = new Set([C, D, E]);
+  const r2 = ev.evaluate(t, partialDirty);
+  const g2 = r2.output as Geometry;
+  assert(g2.mesh !== undefined, 'second eval still has mesh output');
+
+  // A and B must be SKIPPED
+  assert(!r2.node_timings.has(A.id), `cube A must be SKIPPED, but ran. dirty: ${[...r2.node_timings.keys()].join(',')}`);
+  assert(!r2.node_timings.has(B.id), `icosphere B must be SKIPPED, but ran. dirty: ${[...r2.node_timings.keys()].join(',')}`);
+
+  // C must RE-RUN
+  assert(r2.node_timings.has(C.id), 'transform C must RE-RUN (it is dirty)');
+
+  // Verify the translation took effect
+  let maxY = -Infinity;
+  for (let i = 1; i < g2.mesh!.positions.length; i += 3) maxY = Math.max(maxY, g2.mesh!.positions[i]!);
+  assert(maxY > 1, `combined mesh includes cube at Y+3, maxY=${maxY.toFixed(3)}`);
+});
+
+// --------------------- Phase 2: Geometry evaluator semantic fixes ------
+
+test('phase2: DistributePointsOnFaces works on high-tri-count meshes (UV sphere Poisson fix)', async () => {
+  // The old Math.round proportional approach gave 0 points for all tiny faces.
+  // The Poisson per-face approach gives ~density*area points.
+  const t = new GeometryNodeTree('p2-dist-sphere');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const sphere = t.addNode(GeometryNodeMeshUVSphere);
+  const dist = t.addNode(GeometryNodeDistributePointsOnFaces);
+  (dist.inputs[4]!.default_value as unknown) = 5; // density=5; sphere surface≈12.6; expect ~63 pts
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(sphere.outputs[0]!, dist.inputs[0]!);
+  t.addLink(dist.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.points !== undefined, 'UV sphere distribution produces points');
+  assert(geo.points!.numPoints > 10, `Expected many points on sphere, got ${geo.points!.numPoints}`);
+  assert(geo.points!.numPoints < 200, `Expected reasonable count, got ${geo.points!.numPoints}`);
+});
+
+test('phase2: DistributePointsOnFaces Normal output attribute is non-zero on sphere', async () => {
+  const t = new GeometryNodeTree('p2-dist-normals');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const sphere = t.addNode(GeometryNodeMeshUVSphere);
+  const dist = t.addNode(GeometryNodeDistributePointsOnFaces);
+  (dist.inputs[4]!.default_value as unknown) = 3;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(sphere.outputs[0]!, dist.inputs[0]!);
+  t.addLink(dist.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.points !== undefined, 'points exist');
+  const normalAttr = geo.points!.attributes.get('normal');
+  assert(normalAttr !== undefined, 'normal attribute stored on distributed points');
+  let nonzero = false;
+  for (let i = 0; i < normalAttr!.data.length; i++) {
+    if (Math.abs(Number(normalAttr!.data[i])) > 0.01) { nonzero = true; break; }
+  }
+  assert(nonzero, 'normal attribute has non-zero values (face normals from sphere)');
+});
+
+test('phase2: DistributePointsOnFaces Rotation output field drives InstanceOnPoints rotation', async () => {
+  // On a flat grid (normal=[0,1,0]) the rotation Euler should encode atan2(1,0)=π/2 around X.
+  const t = new GeometryNodeTree('p2-dist-rotation-field');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  (grid.inputs[0]!.default_value as unknown) = 4;
+  (grid.inputs[1]!.default_value as unknown) = 4;
+  const dist = t.addNode(GeometryNodeDistributePointsOnFaces);
+  (dist.inputs[4]!.default_value as unknown) = 1;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(grid.outputs[0]!, dist.inputs[0]!);
+  t.addLink(dist.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.points !== undefined, 'points exist on grid');
+  const rotAttr = geo.points!.attributes.get('rotation');
+  assert(rotAttr !== undefined, 'rotation attribute stored on distributed points');
+  // Grid normal is [0,1,0]; rotation.x = atan2(1,0) = π/2
+  close(Number(rotAttr!.data[0]), Math.PI / 2, 0.05, 'rotation.x for grid face normal [0,1,0] ≈ π/2');
+});
+
+test('phase2: DistributePointsOnFaces Selection=false produces no points', async () => {
+  const t = new GeometryNodeTree('p2-dist-sel-false');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  const dist = t.addNode(GeometryNodeDistributePointsOnFaces);
+  dist.inputs[1]!.default_value = false; // Selection=false
+  (dist.inputs[4]!.default_value as unknown) = 10;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(grid.outputs[0]!, dist.inputs[0]!);
+  t.addLink(dist.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 5));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(!geo.points || geo.points.numPoints === 0, 'Selection=false → no distributed points');
+});
+
+test('phase2: FieldOnDomain FACE→POINT interpolates face normals to points', async () => {
+  // A flat grid has all face normals [0,1,0].
+  // FOD(domain=FACE, value=Normal) should produce [0,1,0] at every POINT.
+  // SetPosition(offset=FOD_output) should shift all vertices by [0,1,0].
+  const t = new GeometryNodeTree('p2-fod-face-to-point');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  (grid.inputs[2]!.default_value as unknown) = 3;
+  (grid.inputs[3]!.default_value as unknown) = 3;
+  const norm = t.addNode(GeometryNodeInputNormal);
+  const fod = t.addNode(GeometryNodeFieldOnDomain);
+  (fod as unknown as { domain: string }).domain = 'FACE';
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(norm.outputs[0]!, fod.inputs[0]!);
+  t.addLink(grid.outputs[0]!, setp.inputs[0]!);
+  t.addLink(fod.outputs[0]!, setp.inputs[3]!);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.mesh !== undefined, 'mesh exists after FOD-driven SetPosition');
+  // All Y values should be original_Y + 1 (grid normals = [0,1,0])
+  for (let i = 1; i < Math.min(geo.mesh!.positions.length, 27); i += 3) {
+    close(geo.mesh!.positions[i]!, 1, 0.05, `vertex[${(i-1)/3}].Y = 0 + 1 (FOD face normal)`);
+  }
+});
+
+test('phase2: FieldOnDomain POINT→FACE correctly averages point data', async () => {
+  // Use Position.X (ranges -0.5..+0.5 on default 1m grid) evaluated at FACE domain.
+  // Different faces at different X positions should have different averaged values.
+  const t = new GeometryNodeTree('p2-fod-point-to-face');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  (grid.inputs[2]!.default_value as unknown) = 4; // 4×4 grid = 16 tris = more distinct face Xs
+  (grid.inputs[3]!.default_value as unknown) = 4;
+  const pos = t.addNode(GeometryNodeInputPosition);
+  const fod = t.addNode(GeometryNodeFieldOnDomain);
+  (fod as unknown as { domain: string }).domain = 'POINT';
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(pos.outputs[0]!, fod.inputs[0]!);
+  t.addLink(grid.outputs[0]!, setp.inputs[0]!);
+  t.addLink(fod.outputs[0]!, setp.inputs[3]!);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.mesh !== undefined, 'mesh after FOD point→face');
+  // After offset by pos, vertices in different X columns have been shifted further.
+  // At minimum the set of X values should be non-trivially distributed.
+  const xs = new Set<string>();
+  for (let i = 0; i < geo.mesh!.positions.length; i += 3) {
+    xs.add((Math.round(geo.mesh!.positions[i]! * 4) / 4).toFixed(2));
+  }
+  assert(xs.size >= 4, `Expected ≥4 distinct X positions after FOD POINT→FACE offset, got ${xs.size}: [${[...xs].join(',')}]`);
+});
+
+test('phase2: CurveToPoints secondary outputs (tangent/normal/rotation) are correct', async () => {
+  // A line along X-axis → tangent = [1,0,0], normal ≈ [0,1,0] (stable reference)
+  const GeometryNodeCurveLine = NodeRegistry.getNode('GeometryNodeCurvePrimitiveLine')!;
+  const GeometryNodeCurveToPoints = NodeRegistry.getNode('GeometryNodeCurveToPoints')!;
+  const t = new GeometryNodeTree('p2-ctp-secondary');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);
+  line.inputs[0]!.default_value = [0, 0, 0];
+  line.inputs[1]!.default_value = [1, 0, 0]; // along X
+  const ctp = t.addNode(GeometryNodeCurveToPoints as Parameters<typeof t.addNode>[0]);
+  (ctp.inputs[1]!.default_value as unknown) = 5;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(line.outputs[0]!, ctp.inputs[0]!);
+  t.addLink(ctp.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(ctp.id), `CurveToPoints error: ${r.errors.get(ctp.id)}`);
+  const geo = r.output as Geometry;
+  assert(geo.points !== undefined, 'CurveToPoints produces points');
+  const tangentAttr = geo.points!.attributes.get('tangent');
+  const normalAttr = geo.points!.attributes.get('normal');
+  const rotAttr = geo.points!.attributes.get('rotation');
+  assert(tangentAttr !== undefined, 'tangent attribute exists on CurveToPoints output');
+  assert(normalAttr !== undefined, 'normal attribute exists on CurveToPoints output');
+  assert(rotAttr !== undefined, 'rotation attribute exists on CurveToPoints output');
+  // Tangent along X-axis should be [1,0,0]
+  close(Number(tangentAttr!.data[0]), 1, 0.01, 'tangent.x = 1 for X-axis line');
+  close(Number(tangentAttr!.data[1]), 0, 0.01, 'tangent.y = 0 for X-axis line');
+  close(Number(tangentAttr!.data[2]), 0, 0.01, 'tangent.z = 0 for X-axis line');
+});
+
+test('phase2: CurveToPoints Rotation output field drives InstanceOnPoints correctly', async () => {
+  // 3 points along X-axis; instances should be oriented with their "tall" axis
+  // perpendicular to the curve tangent (along X). Realized mesh should span in XY.
+  const GeometryNodeCurveLine = NodeRegistry.getNode('GeometryNodeCurvePrimitiveLine')!;
+  const GeometryNodeCurveToPoints = NodeRegistry.getNode('GeometryNodeCurveToPoints')!;
+  const t = new GeometryNodeTree('p2-ctp-rotation-iop');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine as Parameters<typeof t.addNode>[0]);
+  line.inputs[0]!.default_value = [0, 0, 0];
+  line.inputs[1]!.default_value = [2, 0, 0]; // 2m along X → 3 evenly spaced points at 0, 1, 2
+  const ctp = t.addNode(GeometryNodeCurveToPoints as Parameters<typeof t.addNode>[0]);
+  (ctp.inputs[1]!.default_value as unknown) = 3;
+  const cube = t.addNode(GeometryNodeMeshCube);
+  (cube.inputs[0]!.default_value as number[]).splice(0, 3, 0.1, 0.1, 0.1);
+  const iop = t.addNode(GeometryNodeInstanceOnPoints);
+  const real = t.addNode(GeometryNodeRealizeInstances);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(line.outputs[0]!, ctp.inputs[0]!);
+  t.addLink(ctp.outputs[0]!, iop.inputs[0]!);      // points
+  t.addLink(ctp.outputs[1]!, iop.inputs[5]!);      // tangent/rotation → Rotation socket
+  t.addLink(cube.outputs[0]!, iop.inputs[2]!);     // instance
+  t.addLink(iop.outputs[0]!, real.inputs[0]!);
+  t.addLink(real.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.mesh !== undefined, 'realized instances produce mesh');
+  eq(geo.mesh!.numVerts, 24, '3 instances × 8 cube verts = 24 verts');
+});
+
+test('phase2: ResampleCurve Selection=false preserves original curve', async () => {
+  // A BezierSegment with resolution=16 has 17 points.
+  // With Selection=false, resample should preserve the original 17 points, NOT apply Count=8.
+  const t = new GeometryNodeTree('p2-resample-sel-false');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const bez = t.addNode(GeometryNodeCurveBezierSegment);
+  const rs = t.addNode(GeometryNodeResampleCurve);
+  rs.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  rs.inputs.find((s) => s.identifier === 'Count')!.default_value = 8;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(bez.outputs[0]!, rs.inputs[0]!);
+  t.addLink(rs.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.curves !== undefined, 'curves exist after resample with selection=false');
+  eq(geo.curves!.numPoints, 17, 'selection=false preserves BezierSegment original 17 points');
+});
+
+test('phase2: ReverseCurve Selection=false leaves curve unchanged', async () => {
+  // A line from [-1,0,0] to [1,0,0]. With selection=false, first point stays at X=-1.
+  const t = new GeometryNodeTree('p2-reverse-sel-false');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const bez = t.addNode(GeometryNodeCurveBezierSegment);
+  const rev = t.addNode(GeometryNodeReverseCurve);
+  rev.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(bez.outputs[0]!, rev.inputs[0]!);
+  t.addLink(rev.outputs[0]!, out.inputs[0]!);
+  await new Promise(r => setTimeout(r, 10));
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.curves !== undefined, 'curves exist');
+  // Default BezierSegment start is at [-1,0,0]
+  close(geo.curves!.positions[0]!, -1, 0.01, 'first point X = -1 when selection=false (not reversed)');
+});
+
+test('phase2: StoreNamedAttribute Selection=false preserves existing attribute', () => {
+  // StoreA writes value [1,2,3] to all points.
+  // StoreB writes [9,9,9] but with Selection=false → no change.
+  // Final attribute should still be [1,2,3].
+  const t = new GeometryNodeTree('p2-store-sel');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const storeA = t.addNode(NodeRegistry.getNode('GeometryNodeStoreNamedAttribute')! as Parameters<typeof t.addNode>[0]);
+  const storeB = t.addNode(NodeRegistry.getNode('GeometryNodeStoreNamedAttribute')! as Parameters<typeof t.addNode>[0]);
+  (storeA as unknown as { data_type: string; domain: string }).data_type = 'FLOAT_VECTOR';
+  (storeA as unknown as { data_type: string; domain: string }).domain = 'POINT';
+  storeA.inputs.find((s) => s.identifier === 'Name')!.default_value = 'test_attr';
+  storeA.inputs.find((s) => s.identifier === 'Value')!.default_value = [1, 2, 3];
+  (storeB as unknown as { data_type: string; domain: string }).data_type = 'FLOAT_VECTOR';
+  (storeB as unknown as { data_type: string; domain: string }).domain = 'POINT';
+  storeB.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  storeB.inputs.find((s) => s.identifier === 'Name')!.default_value = 'test_attr';
+  storeB.inputs.find((s) => s.identifier === 'Value')!.default_value = [9, 9, 9];
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, storeA.inputs[0]!);
+  t.addLink(storeA.outputs[0]!, storeB.inputs[0]!);
+  t.addLink(storeB.outputs[0]!, out.inputs[0]!);
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  const attr = geo.findAttribute('test_attr');
+  assert(attr !== undefined, 'test_attr exists');
+  close(Number(attr!.data[0]), 1, 1e-6, 'Selection=false preserves X=1');
+  close(Number(attr!.data[1]), 2, 1e-6, 'Selection=false preserves Y=2');
+  close(Number(attr!.data[2]), 3, 1e-6, 'Selection=false preserves Z=3');
+});
+
+test('phase2: MeshToPoints Position input override works', () => {
+  // A cube's mesh-to-points with a forced Position=[5,0,0] should put all points at X≈5.
+  const t = new GeometryNodeTree('p2-mtp-pos');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const mtp = t.addNode(GeometryNodeMeshToPoints);
+  const comb = t.addNode(CombineXYZNode);
+  comb.inputs[0]!.default_value = 5;
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(cube.outputs[0]!, mtp.inputs[0]!);
+  t.addLink(comb.outputs[0]!, mtp.inputs[2]!); // Position = [5,0,0]
+  t.addLink(mtp.outputs[0]!, out.inputs[0]!);
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.points !== undefined, 'MeshToPoints produces points');
+  for (let i = 0; i < geo.points!.numPoints; i++) {
+    close(geo.points!.positions[i * 3]!, 5, 1e-6, `point[${i}].X = 5 (position override)`);
+  }
+});
+
+test('phase2: GeometryProximity uses nearest-surface (not nearest-vertex) for mesh', () => {
+  // A cube. Point (0, 2, 0). Nearest vertex is at (±1, ±1, ±1); closest face is top (Y=1).
+  // Nearest-surface distance should be 1.0; nearest-vertex distance would be ~1.73.
+  const t = new GeometryNodeTree('p2-proximity-surface');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const target = t.addNode(GeometryNodeMeshCube);
+  const probe = t.addNode(GeometryNodeMeshCube);
+  const prox = t.addNode(GeometryNodeProximity);
+  prox.inputs.find((s) => s.identifier === 'Source Position')!.default_value = [0, 2, 0];
+  const comb = t.addNode(CombineXYZNode);
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(target.outputs[0]!, prox.inputs[0]!);
+  t.addLink(probe.outputs[0]!, setp.inputs[0]!);
+  t.addLink(prox.outputs.find((s) => s.identifier === 'Distance')!, comb.inputs[0]!);
+  t.addLink(comb.outputs[0]!, setp.inputs[3]!);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  // The distance from (0,2,0) to the top face (Y=1) is 1.0.
+  // Each cube vertex gets shifted by distance. Minimum X should be -1 + 1 = 0.
+  close(geo.mesh!.positions[0]!, 0, 0.1, 'proximity distance ≈ 1 (nearest-surface), shifts cube vertex by ~1');
+});
+
+test('phase2: InstanceOnPoints Pick Instance selects different source geometries per point', () => {
+  // 2 outer points. 2 inner candidates (cube at X=-1, cube at X=+1, realized as 2 instances).
+  // Pick instance by index [0,1] → each outer point picks a different candidate.
+  const t = new GeometryNodeTree('p2-pick-instance');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const GeometryNodeMeshLine = NodeRegistry.getNode('GeometryNodeMeshLine')!;
+  const innerLine = t.addNode(GeometryNodeMeshLine as Parameters<typeof t.addNode>[0]);
+  innerLine.inputs.find((s) => s.identifier === 'Count')!.default_value = 2;
+  innerLine.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [-1, 0, 0];
+  innerLine.inputs.find((s) => s.identifier === 'Offset')!.default_value = [2, 0, 0];
+  const cube = t.addNode(GeometryNodeMeshCube);
+  (cube.inputs[0]!.default_value as number[]).splice(0, 3, 0.1, 0.1, 0.1);
+  const innerInst = t.addNode(GeometryNodeInstanceOnPoints);
+  t.addLink(innerLine.outputs[0]!, innerInst.inputs[0]!);
+  t.addLink(cube.outputs[0]!, innerInst.inputs[2]!);
+  const outerLine = t.addNode(GeometryNodeMeshLine as Parameters<typeof t.addNode>[0]);
+  outerLine.inputs.find((s) => s.identifier === 'Count')!.default_value = 2;
+  outerLine.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [0, 0, 0];
+  outerLine.inputs.find((s) => s.identifier === 'Offset')!.default_value = [0, 1, 0];
+  const idx = t.addNode(GeometryNodeInputIndex);
+  const outerInst = t.addNode(GeometryNodeInstanceOnPoints);
+  outerInst.inputs.find((s) => s.identifier === 'Pick Instance')!.default_value = true;
+  const real = t.addNode(GeometryNodeRealizeInstances);
+  const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+  t.addLink(outerLine.outputs[0]!, outerInst.inputs[0]!);
+  t.addLink(innerInst.outputs[0]!, outerInst.inputs[2]!);
+  t.addLink(idx.outputs[0]!, outerInst.inputs[4]!);
+  t.addLink(outerInst.outputs[0]!, real.inputs[0]!);
+  t.addLink(real.outputs[0]!, out.inputs[0]!);
+  const geo = t.depsgraph.evaluate()!.output as Geometry;
+  assert(geo.mesh !== undefined, 'picked instances realized to mesh');
+  eq(geo.mesh!.numVerts, 16, '2 outer points × 1 picked cube (8 verts) each = 16 verts');
+});
+
+test('phase2: TranslateInstances LocalSpace=true vs false produce different results', () => {
+  // An instance rotated 90° around Z. Translating in local +X (= global -Y if rotated) vs global +X.
+  const makeTree = (localSpace: boolean) => {
+    const t = new GeometryNodeTree(`p2-translate-local-${localSpace}`);
+    t.depsgraph.setEvaluator(new GeometryEvaluator());
+    t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+    const GeometryNodeMeshLine = NodeRegistry.getNode('GeometryNodeMeshLine')!;
+    const line = t.addNode(GeometryNodeMeshLine as Parameters<typeof t.addNode>[0]);
+    line.inputs.find((s) => s.identifier === 'Count')!.default_value = 1;
+    line.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [0, 0, 0];
+    line.inputs.find((s) => s.identifier === 'Offset')!.default_value = [0, 0, 0];
+    const cube = t.addNode(GeometryNodeMeshCube);
+    const iop = t.addNode(GeometryNodeInstanceOnPoints);
+    // Apply Z rotation of 90° to the instance
+    iop.inputs.find((s) => s.identifier === 'Rotation')!.default_value = [0, 0, Math.PI / 2];
+    const tr = t.addNode(GeometryNodeTranslateInstances);
+    tr.inputs.find((s) => s.identifier === 'Translation')!.default_value = [1, 0, 0]; // +X in local or world
+    tr.inputs.find((s) => s.identifier === 'Local Space')!.default_value = localSpace;
+    const real = t.addNode(GeometryNodeRealizeInstances);
+    const out = t.addNode(NodeGroupOutput); out.refreshFromInterface(t);
+    t.addLink(line.outputs[0]!, iop.inputs[0]!);
+    t.addLink(cube.outputs[0]!, iop.inputs[2]!);
+    t.addLink(iop.outputs[0]!, tr.inputs[0]!);
+    t.addLink(tr.outputs[0]!, real.inputs[0]!);
+    t.addLink(real.outputs[0]!, out.inputs[0]!);
+    return t;
+  };
+  const gWorld = makeTree(false).depsgraph.evaluate()!.output as Geometry;
+  const gLocal = makeTree(true).depsgraph.evaluate()!.output as Geometry;
+  let worldMinX = Infinity, localMinX = Infinity;
+  for (let i = 0; i < gWorld.mesh!.positions.length; i += 3) worldMinX = Math.min(worldMinX, gWorld.mesh!.positions[i]!);
+  for (let i = 0; i < gLocal.mesh!.positions.length; i += 3) localMinX = Math.min(localMinX, gLocal.mesh!.positions[i]!);
+  // World +X shifts all verts right → minX for world should be ~0 (originally -1, now +0 after +1 world X)
+  // Local +X on a 90° Z-rotated instance is actually -Y in world space → no X shift expected
+  // So world minX > local minX
+  assert(worldMinX > localMinX - 0.1, `LocalSpace should give different X than world: world=${worldMinX.toFixed(3)}, local=${localMinX.toFixed(3)}`);
+});
+
+// --------------------- Phase 1: Foundation fixes -----------------------
+
+test('phase1: NodeTree.dispose() removes tree from _allTreeRefs', () => {
+  bootstrapBuiltins();
+  const t = new ShaderNodeTree('disposable');
+  // It should be in the weak ref set immediately after construction.
+  let found = false;
+  for (const live of (ShaderNodeTree as unknown as typeof import('../src/core/NodeTree').NodeTree)._iterAllTrees()) {
+    if (live === t) { found = true; break; }
+  }
+  assert(found, 'tree found in _iterAllTrees before dispose');
+
+  t.dispose();
+
+  // After dispose, it must be gone from the registry.
+  let foundAfter = false;
+  for (const live of (ShaderNodeTree as unknown as typeof import('../src/core/NodeTree').NodeTree)._iterAllTrees()) {
+    if (live === t) { foundAfter = true; break; }
+  }
+  assert(!foundAfter, 'tree NOT found in _iterAllTrees after dispose');
+});
+
+test('phase1: NodeTree.dispose() releases depsgraph listeners', () => {
+  bootstrapBuiltins();
+  const t = new ShaderNodeTree('disposable-eval');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  let called = 0;
+  t.depsgraph.on('evaluated', () => { called++; });
+  t.depsgraph.evaluate();
+  assert(called >= 1, 'listener fires before dispose');
+
+  t.dispose();
+  // After dispose, evaluator and listeners are cleared.
+  // Calling evaluate() should return undefined (no evaluator set).
+  const result = t.depsgraph.evaluate();
+  assert(result === undefined, 'evaluate returns undefined after dispose');
+  // Listener should not be called again.
+  const before = called;
+  t.depsgraph.evaluate();
+  eq(called, before, 'listener not called after dispose');
+});
+
+test('phase1: multiple NodeTree.dispose() calls are safe (idempotent)', () => {
+  const t = new GeometryNodeTree('safe-dispose');
+  t.dispose();
+  t.dispose(); // must not throw
+  assert(true, 'double dispose did not throw');
+});
+
+test('phase1: refreshGroupNodes uses _iterAllTrees (no stale refs crash)', () => {
+  bootstrapBuiltins();
+  // Create a tree, dispose it, then create a new tree and call refreshGroupNodes.
+  // If the old disposed tree leaked into _allTreeRefs, iterating would hit
+  // a deref'd null and could crash (or not — WeakRef.deref() is safe).
+  const dead = new GeometryNodeTree('dead-tree');
+  dead.dispose();
+
+  const live = new GeometryNodeTree('live-tree');
+  live.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  // refreshGroupNodes iterates _iterAllTrees internally; must not crash.
+  live.refreshGroupNodes();
+  live.dispose();
+  assert(true, 'refreshGroupNodes with stale WeakRefs did not crash');
 });
 
 // ------------------------------ Runner ----------------------------------

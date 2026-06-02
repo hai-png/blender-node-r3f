@@ -50,8 +50,23 @@ export class Depsgraph {
 
   constructor(public tree: NodeTree) {}
 
+  /** Unsubscribe function for the tree event listener installed by setEvaluator. */
+  private _treeUnsub?: () => void;
+
   setEvaluator(ev: SystemEvaluator): void {
+    // Unsubscribe from the previous evaluator's tree listener.
+    this._treeUnsub?.();
     this._evaluator = ev;
+    // When topology changes (add/remove node or link), clear the evaluator's
+    // persistent output cache so stale socket IDs don't haunt future evals.
+    const topologicalEvents = new Set([
+      'node_added', 'node_removed', 'link_added', 'link_removed',
+    ]);
+    this._treeUnsub = this.tree.subscribe((_tree, ev) => {
+      if (!topologicalEvents.has(ev.type)) return;
+      const e = this._evaluator as { clearPersistentCache?(): void } | undefined;
+      e?.clearPersistentCache?.();
+    });
     this.invalidateAll();
   }
 
@@ -123,5 +138,19 @@ export class Depsgraph {
     this._listeners.add(cb);
     if (this._lastResult) cb(this._lastResult);
     return () => this._listeners.delete(cb);
+  }
+
+  /**
+   * Release all listeners, evaluator, and caches.
+   * Called automatically by `NodeTree.dispose()`.
+   */
+  dispose(): void {
+    this._treeUnsub?.();
+    this._treeUnsub = undefined;
+    this._listeners.clear();
+    this._evaluator = undefined;
+    this._dirty.clear();
+    this.simCache.clear();
+    this._scheduled = false;
   }
 }

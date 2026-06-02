@@ -150,8 +150,33 @@ function hsl2rgb(h: number, s: number, l: number): [number, number, number] {
 }
 
 export class ShaderEvaluator implements SystemEvaluator {
-  evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
+  /**
+   * Persistent output from the last complete evaluation.
+   * If the dirty set is empty AND tree hasn't changed, return this directly.
+   */
+  private _lastOutput: MaterialDescriptor | null = null;
+  private _lastTreeId: string | null = null;
+
+  /** Wipe cached output (called by Depsgraph on topology changes). */
+  clearPersistentCache(): void {
+    this._lastOutput = null;
+    this._lastTreeId = null;
+  }
+
+  evaluate(tree: NodeTree, dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
+
+    // Fast path: nothing changed AND same tree — return the previous result.
+    if (this._lastOutput !== null && dirty.size === 0 && this._lastTreeId === tree.id) {
+      return {
+        output: this._lastOutput,
+        duration_ms: 0,
+        node_timings: new Map(),
+        errors: new Map(),
+      };
+    }
+    this._lastTreeId = tree.id;
+
     const cache = new Map<string, unknown>();
     const timings = new Map<string, number>();
     const errors = new Map<string, string>();
@@ -176,6 +201,7 @@ export class ShaderEvaluator implements SystemEvaluator {
       if (closure) desc = closure;
     }
 
+    this._lastOutput = desc;
     return {
       output: desc,
       duration_ms: performance.now() - start,

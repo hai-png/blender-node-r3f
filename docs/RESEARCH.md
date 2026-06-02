@@ -315,7 +315,7 @@ The .blend file format is a complex C-struct dump (DNA + SDNA + BHead chunks). D
 | `bpy.types.NodeTreeInterface` | `src/core/NodeTreeInterface.ts` |
 | `bpy.props.*` | `src/core/Properties.ts` (FloatProperty, EnumProperty, …) |
 | `bpy.utils.register_class` | `src/registry/NodeRegistry.ts` |
-| `nodeitems_utils.NodeCategory` | `src/registry/NodeCategory.ts` |
+| `nodeitems_utils.NodeCategory` | `src/registry/NodeRegistry.ts` (`NodeCategory` + `NodeCategories` + `NodeItem` classes) |
 | Depsgraph | `src/eval/Depsgraph.ts` |
 | Shader evaluator | `src/eval/ShaderEvaluator.ts` → emits TSL |
 | Geometry evaluator | `src/eval/GeometryEvaluator.ts` → executes MFN over BufferGeometry |

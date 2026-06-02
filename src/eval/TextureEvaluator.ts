@@ -164,6 +164,14 @@ export class TextureEvaluator implements SystemEvaluator {
     this.resolveImage = opts.resolveImage;
   }
 
+  /**
+   * The texture evaluator compiles a full sampler graph on every call
+   * (it is fast — pure functional closures). No persistent cache needed.
+   * This method exists for interface compatibility with the Depsgraph's
+   * topology-change hook.
+   */
+  clearPersistentCache(): void { /* no-op — sampler recompiled each call */ }
+
   evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
     const flat = flattenTree(tree);

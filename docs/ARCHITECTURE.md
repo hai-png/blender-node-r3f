@@ -22,7 +22,7 @@ blender-nodes-r3f/
 │   │   ├── TextureEvaluator.ts
 │   │   └── zones/
 │   ├── registry/          # bpy.utils.register_class equivalents
-│   ├── ui/                # React Flow editor + Inspector + AddMenu
+│   ├── ui/                # React Flow editor + AddMenu + operators + store
 │   ├── bridge/            # Blender ↔ JSON exporter/importer + bpy shim
 │   └── index.ts
 ├── demo/                  # Vite app showcasing all four systems
@@ -185,13 +185,34 @@ export class NodeTree {
   addLink(from: NodeSocket, to: NodeSocket): NodeLink;
   removeLink(link: NodeLink): void;
 
-  /** Topologically sorted forward edges. Throws on cycle. */
-  topoOrder(): Node[];
+  /**
+   * Topologically sorted forward edges (Kahn's algorithm).
+   * On a cycle, does NOT throw; instead, appends the cycle nodes at the end
+   * and sets `result.cycleNodes` so evaluators can surface a diagnostic error.
+   * Blender forbids cycles entirely; our evaluator surfaces them as errors
+   * after the fact rather than at link-time (link-time rejection IS enforced
+   * by `NodeTree.addLink()`).
+   */
+  topoOrder(): Node[] & { cycleNodes?: Node[] };
 
-  /** Marks downstream nodes dirty in the depsgraph. */
-  invalidateFrom(node: Node): void;
+  /**
+   * Convenience: remove all links involving `node` and then remove the node
+   * from the tree. Calls `node.free?.()` and emits `node_removed`.
+   */
+  removeNode(node: Node): void;
+
+  /**
+   * Release this tree from the global `_allTreeRefs` registry and clear all
+   * listeners. Call when done with a tree (tests, undo snapshots, etc.).
+   */
+  dispose(): void;
 }
 ```
+
+> **Note (Phase 1 truth-alignment):** `invalidateFrom(node)` no longer exists.
+> Use `tree.depsgraph.invalidate(node)` instead — the depsgraph owns dirty tracking.
+> The evaluator is **injected** via `depsgraph.setEvaluator(ev)` rather than
+> selected automatically from `tree.bl_idname`. See §8 below.
 
 ## 6. `NodeTreeInterface`
 
@@ -234,16 +255,40 @@ These attach metadata so the inspector panel renders them automatically and so t
 ```ts
 // src/eval/Depsgraph.ts
 export class Depsgraph {
-  private dirty = new Set<Node>();
+  scene: SceneTime;                    // frame, fps, elapsed
+  simCache: Map<string, SimZoneCache>; // per-zone simulation state
+
   constructor(public tree: NodeTree) {}
 
-  invalidate(node: Node): void;       // marks node + downstream dirty
-  evaluate(): EvaluationResult;       // runs the system-specific evaluator
-  on(event: 'evaluated', cb: (r: EvaluationResult) => void): void;
+  /** Inject the evaluator. Must be called before evaluate(). */
+  setEvaluator(ev: SystemEvaluator): void;
+
+  /** Mark node and all downstream as dirty. */
+  invalidate(node: Node): void;
+  invalidateAll(): void;
+
+  /** Update scene clock; triggers re-evaluation. Rewinds truncate sim caches. */
+  setScene(partial: Partial<SceneTime>): void;
+  /** Wipe all simulation caches and reset the clock. */
+  resetSimulation(): void;
+
+  /** Run the injected evaluator over the tree. Returns undefined if no evaluator set. */
+  evaluate(): EvaluationResult | undefined;
+
+  on(event: 'evaluated', cb: (r: EvaluationResult) => void): () => void;
+  dispose(): void;
 }
 ```
 
-Each `NodeTree` has exactly one `Depsgraph`. The `evaluate()` method dispatches to one of the system evaluators based on `tree.bl_idname`.
+Each `NodeTree` has exactly one `Depsgraph`. **The evaluator is injected by the
+host via `depsgraph.setEvaluator(ev)` — it is NOT auto-selected from
+`tree.bl_idname`.** This lets callers swap the TSL path vs the legacy WebGL
+path at runtime. Evaluation is scheduled via `queueMicrotask` so multiple
+synchronous edits coalesce into one evaluation tick.
+
+> **Current limitation (Phase 1):** evaluators perform full-tree re-traversal on
+> every `evaluate()` call. The `dirty` set is tracked and passed to the evaluator
+> but not yet exploited for incremental execution (Phase 3 work).
 
 ## 9. Per-system evaluators
 
@@ -359,10 +404,13 @@ With this, a Blender custom-node addon usually requires **only syntactic** chang
 
 ## 13. UI
 
-- `src/ui/NodeEditor.tsx` — React Flow 12 host. Each Node renders via `nodeTypes` map keyed by `bl_idname`. Sockets become `Handle`s. Multi-input handles use React Flow's `connectionMode="loose"` + custom validation.
-- `src/ui/AddMenu.tsx` — Shift+A menu driven by `NodeCategory` registry.
-- `src/ui/Inspector.tsx` — properties panel that introspects `Properties.ts` decorators.
-- `src/ui/Toolbar.tsx` — tree picker, undo/redo, evaluate, export, import.
+- `src/ui/NodeEditor.tsx` — React Flow 12 host. Each Node renders via `nodeTypes` map keyed by `bl_idname`. Sockets become `Handle`s. Multi-input handles use React Flow's `connectionMode="loose"` + custom validation. Includes an inline `OperatorBar` with Undo/Redo/AutoLayout/Group/Ungroup/Mute/Hide actions and full keyboard shortcuts (Shift+A, Ctrl+Z/Y, M, H, Ctrl+C/V, Ctrl+L, Ctrl+G, Alt+G).
+- `src/ui/AddMenu.tsx` — Shift+A / right-click add menu driven by `NodeCategories` registry (addon-registered categories first, static `Node.category` fallback). Supports free-text search.
+- `src/ui/BlenderNode.tsx` — universal node renderer: Blender-style header colour per category, coloured handles by socket kind, inline property editors (Float/Int/Bool/Enum/Vector).
+- `src/ui/store.ts` — Zustand store with **per-tree persistence**: switching tree tabs does not discard edits. Holds `Map<slotId, NodeTree>` and the active slot. Provides `setTree(id, tree)` and `switchTree(id)`.
+- `src/ui/operators.ts` — headless editor operators: `autoLayout`, `makeGroup`, `ungroup`, `History`.
+
+> **Note:** `src/ui/Inspector.tsx` and `src/ui/Toolbar.tsx` are **planned but not yet implemented** (Phase 4). The tree picker and playback toolbar live inline in `demo/App.tsx`; node properties render inline in `BlenderNode.tsx`. A standalone Inspector sidebar remains a gap.
 - Theming: Tailwind tokens that match Blender's "Default" theme (dark grey 0x1d1d1d, headers per-category color).
 
 ## 14. R3F viewport (demo)
@@ -376,10 +424,33 @@ With this, a Blender custom-node addon usually requires **only syntactic** chang
 
 ## 15. Build / packaging
 
-- Library output: `dist/index.{esm,cjs,umd}.js` + `.d.ts`
-- Demo: `vite build` → `demo/dist/`
-- Node 20+ required.
-- Public exports are tree-shakeable. Built-in node packs are separate sub-entries so consumers can lazy-load only what they need: `import { ShaderNodeBsdfPrincipled } from 'blender-nodes-r3f/nodes/shader/principled'`.
+Two separate build targets:
+
+### Library (`npm run build:lib` → `tsup`)
+- **Entry points:**
+  - `src/index.ts` → `dist/index.js` (ESM) + `dist/index.cjs` (CJS) + `dist/index.d.ts` / `dist/index.d.cts`
+  - `src/tsl.ts`   → `dist/tsl.js` (ESM)   + `dist/tsl.cjs` (CJS)   + `dist/tsl.d.ts` / `dist/tsl.d.cts`
+- Peer dependencies (`three`, `react`, `@xyflow/react`, `zustand`) are **not bundled**.
+- `tsup.config.ts` at root configures entry, format, dts, treeshake, and externals.
+- `tsconfig.lib.json` extends the root tsconfig with `rootDir:"src"`, `outDir:"dist"`, `emitDeclarationOnly:true`.
+
+### Package exports map (`package.json`)
+```json
+"exports": {
+  ".":      { "import": "dist/index.js",  "require": "dist/index.cjs" },
+  "./tsl":  { "import": "dist/tsl.js",    "require": "dist/tsl.cjs"   }
+}
+```
+The TSL sub-entry isolates the `three/webgpu` import (requires `self`/`navigator.gpu` globals) from the main entry, so Node.js / SSR consumers can import `blender-nodes-r3f` without crashing.
+
+### Demo (`npm run build:demo` → `vite build`)
+- Vite root is `demo/`, output goes to `dist-demo/`.
+- `vite.config.ts` handles the demo app only; it is not part of the library build.
+
+### CI pipeline (`npm run ci`)
+`typecheck → test → build:lib → build:demo`
+
+Node 20+ required.
 
 ---
 

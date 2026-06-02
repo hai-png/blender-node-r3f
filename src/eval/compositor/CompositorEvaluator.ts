@@ -95,6 +95,14 @@ export class CompositorEvaluator implements SystemEvaluator {
     if (opts.resolveTexture) this.resolveTexture = opts.resolveTexture;
   }
 
+  /**
+   * The compositor re-plans and re-executes the full pipeline on every call
+   * (GPU passes are already fast). No per-node persistent cache needed.
+   * This method exists for interface compatibility with the Depsgraph's
+   * topology-change hook.
+   */
+  clearPersistentCache(): void { /* no-op — pipeline replanned each call */ }
+
   /** Wipe GPU state. Safe to call multiple times. */
   dispose(): void {
     for (const m of this.materialCache.values()) m.dispose();

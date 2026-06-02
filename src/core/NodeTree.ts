@@ -37,7 +37,7 @@ export class NodeTree {
   constructor(name = 'NodeTree') {
     this.name = name;
     this.depsgraph = new Depsgraph(this);
-    NodeTree._allTrees.add(this);
+    NodeTree._allTreeRefs.add(new WeakRef(this));
   }
 
   // ---------------------------------------------------------------------
@@ -348,7 +348,7 @@ export class NodeTree {
       anyN.refreshFromInterface?.(this);
     }
     // Notify container nodes referencing this tree to rebuild their sockets.
-    for (const t of NodeTree._allTrees) {
+    for (const t of NodeTree._iterAllTrees()) {
       for (const n of t.nodes) {
         const c = n as unknown as { resolvedTree?: NodeTree; refreshSockets?(): void };
         if (c.resolvedTree === this) c.refreshSockets?.();
@@ -357,8 +357,60 @@ export class NodeTree {
     this.emit({ type: 'evaluated' });
   }
 
-  /** Weak registry of all live trees, used for cross-tree group refresh. */
-  static _allTrees: Set<NodeTree> = new Set();
+  /**
+   * Weak registry of all live NodeTrees, used for cross-tree group refresh.
+   *
+   * Implementation: a `Set` of `WeakRef<NodeTree>` values, pruned lazily
+   * when iterated. This prevents the global reference from keeping trees alive
+   * after all userland references are dropped.
+   *
+   * Iteration helpers live in `_iterAllTrees()`.
+   */
+  static _allTreeRefs: Set<WeakRef<NodeTree>> = new Set();
+
+  /**
+   * Iterate all live trees, skipping any that have been garbage-collected and
+   * removing their stale `WeakRef` entries. Use this instead of `_allTrees`
+   * directly.
+   */
+  static *_iterAllTrees(): Iterable<NodeTree> {
+    for (const ref of NodeTree._allTreeRefs) {
+      const t = ref.deref();
+      if (t === undefined) {
+        NodeTree._allTreeRefs.delete(ref);
+      } else {
+        yield t;
+      }
+    }
+  }
+
+  /**
+   * Explicit disposal. Removes this tree from the global weak registry and
+   * clears all listeners, freeing memory immediately. Optional — garbage
+   * collection handles the WeakRef automatically, but calling `dispose()` is
+   * good practice for short-lived trees (tests, undo snapshots, etc.).
+   */
+  dispose(): void {
+    for (const ref of NodeTree._allTreeRefs) {
+      if (ref.deref() === this) {
+        NodeTree._allTreeRefs.delete(ref);
+        break;
+      }
+    }
+    this.listeners.clear();
+    this.depsgraph.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Back-compat shim — keep _allTrees as a readable proxy so any callers that
+  // imported the old static directly keep working without modification.
+  // ---------------------------------------------------------------------------
+  /** @deprecated Use `NodeTree._iterAllTrees()` instead. */
+  static get _allTrees(): Set<NodeTree> {
+    const live = new Set<NodeTree>();
+    for (const t of NodeTree._iterAllTrees()) live.add(t);
+    return live;
+  }
 
   // ---------------------------------------------------------------------
   //  Event bus

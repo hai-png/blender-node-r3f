@@ -3,33 +3,93 @@
   "version": "0.1.0",
   "description": "Blender-compatible node system (Shader / Geometry / Compositor / Texture) for three.js / react-three-fiber",
   "type": "module",
-  "main": "src/index.ts",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -p . --noEmit && vite build",
-    "preview": "vite preview",
-    "typecheck": "tsc -p . --noEmit",
-    "test": "tsx scripts/smoketest.ts",
-    "ci": "npm run typecheck && npm test && npm run build"
+  "license": "MIT",
+  "sideEffects": false,
+
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./tsl": {
+      "import": {
+        "types": "./dist/tsl.d.ts",
+        "default": "./dist/tsl.js"
+      },
+      "require": {
+        "types": "./dist/tsl.d.cts",
+        "default": "./dist/tsl.cjs"
+      }
+    }
   },
+
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+
+  "scripts": {
+    "dev":          "vite",
+    "build:lib":    "tsup",
+    "build:demo":   "tsc -p . --noEmit && vite build",
+    "build":        "npm run build:lib && npm run build:demo",
+    "preview":      "vite preview",
+    "typecheck":    "tsc -p . --noEmit",
+    "typecheck:lib": "tsc -p tsconfig.lib.json --noEmit",
+    "test":         "tsx scripts/smoketest.ts",
+    "ci":           "npm run typecheck && npm test && npm run build"
+  },
+
+  "peerDependencies": {
+    "@react-three/drei": ">=9",
+    "@react-three/fiber": ">=8",
+    "@xyflow/react": ">=12",
+    "react": ">=18",
+    "react-dom": ">=18",
+    "three": ">=0.169",
+    "zustand": ">=5"
+  },
+
+  "peerDependenciesMeta": {
+    "@react-three/drei": { "optional": true },
+    "@react-three/fiber": { "optional": true },
+    "@xyflow/react": { "optional": true },
+    "react": { "optional": true },
+    "react-dom": { "optional": true }
+  },
+
   "dependencies": {
+    "nanoid": "^5.0.7",
+    "zod": "^3.23.8"
+  },
+
+  "devDependencies": {
     "@react-three/drei": "^9.114.0",
     "@react-three/fiber": "^8.17.10",
-    "@xyflow/react": "^12.3.5",
-    "nanoid": "^5.0.7",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "three": "^0.169.0",
-    "zod": "^3.23.8",
-    "zustand": "^5.0.0"
-  },
-  "devDependencies": {
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.0",
     "@types/three": "^0.169.0",
     "@vitejs/plugin-react": "^4.3.2",
+    "@xyflow/react": "^12.3.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0",
+    "tsup": "^8.4.0",
     "tsx": "^4.22.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.10"
+    "vite": "^5.4.10",
+    "zustand": "^5.0.0"
   }
 }

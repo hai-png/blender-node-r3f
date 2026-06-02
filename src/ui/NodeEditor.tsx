@@ -40,7 +40,13 @@ export function NodeEditor() {
   const version = useTreeStore((s) => s.version);
   const selectedNodeIds = useTreeStore((s) => s.selectedNodeIds);
   const setSelected = useTreeStore((s) => s.setSelected);
-  const setTree = useTreeStore((s) => s.setTree);
+  const rawSetTree = useTreeStore((s) => s.setTree);
+  const activeId = useTreeStore((s) => s.activeId);
+  // Wrap setTree so callers inside the editor always use the current activeId.
+  const setTree = useCallback(
+    (restoredTree: import('../core/NodeTree').NodeTree) => rawSetTree(activeId, restoredTree),
+    [rawSetTree, activeId],
+  );
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const historyRef = useRef<History>(new History());
   const clipboardRef = useRef<string | null>(null);

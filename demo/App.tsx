@@ -216,20 +216,41 @@ const TREES: { id: string; label: string; build: (useTSL: boolean) => NodeTree }
   { id: 'texture',    label: 'Texture',    build: () => buildTextureTree() },
 ];
 
+// Tracks the last `useTSL` value to detect actual changes for the shader slot.
+const _tslRef = { current: false };
+
 export function App() {
   const [activeId, setActiveId] = useState('shader');
   const [useTSL, setUseTSL] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [frame, setFrame] = useState(1);
-  const setTree = useTreeStore((s) => s.setTree);
+  const storeSetTree = useTreeStore((s) => s.setTree);
+  const storeSwitchTree = useTreeStore((s) => s.switchTree);
+  const storeTrees = useTreeStore((s) => s.trees);
   const tree = useTreeStore((s) => s.tree);
 
   useEffect(() => {
-    const def = TREES.find((t) => t.id === activeId)!.build(useTSL);
-    setTree(def);
-    setFrame(1);
-    def.depsgraph.resetSimulation();
-  }, [activeId, useTSL, setTree]);
+    // Only rebuild the tree for this slot if:
+    //  (a) it hasn't been built yet, OR
+    //  (b) the TSL toggle changed for the shader tree (it changes the evaluator).
+    const existing = storeTrees.get(activeId);
+    const needRebuild = !existing || (activeId === 'shader' && useTSL !== _tslRef.current);
+    _tslRef.current = useTSL;
+
+    // Stop playback when changing trees.
+    setPlaying(false);
+
+    if (needRebuild) {
+      const def = TREES.find((t) => t.id === activeId)!.build(useTSL);
+      storeSetTree(activeId, def);
+      setFrame(1);
+      def.depsgraph.resetSimulation();
+    } else {
+      // Tree already exists — just switch to it (edits preserved).
+      storeSwitchTree(activeId);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, useTSL]);
 
   // Animation driver: when `playing`, advance one frame every 1/24s and
   // poke the depsgraph so the simulation zone(s) tick. Resetting clears the

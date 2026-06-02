@@ -958,8 +958,30 @@ function addDescriptors(a: TSLMaterialDescriptor, b: TSLMaterialDescriptor): TSL
 export class TSLShaderEvaluator implements SystemEvaluator {
   constructor(private opts: TSLShaderEvaluatorOptions = {}) {}
 
-  evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
+  /** Last complete output — returned as-is when dirty set is empty and same tree. */
+  private _lastOutput: { descriptor: TSLMaterialDescriptor; material: unknown } | null = null;
+  private _lastTreeId: string | null = null;
+
+  /** Wipe cached output (called by Depsgraph on topology changes). */
+  clearPersistentCache(): void {
+    this._lastOutput = null;
+    this._lastTreeId = null;
+  }
+
+  evaluate(tree: NodeTree, dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
+
+    // Fast path: nothing changed AND same tree — reuse last material.
+    if (this._lastOutput !== null && dirty.size === 0 && this._lastTreeId === tree.id) {
+      return {
+        output: this._lastOutput,
+        duration_ms: 0,
+        node_timings: new Map(),
+        errors: new Map(),
+      };
+    }
+    this._lastTreeId = tree.id;
+
     const cache: Cache = new Map();
     const timings = new Map<string, number>();
     const errors = new Map<string, string>();
@@ -1027,8 +1049,9 @@ export class TSLShaderEvaluator implements SystemEvaluator {
       errors.set('__material__', (e as Error).message);
     }
 
+    this._lastOutput = { descriptor: desc, material };
     return {
-      output: { descriptor: desc, material },
+      output: this._lastOutput,
       duration_ms: performance.now() - start,
       node_timings: timings,
       errors,

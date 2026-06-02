@@ -139,15 +139,19 @@ bpy.types.NodeLink          ─►  src/core/NodeLink.ts
 bpy.types.NodeTreeInterface ─►  src/core/NodeTreeInterface.ts
 bpy.props.*                 ─►  src/core/Properties.ts
 bpy.utils.register_class    ─►  src/registry/NodeRegistry.ts
-nodeitems_utils             ─►  src/registry/NodeRegistry.ts (NodeCategory)
+nodeitems_utils             ─►  src/registry/NodeRegistry.ts  (NodeCategory + NodeCategories + NodeItem)
 Depsgraph                   ─►  src/eval/Depsgraph.ts
-Shader  evaluator (TSL)     ─►  src/eval/tsl/TSLShaderEvaluator.ts
-Geometry evaluator (MFN)    ─►  src/eval/GeometryEvaluator.ts
-Compositor evaluator        ─►  src/eval/compositor/CompositorEvaluator.ts
+Shader evaluator — TSL      ─►  src/eval/tsl/TSLShaderEvaluator.ts      (primary, emits MeshStandardNodeMaterial)
+Shader evaluator — legacy   ─►  src/eval/ShaderEvaluator.ts             (WebGL fallback, approximate)
+Geometry evaluator          ─►  src/eval/GeometryEvaluator.ts
+Zone runner                 ─►  src/eval/zones/ZoneRunner.ts
+Compositor evaluator        ─►  src/eval/compositor/CompositorEvaluator.ts  (real WebGL pipeline)
 Texture evaluator           ─►  src/eval/TextureEvaluator.ts
-.blend  → JSON bridge       ─►  src/bridge/{schema,importer,exporter,blender_exporter.py}
-React Flow editor           ─►  src/ui/{NodeEditor,BlenderNode,AddMenu,store}.tsx
-R3F viewport                ─►  demo/Viewport.tsx
+.blend → JSON bridge        ─►  src/bridge/{schema,importer,exporter,blender_exporter.py}
+React Flow editor           ─►  src/ui/{NodeEditor,BlenderNode,AddMenu,store,operators}.ts(x)
+Editor operators            ─►  src/ui/operators.ts  (autoLayout, makeGroup, ungroup, History)
+R3F viewport                ─►  demo/Viewport.tsx  (ShaderPreview / GeometryPreview / TexturePreview / CompositorPreview)
+Library build               ─►  tsup.config.ts → dist/{index,tsl}.{esm,cjs}.js + .d.ts
 ```
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full module specification.

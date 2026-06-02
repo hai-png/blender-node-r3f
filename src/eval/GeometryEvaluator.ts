@@ -178,11 +178,90 @@ function dimsForFieldKind(kind: FieldKind): number {
 
 export class GeometryEvaluator implements SystemEvaluator {
   constructor(private opts: { resolveImage?: (imageSrc: string) => ImageData | null } = {}) {}
-  evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
+
+  /**
+   * Persistent socket-output cache across `evaluate()` calls.
+   *
+   * Keyed by `socket.id` (globally unique nanoid). On each call, all previous
+   * clean-node outputs are pre-seeded into the local cache so upstream values
+   * are available for downstream dirty nodes without re-executing the clean
+   * nodes.
+   *
+   * The cache is invalidated in three ways:
+   *   1. Per-node: nodes in the `dirty` set are re-executed and their outputs
+   *      overwrite this cache.
+   *   2. Full reset: call `clearPersistentCache()` when the tree topology
+   *      changes in ways that the dirty set doesn't capture (e.g. a node is
+   *      removed — its socket IDs are gone, leaving stale entries).
+   *   3. Tree switch: if the evaluator is reused across different tree instances,
+   *      `_lastTreeId` mismatch triggers a full rebuild.
+   *
+   * Why socket.id rather than node.id? A node's outputs are in the cache under
+   * *socket* IDs because that's how the cache map is keyed (socketId → value).
+   * We store them flat so that zone interiors (which share the same cache) and
+   * group child trees (also sharing the cache) all read from a single lookup.
+   */
+  private _persistentCache: Map<string /* socket.id */, unknown> = new Map();
+
+  /** ID of the last tree evaluated — used to detect tree-switch. */
+  private _lastTreeId: string | null = null;
+
+  /**
+   * Wipe the persistent cache. Call whenever the tree topology changes (node
+   * added/removed/linked) so stale socket IDs don't haunt future evaluations.
+   * The next evaluate() will fall back to full re-execution.
+   */
+  clearPersistentCache(): void {
+    this._persistentCache.clear();
+    this._lastTreeId = null;
+  }
+
+  evaluate(tree: NodeTree, dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
     const timings = new Map<string, number>();
     const errors = new Map<string, string>();
-    const cache: Cache = new Map();
+
+    // ---------------------------------------------------------------
+    //  Incremental setup: determine whether a full rebuild is required.
+    //
+    //  Full rebuild conditions:
+    //  1. Persistent cache is empty (first call or cleared by topology change).
+    //  2. Dirty set covers every node in the tree (invalidateAll was called).
+    //  3. Tree switch: a different tree from the last call (tree.id changed).
+    //  4. Structural cache miss: any outer-tree node (in the topo order) has
+    //     at least one output socket missing from the persistent cache. This
+    //     catches the case where the tree topology changed without going through
+    //     the depsgraph (e.g. test code calls makeGroup/ungroup then passes
+    //     new Set() as dirty, or ungroup adds nodes after the last eval).
+    //
+    //  The cache-miss check is O(nodes × sockets) but executed only when the
+    //  dirty set is small, keeping it out of the hot path for real-time use.
+    // ---------------------------------------------------------------
+    const treeChanged = this._lastTreeId !== tree.id;
+    this._lastTreeId = tree.id;
+
+    let isFullRebuild = this._persistentCache.size === 0
+      || dirty.size >= tree.nodes.length
+      || treeChanged;
+
+    if (!isFullRebuild) {
+      // Quick structural check: look for any node whose output sockets are
+      // absent from the cache. This detects topology changes (add/remove node)
+      // that occurred without going through the depsgraph's event hook.
+      for (const node of tree.nodes) {
+        if (node.outputs.length > 0) {
+          if (!this._persistentCache.has(node.outputs[0]!.id)) {
+            isFullRebuild = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Local cache for this evaluation pass.
+    // For incremental runs, pre-seed from the persistent cache so that
+    // downstream dirty nodes can read upstream clean nodes' outputs.
+    const cache: Cache = isFullRebuild ? new Map() : new Map(this._persistentCache);
 
     // ---- M4: pre-compute interior membership so the outer pass skips
     // ---- nodes that belong to a zone. They'll be re-run by the ZoneRunner
@@ -197,6 +276,21 @@ export class GeometryEvaluator implements SystemEvaluator {
       const interior = this.collectInteriorForOuter(input, n, tree);
       for (const x of interior) interiorOf.set(x, n);
     }
+
+    // ---------------------------------------------------------------
+    //  Zone dirtiness: a zone output is dirty if the zone output node
+    //  itself is dirty OR any of its interior nodes is dirty.
+    //  (The depsgraph propagates property changes to the zone output node
+    //  correctly when links change, but interior node property changes
+    //  are propagated to the zone output through the zone's internal links.)
+    // ---------------------------------------------------------------
+    const isDirtyZoneOutput = (zoneOut: GeoZoneOutputBase): boolean => {
+      if (isFullRebuild || dirty.has(zoneOut)) return true;
+      const input = zoneOut.findPair();
+      if (!input) return true;
+      const interior = this.collectInteriorForOuter(input, zoneOut, tree);
+      return dirty.has(input) || interior.some((n) => dirty.has(n));
+    };
 
     // Build the zone runner's context once.
     const zoneCtx: ZoneEvalContext = {
@@ -219,6 +313,7 @@ export class GeometryEvaluator implements SystemEvaluator {
     for (const node of order) {
       // Skip interior nodes — the ZoneRunner runs them at the right time.
       if (interiorOf.has(node)) continue;
+
       // Skip ZONE_INPUT nodes from the outer pass — their outputs are set
       // by the ZoneRunner when the partner Output is reached. We still
       // pre-populate the Input meta sockets (Delta Time / Iteration / Index)
@@ -230,16 +325,46 @@ export class GeometryEvaluator implements SystemEvaluator {
         }
         continue;
       }
+
+      // ---------------------------------------------------------------
+      //  Incremental skip: if this node is NOT in the dirty set (and
+      //  for zone outputs: none of its interior is dirty either), its
+      //  outputs are already in `cache` from the seeding step.
+      // ---------------------------------------------------------------
+      if (!isFullRebuild) {
+        if (node instanceof GeoZoneOutputBase) {
+          if (!isDirtyZoneOutput(node)) continue; // already in cache from seed
+        } else {
+          if (!dirty.has(node)) continue; // already in cache from seed
+        }
+      }
+
       if (node.mute) {
         this.passthroughMuted(node, cache);
+        // Update persistent cache for muted pass-through outputs.
+        for (const out of node.outputs) {
+          const v = cache.get(out.id);
+          if (v !== undefined) this._persistentCache.set(out.id, v);
+        }
         continue;
       }
+
       const t0 = performance.now();
       try {
         if (node instanceof GeoZoneOutputBase) {
           runZone(node, cache, zoneCtx);
+          // Persist zone outputs.
+          for (const out of node.outputs) {
+            const v = cache.get(out.id);
+            if (v !== undefined) this._persistentCache.set(out.id, v);
+          }
         } else {
           this.executeNode(node, cache);
+          // Persist all output socket values for this node.
+          for (const out of node.outputs) {
+            const v = cache.get(out.id);
+            if (v !== undefined) this._persistentCache.set(out.id, v);
+          }
         }
       } catch (e) {
         errors.set(node.id, (e as Error).message);
