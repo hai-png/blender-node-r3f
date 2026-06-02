@@ -48,6 +48,7 @@ export { Geometry, MeshComponent, InstancesComponent, buildCube, buildUVSphere, 
 export { NodeRegistry, NodeCategory, NodeCategories, NodeItem } from './registry/NodeRegistry';
 
 export { autoLayout, makeGroup, ungroup, History } from './ui/operators';
+export { Inspector } from './ui/Inspector';
 export { bpy, nodeitems_utils } from './bridge/bpy_shim';
 export { importDocument } from './bridge/importer';
 export { exportDocument } from './bridge/exporter';

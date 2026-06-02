@@ -43,6 +43,8 @@ export class Depsgraph {
   private _scheduled = false;
   private _lastResult?: EvaluationResult;
 
+  get lastResult(): EvaluationResult | undefined { return this._lastResult; }
+
   /** Scene clock; updated by the animation driver via `setScene()`. */
   scene: SceneTime = { ...DEFAULT_SCENE_TIME };
   /** Per-zone simulation caches, keyed by `zone_id`. Survives evaluate() calls. */

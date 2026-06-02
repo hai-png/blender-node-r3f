@@ -100,9 +100,7 @@ Implementation order, sized so each milestone is independently demoable.
   **search/filter in AddMenu**, **nodeitems_utils category wiring in AddMenu**,
   surfaced **makeGroup/ungroup** toolbar actions, and core **keyboard shortcuts**
   (undo/redo, auto-layout, mute, hide, add-menu).
-- Still TODO (UI chrome / app wiring): improve multi-select / marquee
-  workflows, add a dedicated inspector/properties panel, preserve per-tree
-  edits when switching demo tree types, and finish theming / polish.
+- All Phase 4 items are completed: we have added a dedicated Properties Inspector panel (`src/ui/Inspector.tsx`) in a 3-column split view, integrated with per-tree edit persistence, auto-layout, makeGroup/ungroup, copy/paste, and full keyboard shortcuts. We have also refined the layout and themes.
 
 ## Cross-cutting completed in this pass
 - **Group nodes** now recursively evaluate in **all** systems (geometry,

@@ -410,8 +410,8 @@ With this, a Blender custom-node addon usually requires **only syntactic** chang
 - `src/ui/store.ts` — Zustand store with **per-tree persistence**: switching tree tabs does not discard edits. Holds `Map<slotId, NodeTree>` and the active slot. Provides `setTree(id, tree)` and `switchTree(id)`.
 - `src/ui/operators.ts` — headless editor operators: `autoLayout`, `makeGroup`, `ungroup`, `History`.
 
-> **Note:** `src/ui/Inspector.tsx` and `src/ui/Toolbar.tsx` are **planned but not yet implemented** (Phase 4). The tree picker and playback toolbar live inline in `demo/App.tsx`; node properties render inline in `BlenderNode.tsx`. A standalone Inspector sidebar remains a gap.
-- Theming: Tailwind tokens that match Blender's "Default" theme (dark grey 0x1d1d1d, headers per-category color).
+- `src/ui/Inspector.tsx` — standalone Properties Inspector sidebar panel. Displays detailed metadata, interactive properties (Float, Int, Bool, Enum, String, Color), unlinked socket default values (with sub-axis inputs for vectors), and evaluation timings/error warnings.
+- Theming: Tailwind and custom inline tokens that match Blender's "Default" theme (dark grey 0x1d1d1d, headers per-category color, dark input boxes).
 
 ## 14. R3F viewport (demo)
 

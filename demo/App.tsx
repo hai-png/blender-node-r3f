@@ -24,6 +24,7 @@ import {
   CompositorNodeInvert, CompositorNodeVignette, CompositorNodeGlare,
   TextureNodeNoise, TextureNodeChecker, TextureNodeOutput,
   exportDocument,
+  Inspector,
   type NodeTree,
 } from '../src';
 import { TSLShaderEvaluator } from '../src/tsl';
@@ -301,11 +302,14 @@ export function App() {
         }}
       />
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <div style={{ flex: 1, minWidth: 0, borderRight: '1px solid #000' }}>
+        <div style={{ flex: 1.2, minWidth: 0, borderRight: '1px solid #111', display: 'flex', flexDirection: 'column' }}>
           <NodeEditor />
         </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ flex: 0.8, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {showTSL ? <TSLViewport /> : <Viewport />}
+        </div>
+        <div style={{ width: 280, minWidth: 280, flexShrink: 0 }}>
+          <Inspector />
         </div>
       </div>
       <Footer />
