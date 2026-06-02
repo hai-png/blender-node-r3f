@@ -2,7 +2,7 @@
 
 Implementation order, sized so each milestone is independently demoable.
 
-> **Baseline note (2026-06-02):** current verified state is **90 smoke tests passing**, strict `tsc` clean, and `vite build` clean. See [`PHASE0_AUDIT_2026-06-02.md`](./PHASE0_AUDIT_2026-06-02.md) for the authoritative current audit; this roadmap describes milestone intent plus what still remains to close.
+> **Baseline note (2026-06-02):** current verified state is **108 smoke tests passing**, strict `tsc` clean, and `vite build` clean. See [`PHASE0_AUDIT_2026-06-02.md`](./PHASE0_AUDIT_2026-06-02.md) for the authoritative current audit; this roadmap describes milestone intent plus what still remains to close.
 
 ## M0 — Foundations (this commit)
 - Project scaffold, TypeScript strict, Vite app
@@ -97,12 +97,12 @@ Implementation order, sized so each milestone is independently demoable.
   - `autoLayout(tree)` — topological-depth column layout.
 - 3 smoke tests (autoLayout ordering, undo/redo, makeGroup↔ungroup parity).
 - Since the original milestone write-up, the editor also gained **copy/paste**,
-  **search/filter in AddMenu**, and core **keyboard shortcuts** (undo/redo,
-  auto-layout, mute, hide, add-menu).
-- Still TODO (UI chrome / app wiring): surface **makeGroup/ungroup** in the
-  editor toolbar, improve multi-select / marquee workflows, add a dedicated
-  inspector/properties panel, preserve per-tree edits when switching demo tree
-  types, and finish theming / polish.
+  **search/filter in AddMenu**, **nodeitems_utils category wiring in AddMenu**,
+  surfaced **makeGroup/ungroup** toolbar actions, and core **keyboard shortcuts**
+  (undo/redo, auto-layout, mute, hide, add-menu).
+- Still TODO (UI chrome / app wiring): improve multi-select / marquee
+  workflows, add a dedicated inspector/properties panel, preserve per-tree
+  edits when switching demo tree types, and finish theming / polish.
 
 ## Cross-cutting completed in this pass
 - **Group nodes** now recursively evaluate in **all** systems (geometry,

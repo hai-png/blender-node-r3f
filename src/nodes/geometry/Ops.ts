@@ -242,7 +242,7 @@ export class GeometryNodeMeshToPoints extends GeoDataFlow {
   override init(_ctx: NodeInitContext): void {
     this.addInput(NodeSocketGeometry, 'Mesh');
     this.addInput(NodeSocketBool, 'Selection', { default_value: true });
-    this.addInput(NodeSocketFloat, 'Position');
+    this.addInput(NodeSocketVector, 'Position');
     this.addInput(NodeSocketFloat, 'Radius', { default_value: 0.05 });
     this.addOutput(NodeSocketGeometry, 'Points');
   }

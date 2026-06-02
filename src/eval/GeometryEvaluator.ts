@@ -19,7 +19,7 @@ import type { SystemEvaluator, EvaluationResult } from './Depsgraph';
 import type { AttributeDomain, Vec3 } from '../core/types';
 
 import {
-  Geometry, MeshComponent,
+  Geometry, MeshComponent, type ScalarTypedArray,
   buildCube, buildUVSphere, buildIcosphere, buildCylinder, buildCone,
   buildGrid, buildMeshLine, buildMeshCircle,
   buildCurveLine, buildCurveCircle, buildCurveSpiral, buildBezierSegment,
@@ -28,6 +28,7 @@ import {
   Field, FieldContext, FieldKind,
   attributeField, constField, indexField, idField, normalField, positionField,
   radiusField, anonField, nextAnonymousId, liftToField, isField, mapField, zipField,
+  interpolateAttribute,
 } from './geometry/Field';
 import {
   transformGeometry, joinGeometries, setPosition, storeAttributeOn, boundingBox, convexHull,
@@ -36,7 +37,7 @@ import {
   curveToMesh, curveToPoints, resampleCurve, reverseCurve,
   sampleNearestIndex, geometryProximity, sampleCurveAtFactor, subdivideCurve,
   fillCurve, filletCurve,
-  composeMat4, mat4Mul, flipFaces,
+  translationMat4, rotationMat4, scaleMat4, transformAroundPivotMat4, mat4Mul, flipFaces,
 } from './geometry/MeshOps';
 
 import { ValueNode, VectorNode, RGBNode } from '../nodes/common/Value';
@@ -100,6 +101,7 @@ const fieldKindForSocket = (s: NodeSocket): FieldKind => {
     case 'INT': return 'INT';
     case 'BOOLEAN': return 'BOOL';
     case 'VECTOR': return 'VECTOR';
+    case 'ROTATION': return 'VECTOR';
     case 'RGBA': return 'COLOR';
     default: return 'FLOAT';
   }
@@ -152,6 +154,26 @@ function sampleImageNearest(img: ImageData, u: number, v: number): [number, numb
   const y = Math.max(0, Math.min(img.height - 1, Math.floor(clamp01(v) * img.height)));
   const i = (y * img.width + x) * 4;
   return [img.data[i]! / 255, img.data[i + 1]! / 255, img.data[i + 2]! / 255, img.data[i + 3]! / 255];
+}
+
+function attrTypeForFieldKind(kind: FieldKind): 'FLOAT' | 'INT' | 'BOOL' | 'FLOAT_VECTOR' | 'FLOAT_COLOR' {
+  return kind === 'INT' ? 'INT'
+    : kind === 'BOOL' ? 'BOOL'
+    : kind === 'VECTOR' ? 'FLOAT_VECTOR'
+    : kind === 'COLOR' ? 'FLOAT_COLOR'
+    : 'FLOAT';
+}
+
+function fieldKindForAttrType(type: 'FLOAT' | 'INT' | 'BOOL' | 'FLOAT_VECTOR' | 'FLOAT_COLOR'): FieldKind {
+  return type === 'INT' ? 'INT'
+    : type === 'BOOL' ? 'BOOL'
+    : type === 'FLOAT_VECTOR' ? 'VECTOR'
+    : type === 'FLOAT_COLOR' ? 'COLOR'
+    : 'FLOAT';
+}
+
+function dimsForFieldKind(kind: FieldKind): number {
+  return kind === 'VECTOR' ? 3 : kind === 'COLOR' ? 4 : 1;
 }
 
 export class GeometryEvaluator implements SystemEvaluator {
@@ -305,7 +327,31 @@ export class GeometryEvaluator implements SystemEvaluator {
       for (let i = 0; i < dims; i++) out.push(arr[i] as number);
       return out as unknown as T;
     }
+    if (v && typeof v === 'object' && 'euler' in (v as object) && Array.isArray((v as { euler?: unknown }).euler)) {
+      return ([...(v as { euler: number[] }).euler] as unknown) as T;
+    }
     return v as T;
+  }
+
+  /** Materialise a field on a specific source domain. */
+  private fieldOnDomain(field: Field, geometry: Geometry, domain: AttributeDomain): ScalarTypedArray {
+    return field.eval({ geometry, domain, size: geometry.domainSize(domain) });
+  }
+
+  /**
+   * Store a materialised field array as an anonymous attribute on `geometry`
+   * and return both the updated geometry and a field that reads the captured
+   * snapshot back from downstream consumers.
+   */
+  private captureAnonField(
+    geometry: Geometry,
+    domain: AttributeDomain,
+    kind: FieldKind,
+    data: ScalarTypedArray,
+  ): { geometry: Geometry; field: Field } {
+    const anonId = nextAnonymousId();
+    const stored = storeAttributeOn(geometry, anonId, domain, attrTypeForFieldKind(kind), data);
+    return { geometry: stored, field: anonField(anonId, kind) };
   }
 
   // ------------------------------------------------------------------
@@ -453,7 +499,9 @@ export class GeometryEvaluator implements SystemEvaluator {
     /* ---------------- Field utilities ---------------- */
     if (node instanceof GeometryNodeFlipFaces) {
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      cache.set(node.outputs[0]!.id, flipFaces(geo));
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const selV = this.fieldOnDomain(sel, geo, 'FACE');
+      cache.set(node.outputs[0]!.id, flipFaces(geo, selV));
       return;
     }
     if (node instanceof GeometryNodeAttributeDomainSize) {
@@ -495,19 +543,24 @@ export class GeometryEvaluator implements SystemEvaluator {
     if (node instanceof GeometryNodeFieldOnDomain) {
       const valF = this.socketField(node.inputs[0]!, cache);
       const dom = (node.domain as AttributeDomain) ?? 'POINT';
-      // Materialise on the configured domain, then map back to the consumer
-      // domain by clamped index (a simplified interpolation).
-      const out: Field = { kind: valF.kind, eval(ctx) {
-        const srcSize = ctx.geometry.domainSize(dom);
-        const src = valF.eval({ geometry: ctx.geometry, domain: dom, size: srcSize }) as ArrayLike<number>;
-        const dims = valF.kind === 'VECTOR' ? 3 : valF.kind === 'COLOR' ? 4 : 1;
-        const res = new Float32Array(ctx.size * dims);
-        for (let i = 0; i < ctx.size; i++) {
-          const si = srcSize > 0 ? Math.min(i, srcSize - 1) : 0;
-          for (let d = 0; d < dims; d++) res[i * dims + d] = Number(src[si * dims + d] ?? 0);
-        }
-        return res;
-      } };
+      const out: Field = {
+        kind: valF.kind,
+        eval(ctx) {
+          const srcSize = ctx.geometry.domainSize(dom);
+          const src = valF.eval({ geometry: ctx.geometry, domain: dom, size: srcSize });
+          return interpolateAttribute({
+            name: '__eval_on_domain__',
+            domain: dom,
+            dimensions: dimsForFieldKind(valF.kind) as 1 | 2 | 3 | 4,
+            data_type: attrTypeForFieldKind(valF.kind) === 'FLOAT_VECTOR' ? 'VECTOR'
+              : attrTypeForFieldKind(valF.kind) === 'FLOAT_COLOR' ? 'COLOR'
+              : attrTypeForFieldKind(valF.kind) === 'INT' ? 'INT'
+              : attrTypeForFieldKind(valF.kind) === 'BOOL' ? 'BOOL'
+              : 'FLOAT',
+            data: src,
+          }, ctx.geometry, ctx.domain, ctx.size, valF.kind);
+        },
+      };
       cache.set(node.outputs[0]!.id, out);
       return;
     }
@@ -838,10 +891,39 @@ export class GeometryEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof SwitchNode) {
-      // Static fallback: forward False or True based on the Switch socket's
-      // current default value. Full dynamic switching across systems is M8.
-      const useTrue = !!(this.socketValue(node.inputs[0]!, cache) as boolean);
-      cache.set(node.outputs[0]!.id, this.socketValue(node.inputs[useTrue ? 2 : 1]!, cache));
+      const cond = this.socketValue(node.inputs[0]!, cache);
+      const falseV = this.socketValue(node.inputs[1]!, cache);
+      const trueV = this.socketValue(node.inputs[2]!, cache);
+      if (isField(cond) || isField(falseV) || isField(trueV)) {
+        const condF = isField(cond) ? cond : liftToField(cond, 'BOOL');
+        const falseF = isField(falseV) ? falseV : liftToField(falseV, fieldKindForSocket(node.inputs[1]!));
+        const trueF = isField(trueV) ? trueV : liftToField(trueV, fieldKindForSocket(node.inputs[2]!));
+        const kind = isField(trueV) ? trueV.kind : isField(falseV) ? falseV.kind : fieldKindForSocket(node.outputs[0]!);
+        cache.set(node.outputs[0]!.id, {
+          kind,
+          eval(ctx) {
+            const cv = condF.eval(ctx) as ArrayLike<number>;
+            const fv = falseF.eval(ctx) as ArrayLike<number>;
+            const tv = trueF.eval(ctx) as ArrayLike<number>;
+            const dims = kind === 'VECTOR' ? 3 : kind === 'COLOR' ? 4 : 1;
+            const out = kind === 'INT' ? new Int32Array(ctx.size)
+              : kind === 'BOOL' ? new Uint8Array(ctx.size)
+              : new Float32Array(ctx.size * dims);
+            if (dims === 1) {
+              for (let i = 0; i < ctx.size; i++) (out as ArrayLike<number> as number[])[i] = cv[i] ? Number(tv[i] ?? 0) : Number(fv[i] ?? 0);
+            } else {
+              for (let i = 0; i < ctx.size; i++) {
+                const src = cv[i] ? tv : fv;
+                for (let d = 0; d < dims; d++) (out as Float32Array)[i * dims + d] = Number(src[i * dims + d] ?? 0);
+              }
+            }
+            return out as ScalarTypedArray;
+          },
+        } satisfies Field);
+      } else {
+        const useTrue = !!cond;
+        cache.set(node.outputs[0]!.id, useTrue ? trueV : falseV);
+      }
       return;
     }
     if (node instanceof NodeGroupInput) {
@@ -1410,29 +1492,27 @@ export class GeometryEvaluator implements SystemEvaluator {
       const captured = valueField.eval(ctx);
       const anonId = nextAnonymousId();
       const dt = node.data_type;
-      // Map our FieldKind back to Blender's storage type
       const storageType =
         dt === 'INT' ? 'INT' :
         dt === 'BOOL' ? 'BOOL' :
         dt === 'FLOAT_VECTOR' ? 'FLOAT_VECTOR' :
         dt === 'FLOAT_COLOR' ? 'FLOAT_COLOR' :
         'FLOAT';
+      const capturedKind = fieldKindForAttrType(storageType);
       const stored = storeAttributeOn(geo, anonId, domain, storageType, captured);
       cache.set(node.outputs[0]!.id, stored);
-      cache.set(
-        node.outputs[1]!.id,
-        anonField(anonId, valueField.kind, valueField),
-      );
+      cache.set(node.outputs[1]!.id, anonField(anonId, capturedKind));
       return;
     }
     if (node instanceof GeometryNodeStoreNamedAttribute) {
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      const _sel = this.socketField(node.inputs[1]!, cache); void _sel;
+      const sel = this.socketField(node.inputs[1]!, cache);
       const name = this.socketSingle<string>(node.inputs[2]!, cache, geo);
       const valueField = this.socketField(node.inputs[3]!, cache);
       const domain = node.domain;
       const ctx: FieldContext = { geometry: geo, domain, size: geo.domainSize(domain) };
       const arr = valueField.eval(ctx);
+      const selV = sel.eval(ctx);
       const dt = node.data_type;
       const storageType =
         dt === 'INT' ? 'INT' :
@@ -1440,7 +1520,7 @@ export class GeometryEvaluator implements SystemEvaluator {
         dt === 'FLOAT_VECTOR' ? 'FLOAT_VECTOR' :
         dt === 'FLOAT_COLOR' ? 'FLOAT_COLOR' :
         'FLOAT';
-      cache.set(node.outputs[0]!.id, storeAttributeOn(geo, name, domain, storageType, arr));
+      cache.set(node.outputs[0]!.id, storeAttributeOn(geo, name, domain, storageType, arr, selV));
       return;
     }
     if (node instanceof GeometryNodeRemoveAttribute) {
@@ -1491,27 +1571,38 @@ export class GeometryEvaluator implements SystemEvaluator {
     }
     if (node instanceof GeometryNodeDistributePointsOnFaces) {
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      const _sel = this.socketField(node.inputs[1]!, cache); void _sel;
+      const sel = this.socketField(node.inputs[1]!, cache);
       const distMin = this.socketSingle<number>(node.inputs[2]!, cache, geo);
       const density =
         node.distribute_method === 'POISSON'
           ? this.socketSingle<number>(node.inputs[3]!, cache, geo)
           : this.socketSingle<number>(node.inputs[4]!, cache, geo);
+      const densityFactorF = this.socketField(node.inputs[5]!, cache);
       const seed = this.socketSingle<number>(node.inputs[6]!, cache, geo);
-      const r = distributePointsOnFaces(geo, density, seed, node.distribute_method, distMin);
-      cache.set(node.outputs[0]!.id, r.points);
-      cache.set(node.outputs[1]!.id, constField([0, 0, 1], 'VECTOR')); // simplified
-      cache.set(node.outputs[2]!.id, constField([0, 0, 0], 'VECTOR'));
+      const faceSel = this.fieldOnDomain(sel, geo, 'FACE');
+      const faceFactor = this.fieldOnDomain(densityFactorF, geo, 'FACE');
+      const r = distributePointsOnFaces(geo, density, seed, node.distribute_method, distMin, faceSel, faceFactor);
+      let pointsGeo = r.points;
+      const normalCapture = this.captureAnonField(pointsGeo, 'POINT', 'VECTOR', r.normals);
+      pointsGeo = normalCapture.geometry;
+      const rotationCapture = this.captureAnonField(pointsGeo, 'POINT', 'VECTOR', r.rotations);
+      pointsGeo = rotationCapture.geometry;
+      cache.set(node.outputs[0]!.id, pointsGeo);
+      cache.set(node.outputs[1]!.id, normalCapture.field);
+      cache.set(node.outputs[2]!.id, rotationCapture.field);
       return;
     }
     if (node instanceof GeometryNodeMeshToPoints) {
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
       const sel = this.socketField(node.inputs[1]!, cache);
+      const posF = this.socketField(node.inputs[2]!, cache);
       const rad = this.socketField(node.inputs[3]!, cache);
-      const ctx: FieldContext = { geometry: geo, domain: 'POINT', size: geo.domainSize('POINT') };
+      const domain: AttributeDomain = node.mode === 'FACES' ? 'FACE' : node.mode === 'EDGES' ? 'EDGE' : 'POINT';
+      const ctx: FieldContext = { geometry: geo, domain, size: geo.domainSize(domain) };
       const selV = sel.eval(ctx);
+      const posV = posF.eval(ctx) as Float32Array;
       const radV = rad.eval(ctx);
-      cache.set(node.outputs[0]!.id, meshToPoints(geo, selV, radV, node.mode));
+      cache.set(node.outputs[0]!.id, meshToPoints(geo, selV, posV, radV, node.mode));
       return;
     }
     if (node instanceof GeometryNodePointsToVertices) {
@@ -1525,12 +1616,16 @@ export class GeometryEvaluator implements SystemEvaluator {
       const pointsGeo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
       const sel = this.socketField(node.inputs[1]!, cache);
       const inst = (this.socketValue(node.inputs[2]!, cache) as Geometry) ?? Geometry.empty();
+      const pickInstance = !!this.socketSingle<boolean>(node.inputs[3]!, cache, pointsGeo);
+      const indexF = this.socketField(node.inputs[4]!, cache);
       const rot = this.socketField(node.inputs[5]!, cache);
       const scl = this.socketField(node.inputs[6]!, cache);
       const ctx: FieldContext = { geometry: pointsGeo, domain: 'POINT', size: pointsGeo.domainSize('POINT') };
       cache.set(node.outputs[0]!.id, instanceOnPoints(
         pointsGeo, inst,
         sel.eval(ctx),
+        pickInstance,
+        indexF.eval(ctx),
         rot.eval(ctx) as Float32Array,
         scl.eval(ctx) as Float32Array,
       ));
@@ -1542,24 +1637,63 @@ export class GeometryEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof GeometryNodeTranslateInstances || node instanceof GeometryNodeRotateInstances || node instanceof GeometryNodeScaleInstances) {
-      // Light implementation: bake a transform into each instance matrix.
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      const _sel = this.socketField(node.inputs[1]!, cache); void _sel;
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const selV = this.fieldOnDomain(sel, geo, 'INSTANCE');
       const out = geo.cloneOwning();
-      if (out.instances) {
-        for (const it of out.instances.items) {
-          let t: Vec3 = [0, 0, 0], r: Vec3 = [0, 0, 0], s: Vec3 = [1, 1, 1];
-          if (node instanceof GeometryNodeTranslateInstances) {
-            t = this.socketSingle<Vec3>(node.inputs[2]!, cache, geo);
-          } else if (node instanceof GeometryNodeRotateInstances) {
-            const rr = this.socketSingle<unknown>(node.inputs[2]!, cache, geo);
-            r = Array.isArray(rr) ? (rr as Vec3) : [0, 0, 0];
-          } else {
-            s = this.socketSingle<Vec3>(node.inputs[2]!, cache, geo);
-          }
-          // Pre-multiply by the new transform.
-          it.transform = mat4Mul(composeMat4(t, r, s), it.transform);
+      if (!out.instances) {
+        cache.set(node.outputs[0]!.id, out);
+        return;
+      }
+
+      if (node instanceof GeometryNodeTranslateInstances) {
+        const translationF = this.socketField(node.inputs[2]!, cache);
+        const localSpace = !!this.socketSingle<boolean>(node.inputs[3]!, cache, geo);
+        const tv = this.fieldOnDomain(translationF, geo, 'INSTANCE') as Float32Array;
+        for (let i = 0; i < out.instances.items.length; i++) {
+          if (!selV[i]) continue;
+          const t: Vec3 = [tv[i * 3] ?? 0, tv[i * 3 + 1] ?? 0, tv[i * 3 + 2] ?? 0];
+          const xf = translationMat4(t);
+          out.instances.items[i]!.transform = localSpace
+            ? mat4Mul(out.instances.items[i]!.transform, xf)
+            : mat4Mul(xf, out.instances.items[i]!.transform);
         }
+        cache.set(node.outputs[0]!.id, out);
+        return;
+      }
+
+      if (node instanceof GeometryNodeRotateInstances) {
+        const rotationF = this.socketField(node.inputs[2]!, cache);
+        const pivotF = this.socketField(node.inputs[3]!, cache);
+        const localSpace = !!this.socketSingle<boolean>(node.inputs[4]!, cache, geo);
+        const rv = this.fieldOnDomain(rotationF, geo, 'INSTANCE') as Float32Array;
+        const pv = this.fieldOnDomain(pivotF, geo, 'INSTANCE') as Float32Array;
+        for (let i = 0; i < out.instances.items.length; i++) {
+          if (!selV[i]) continue;
+          const r: Vec3 = [rv[i * 3] ?? 0, rv[i * 3 + 1] ?? 0, rv[i * 3 + 2] ?? 0];
+          const p: Vec3 = [pv[i * 3] ?? 0, pv[i * 3 + 1] ?? 0, pv[i * 3 + 2] ?? 0];
+          const xf = transformAroundPivotMat4(rotationMat4(r), p);
+          out.instances.items[i]!.transform = localSpace
+            ? mat4Mul(out.instances.items[i]!.transform, xf)
+            : mat4Mul(xf, out.instances.items[i]!.transform);
+        }
+        cache.set(node.outputs[0]!.id, out);
+        return;
+      }
+
+      const scaleF = this.socketField(node.inputs[2]!, cache);
+      const centerF = this.socketField(node.inputs[3]!, cache);
+      const localSpace = !!this.socketSingle<boolean>(node.inputs[4]!, cache, geo);
+      const sv = this.fieldOnDomain(scaleF, geo, 'INSTANCE') as Float32Array;
+      const cv = this.fieldOnDomain(centerF, geo, 'INSTANCE') as Float32Array;
+      for (let i = 0; i < out.instances.items.length; i++) {
+        if (!selV[i]) continue;
+        const s: Vec3 = [sv[i * 3] ?? 1, sv[i * 3 + 1] ?? 1, sv[i * 3 + 2] ?? 1];
+        const c: Vec3 = [cv[i * 3] ?? 0, cv[i * 3 + 1] ?? 0, cv[i * 3 + 2] ?? 0];
+        const xf = transformAroundPivotMat4(scaleMat4(s), c);
+        out.instances.items[i]!.transform = localSpace
+          ? mat4Mul(out.instances.items[i]!.transform, xf)
+          : mat4Mul(xf, out.instances.items[i]!.transform);
       }
       cache.set(node.outputs[0]!.id, out);
       return;
@@ -1567,26 +1701,44 @@ export class GeometryEvaluator implements SystemEvaluator {
     if (node instanceof GeometryNodeCurveToMesh) {
       const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
       const profile = (this.socketValue(node.inputs[1]!, cache) as Geometry | undefined) ?? null;
-      cache.set(node.outputs[0]!.id, curveToMesh(curve, profile));
+      const fillCaps = !!this.socketSingle<boolean>(node.inputs[2]!, cache, curve);
+      cache.set(node.outputs[0]!.id, curveToMesh(curve, profile, fillCaps));
       return;
     }
     if (node instanceof GeometryNodeCurveToPoints) {
       const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
       const count = this.socketSingle<number>(node.inputs[1]!, cache, curve);
       const length = this.socketSingle<number>(node.inputs[2]!, cache, curve);
-      cache.set(node.outputs[0]!.id, curveToPoints(curve, node.mode, count, length));
+      let pointsGeo = curveToPoints(curve, node.mode, count, length);
+      const tangentAttr = pointsGeo.points?.attributes.get('tangent');
+      const normalAttr = pointsGeo.points?.attributes.get('normal');
+      const rotationAttr = pointsGeo.points?.attributes.get('rotation');
+      const tangentCapture = tangentAttr ? this.captureAnonField(pointsGeo, 'POINT', 'VECTOR', tangentAttr.data) : null;
+      if (tangentCapture) pointsGeo = tangentCapture.geometry;
+      const normalCapture = normalAttr ? this.captureAnonField(pointsGeo, 'POINT', 'VECTOR', normalAttr.data) : null;
+      if (normalCapture) pointsGeo = normalCapture.geometry;
+      const rotationCapture = rotationAttr ? this.captureAnonField(pointsGeo, 'POINT', 'VECTOR', rotationAttr.data) : null;
+      if (rotationCapture) pointsGeo = rotationCapture.geometry;
+      cache.set(node.outputs[0]!.id, pointsGeo);
+      cache.set(node.outputs[1]!.id, tangentCapture?.field ?? constField([0, 0, 1], 'VECTOR'));
+      cache.set(node.outputs[2]!.id, normalCapture?.field ?? constField([0, 1, 0], 'VECTOR'));
+      cache.set(node.outputs[3]!.id, rotationCapture?.field ?? constField([0, 0, 0], 'VECTOR'));
       return;
     }
     if (node instanceof GeometryNodeResampleCurve) {
       const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
       const count = this.socketSingle<number>(node.inputs[2]!, cache, curve);
       const length = this.socketSingle<number>(node.inputs[3]!, cache, curve);
-      cache.set(node.outputs[0]!.id, resampleCurve(curve, node.mode, count, length));
+      const selV = this.fieldOnDomain(sel, curve, 'CURVE');
+      cache.set(node.outputs[0]!.id, resampleCurve(curve, node.mode, count, length, selV));
       return;
     }
     if (node instanceof GeometryNodeReverseCurve) {
       const curve = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
-      cache.set(node.outputs[0]!.id, reverseCurve(curve));
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const selV = this.fieldOnDomain(sel, curve, 'CURVE');
+      cache.set(node.outputs[0]!.id, reverseCurve(curve, selV));
       return;
     }
     if (node instanceof GeometryNodeSampleIndex) {

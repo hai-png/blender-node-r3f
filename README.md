@@ -2,7 +2,7 @@
 
 A **Blender-compatible node system** for three.js + react-three-fiber. Mirrors `bpy.types.Node`, `NodeSocket`, `NodeTree`, `NodeTreeInterface`, `bpy.props.*`, `bpy.utils.register_class`, and `nodeitems_utils` closely enough that Blender Python addons that ship as node-group `.blend` files can be **ported** to TypeScript with minimal *structural* change. Porting is mechanical but **manual** — there is no automatic Python→TS translator; class structure transliterates 1:1 and per-node behaviour is supplied by an `executeGeo(ctx)` hook (see [`examples/falloff_addon.ts`](examples/falloff_addon.ts)).
 
-> **Status**: broad **M0–M8 prototype/subset implemented**, with active gap-closure in progress. All four node systems (Shader/Geometry/Compositor/Texture) evaluate, including **recursive node groups in every system**, node **mute**, **reroute**, interface reactivity, an M5-style **compositor** WebGL pipeline (+ a headless CPU pixel evaluator), the **texture** sampler graph with `DataTexture` baking, geometry **field utilities**, a worked **ported-addon example** through the `bpy` shim, and headless editor **operators** (undo/redo, make-group/ungroup, auto-layout). **176 unique node classes** register at runtime. **90 headless smoke tests pass; strict `tsc` clean; `vite build` clean.** Current baseline and gaps are documented in [`docs/PHASE0_AUDIT_2026-06-02.md`](docs/PHASE0_AUDIT_2026-06-02.md). Note: the depsgraph tracks dirtiness, but evaluators still perform **full-tree re-evaluation** per `evaluate()` call; true incremental execution remains future work.
+> **Status**: broad **M0–M8 prototype/subset implemented**, with active gap-closure in progress. All four node systems (Shader/Geometry/Compositor/Texture) evaluate, including **recursive node groups in every system**, node **mute**, **reroute**, interface reactivity, an M5-style **compositor** WebGL pipeline (+ a headless CPU pixel evaluator), the **texture** sampler graph with `DataTexture` baking, geometry **field utilities**, a worked **ported-addon example** through the `bpy` shim, and headless editor **operators** (undo/redo, make-group/ungroup, auto-layout). **176 unique node classes** register at runtime. **108 headless smoke tests pass; strict `tsc` clean; `vite build` clean.** Current baseline and gaps are documented in [`docs/PHASE0_AUDIT_2026-06-02.md`](docs/PHASE0_AUDIT_2026-06-02.md). Note: the depsgraph tracks dirtiness, but evaluators still perform **full-tree re-evaluation** per `evaluate()` call; true incremental execution remains future work.
 
 ## Documents
 
@@ -40,7 +40,7 @@ You'll see a split UI: React Flow editor on the left, R3F viewport on the right.
 | **UI** | React Flow editor with Blender-style coloured handles, dashed shader links, animated geometry links, inline socket value editors, property panels, right-click Add menu with search & categories |
 | **Bridge** | `BNG/1` JSON schema + Zod validation; Python exporter (`src/bridge/blender_exporter.py`) + TS importer + round-trip exporter; `bpy` / `nodeitems_utils` shim + `executeGeo` per-node hook for ported addons (worked example in `examples/`) |
 | **Groups & flow** | Recursive group evaluation in all 4 systems (nesting + recursion guard); `flattenTree`/`flatTopoOrder` inlining; node mute via `computeInternalLinks`; reroute pass-through; interface reactivity |
-| **Editor operators** | `History` (undo/redo), `makeGroup`/`ungroup` (eval-preserving), `autoLayout` — all headless + tested |
+| **Editor operators** | `History` (undo/redo), `makeGroup`/`ungroup` (eval-preserving), `autoLayout` — all headless + tested; group/ungroup are now surfaced in the editor toolbar |
 
 ## Porting a Blender addon
 
@@ -141,9 +141,9 @@ bpy.props.*                 ─►  src/core/Properties.ts
 bpy.utils.register_class    ─►  src/registry/NodeRegistry.ts
 nodeitems_utils             ─►  src/registry/NodeRegistry.ts (NodeCategory)
 Depsgraph                   ─►  src/eval/Depsgraph.ts
-Shader  evaluator (TSL)     ─►  src/eval/ShaderEvaluator.ts
+Shader  evaluator (TSL)     ─►  src/eval/tsl/TSLShaderEvaluator.ts
 Geometry evaluator (MFN)    ─►  src/eval/GeometryEvaluator.ts
-Compositor evaluator        ─►  src/eval/CompositorEvaluator.ts
+Compositor evaluator        ─►  src/eval/compositor/CompositorEvaluator.ts
 Texture evaluator           ─►  src/eval/TextureEvaluator.ts
 .blend  → JSON bridge       ─►  src/bridge/{schema,importer,exporter,blender_exporter.py}
 React Flow editor           ─►  src/ui/{NodeEditor,BlenderNode,AddMenu,store}.tsx

@@ -84,6 +84,9 @@ export class NodeTree {
     if (!from.is_output) throw new Error('addLink: "from" must be an output socket');
     if (to.is_output) throw new Error('addLink: "to" must be an input socket');
     if (from.node === to.node) throw new Error('addLink: cannot link a node to itself');
+    if (this.wouldCreateCycle(from.node, to.node)) {
+      throw new Error(`addLink: link ${from.node.name || from.node.bl_label} → ${to.node.name || to.node.bl_label} would create a cycle`);
+    }
 
     // enforce link_limit: when limit reached on either side, drop oldest link
     // (Blender does the same: dragging a wire onto a single-input socket
@@ -118,6 +121,30 @@ export class NodeTree {
   /** Recompute zone-escape flags for all links after a topology edit. */
   recomputeZoneEscapes(): void {
     for (const l of this.links) l.escapes_zone = this.detectZoneEscape(l.from_node, l.to_node);
+  }
+
+  /**
+   * Blender forbids graph cycles at edit-time. A new edge `fromNode -> toNode`
+   * would create a cycle iff `toNode` can already reach `fromNode` through the
+   * current valid link topology.
+   */
+  private wouldCreateCycle(fromNode: Node, toNode: Node): boolean {
+    if (fromNode === toNode) return true;
+    const seen = new Set<Node>([toNode]);
+    const stack: Node[] = [toNode];
+    while (stack.length) {
+      const n = stack.pop()!;
+      for (const l of this.links) {
+        if (l.from_node !== n) continue;
+        if (!l.is_valid || l.escapes_zone) continue;
+        if (l.to_node === fromNode) return true;
+        if (!seen.has(l.to_node)) {
+          seen.add(l.to_node);
+          stack.push(l.to_node);
+        }
+      }
+    }
+    return false;
   }
 
   /**

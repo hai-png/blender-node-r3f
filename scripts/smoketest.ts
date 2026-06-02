@@ -22,20 +22,20 @@ import {
   GeometryNodeInputPosition, GeometryNodeInputNormal, GeometryNodeInputIndex,
   GeometryNodeSetPosition, GeometryNodeCaptureAttribute, GeometryNodeBoundBox,
   GeometryNodeDistributePointsOnFaces, GeometryNodeInstanceOnPoints,
-  GeometryNodeRealizeInstances, GeometryNodeMeshToPoints, GeometryNodeSubdivisionSurface,
+  GeometryNodeRealizeInstances, GeometryNodeTranslateInstances, GeometryNodeMeshToPoints, GeometryNodeSubdivisionSurface,
   GeometryNodeCurveCircle, GeometryNodeCurveToPoints, GeometryNodeCurveBezierSegment,
   GeometryNodeResampleCurve, GeometryNodeReverseCurve,
   GeometryNodeAccumulateField, GeometryNodeAttributeDomainSize, GeometryNodeFlipFaces,
   GeometryNodeConvexHull,
   GeometryNodeFieldAtIndex, GeometryNodeInputIndex,
-  GeometryNodeCurveLine,
+  GeometryNodeCurveLine, GeometryNodeProximity,
   NodeRegistry as _NR2,
   CompositorNodeImage, CompositorNodeBlur, CompositorNodeComposite,
   CompositorNodeRGB, CompositorNodeMixRGB, CompositorNodeInvert, CompositorNodeGamma,
   CompositorNodePosterize, CompositorNodeMapRange, CompositorNodeValue as _CV,
   CompositorNodeCombineColor, CompositorNodeSeparateColor, CompositorNodeValToRGB,
   CompositorNodeSplitViewer,
-  cpuComposite, NodeRegistry,
+  cpuComposite, NodeRegistry, NodeCategories, NodeCategory, NodeItem,
   TextureNodeChecker, TextureNodeOutput, TextureNodeVoronoi, TextureNodeWave,
   TextureNodeMath, TextureNodeMixRGB, TextureNodeCoordinates,
   bakeToDataTexture,
@@ -65,6 +65,7 @@ import type { Field } from '../src/eval/geometry/Field';
 import { registerFalloffAddon, GeometryNodeRadialFalloff } from '../examples/falloff_addon';
 registerFalloffAddon();
 import { autoLayout, History, makeGroup, ungroup } from '../src/ui/operators';
+import { buildAddMenuSections, createNodeFromAddMenuEntry } from '../src/ui/AddMenu';
 import { GeometryNodeTree as _GNT, GeometryNodeGroup as _GNG } from '../src';
 import { NodeGroupInput as _NGI, NodeGroupOutput as _NGO } from '../src';
 
@@ -648,6 +649,20 @@ test('geom M3: Distribute Points on Faces yields points proportional to area', a
   assert(g.points!.numPoints < 400, `expected ≲ 200 points, got ${g.points!.numPoints}`);
 });
 
+test('geom M3: Distribute Points on Faces respects Selection=false', () => {
+  const t = new GeometryNodeTree('g-dist-selection');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const grid = t.addNode(GeometryNodeMeshGrid);
+  const dist = t.addNode(GeometryNodeDistributePointsOnFaces);
+  dist.inputs[1]!.default_value = false;
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(grid.outputs[0]!, dist.inputs[0]!);
+  t.addLink(dist.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  assert(!g.points || g.points.numPoints === 0, `selection=false should emit no points, got ${g.points?.numPoints ?? 0}`);
+});
+
 test('geom M3: Instance on Points + Realize produces a joined mesh', async () => {
   const t = new GeometryNodeTree('g');
   t.depsgraph.setEvaluator(new GeometryEvaluator());
@@ -676,6 +691,82 @@ test('geom M3: Instance on Points + Realize produces a joined mesh', async () =>
   assert(g.mesh, 'realized to mesh');
   // 9 grid verts × 8 cube verts = 72 verts (+ original grid 9 = 81)
   assert(g.mesh!.numVerts >= 72, `expected ≥ 72 verts, got ${g.mesh!.numVerts}`);
+});
+
+test('geom M3: Instance on Points respects Pick Instance / Instance Index', () => {
+  const t = new GeometryNodeTree('g-pick-instance');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+
+  // Inner candidate geometry: two instanced cubes at different source-item transforms.
+  const innerLine = t.addNode(NodeRegistry.getNode('GeometryNodeMeshLine')! as Parameters<typeof t.addNode>[0]);
+  innerLine.inputs.find((s) => s.identifier === 'Count')!.default_value = 2;
+  innerLine.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [-1, 0, 0];
+  innerLine.inputs.find((s) => s.identifier === 'Offset')!.default_value = [2, 0, 0];
+  const cube = t.addNode(GeometryNodeMeshCube);
+  (cube.inputs[0]!.default_value as number[]).splice(0, 3, 0.2, 0.2, 0.2);
+  const innerInst = t.addNode(GeometryNodeInstanceOnPoints);
+  t.addLink(innerLine.outputs[0]!, innerInst.inputs[0]!);
+  t.addLink(cube.outputs[0]!, innerInst.inputs[2]!);
+
+  // Outer points choose one candidate each by point index.
+  const outerLine = t.addNode(NodeRegistry.getNode('GeometryNodeMeshLine')! as Parameters<typeof t.addNode>[0]);
+  outerLine.inputs.find((s) => s.identifier === 'Count')!.default_value = 2;
+  outerLine.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [0, 0, 0];
+  outerLine.inputs.find((s) => s.identifier === 'Offset')!.default_value = [0, 2, 0];
+  const idx = t.addNode(GeometryNodeInputIndex);
+  const outerInst = t.addNode(GeometryNodeInstanceOnPoints);
+  outerInst.inputs.find((s) => s.identifier === 'Pick Instance')!.default_value = true;
+  const real = t.addNode(GeometryNodeRealizeInstances);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(outerLine.outputs[0]!, outerInst.inputs[0]!);
+  t.addLink(innerInst.outputs[0]!, outerInst.inputs[2]!);
+  t.addLink(idx.outputs[0]!, outerInst.inputs[4]!);
+  t.addLink(outerInst.outputs[0]!, real.inputs[0]!);
+  t.addLink(real.outputs[0]!, out.inputs[0]!);
+
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  assert(g.mesh, 'picked instances realize to mesh');
+  eq(g.mesh!.numVerts, 16, '2 outer points × 1 picked cube each = 16 verts (not 32)');
+});
+
+test('geom instances: Translate Instances honors Local Space', () => {
+  const make = (localSpace: boolean) => {
+    const t = new GeometryNodeTree(`g-local-${localSpace}`);
+    t.depsgraph.setEvaluator(new GeometryEvaluator());
+    t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+    const line = t.addNode(NodeRegistry.getNode('GeometryNodeMeshLine')! as Parameters<typeof t.addNode>[0]);
+    line.inputs.find((s) => s.identifier === 'Count')!.default_value = 2;
+    line.inputs.find((s) => s.identifier === 'Start Location')!.default_value = [0, 0, 0];
+    line.inputs.find((s) => s.identifier === 'Offset')!.default_value = [0, 0, 0];
+    const cube = t.addNode(GeometryNodeMeshCube);
+    const inst = t.addNode(GeometryNodeInstanceOnPoints);
+    inst.inputs.find((s) => s.identifier === 'Rotation')!.default_value = { quat: [0, 0, 0, 1], euler: [0, Math.PI / 2, 0] };
+    const tr = t.addNode(GeometryNodeTranslateInstances);
+    tr.inputs.find((s) => s.identifier === 'Translation')!.default_value = [1, 0, 0];
+    tr.inputs.find((s) => s.identifier === 'Local Space')!.default_value = localSpace;
+    const real = t.addNode(GeometryNodeRealizeInstances);
+    const out = t.addNode(NodeGroupOutput);
+    t.addLink(line.outputs[0]!, inst.inputs[0]!);
+    t.addLink(cube.outputs[0]!, inst.inputs[2]!);
+    t.addLink(inst.outputs[0]!, tr.inputs[0]!);
+    t.addLink(tr.outputs[0]!, real.inputs[0]!);
+    t.addLink(real.outputs[0]!, out.inputs[0]!);
+    return t;
+  };
+  const world = make(false).depsgraph.evaluate()!.output as Geometry;
+  const local = make(true).depsgraph.evaluate()!.output as Geometry;
+  let worldMinX = Infinity, localMinX = Infinity, worldMinZ = Infinity, localMinZ = Infinity;
+  for (let i = 0; i < world.mesh!.positions.length; i += 3) {
+    worldMinX = Math.min(worldMinX, world.mesh!.positions[i]!);
+    worldMinZ = Math.min(worldMinZ, world.mesh!.positions[i + 2]!);
+  }
+  for (let i = 0; i < local.mesh!.positions.length; i += 3) {
+    localMinX = Math.min(localMinX, local.mesh!.positions[i]!);
+    localMinZ = Math.min(localMinZ, local.mesh!.positions[i + 2]!);
+  }
+  assert(worldMinX > localMinX, 'world-space translation shifts X more than local-space version');
+  assert(Math.abs(localMinZ - worldMinZ) > 0.5, 'local-space translation follows rotated local axis');
 });
 
 test('geom M3: Curve Circle → Curve to Points → mesh has 32 verts', async () => {
@@ -725,6 +816,35 @@ test('geom M3: Reverse Curve flips point order', async () => {
   const g = r.output as Geometry;
   // First point of reversed should equal the curve's end (1, 0, 0) by default
   close(g.curves!.positions[0]!, 1, 1e-6, 'reversed first X');
+});
+
+test('geom M3: Reverse Curve respects Selection=false', () => {
+  const t = new GeometryNodeTree('g-reverse-selection');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const bez = t.addNode(GeometryNodeCurveBezierSegment);
+  const rev = t.addNode(GeometryNodeReverseCurve);
+  rev.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(bez.outputs[0]!, rev.inputs[0]!);
+  t.addLink(rev.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  close(g.curves!.positions[0]!, -1, 1e-6, 'selection=false leaves first point unchanged');
+});
+
+test('geom M3: Resample Curve respects Selection=false', () => {
+  const t = new GeometryNodeTree('g-resample-selection');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const bez = t.addNode(GeometryNodeCurveBezierSegment);
+  const rs = t.addNode(GeometryNodeResampleCurve);
+  rs.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  rs.inputs.find((s) => s.identifier === 'Count')!.default_value = 8;
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(bez.outputs[0]!, rs.inputs[0]!);
+  t.addLink(rs.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  eq(g.curves!.numPoints, 17, 'selection=false preserves original bezier resolution');
 });
 
 test('geom M3: VectorMath in a field — Normal × scale used as offset', async () => {
@@ -826,6 +946,73 @@ test('geom textures: image resolver is called when ShaderNodeTexImage.image_src 
   const r = t.depsgraph.evaluate()!;
   assert(!r.errors.has(img.id), 'ShaderNodeTexImage evaluates with resolver');
   assert(resolved, 'geometry evaluator image resolver was called');
+});
+
+test('geom: Store Named Attribute respects Selection', () => {
+  const t = new GeometryNodeTree('store-selection');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const storeA = t.addNode(NodeRegistry.getNode('GeometryNodeStoreNamedAttribute')! as Parameters<typeof t.addNode>[0]);
+  const storeB = t.addNode(NodeRegistry.getNode('GeometryNodeStoreNamedAttribute')! as Parameters<typeof t.addNode>[0]);
+  (storeA as unknown as { data_type: string; domain: string }).data_type = 'FLOAT_VECTOR';
+  (storeA as unknown as { data_type: string; domain: string }).domain = 'POINT';
+  storeA.inputs.find((s) => s.identifier === 'Name')!.default_value = 'foo';
+  storeA.inputs.find((s) => s.identifier === 'Value')!.default_value = [1, 2, 3];
+  (storeB as unknown as { data_type: string; domain: string }).data_type = 'FLOAT_VECTOR';
+  (storeB as unknown as { data_type: string; domain: string }).domain = 'POINT';
+  storeB.inputs.find((s) => s.identifier === 'Selection')!.default_value = false;
+  storeB.inputs.find((s) => s.identifier === 'Name')!.default_value = 'foo';
+  storeB.inputs.find((s) => s.identifier === 'Value')!.default_value = [9, 9, 9];
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(cube.outputs[0]!, storeA.inputs[0]!);
+  t.addLink(storeA.outputs[0]!, storeB.inputs[0]!);
+  t.addLink(storeB.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  const attr = g.findAttribute('foo');
+  assert(attr, 'named attribute exists');
+  close(Number(attr!.data[0]), 1, 1e-6, 'selection=false preserves existing X');
+  close(Number(attr!.data[1]), 2, 1e-6, 'selection=false preserves existing Y');
+  close(Number(attr!.data[2]), 3, 1e-6, 'selection=false preserves existing Z');
+});
+
+test('geom: Mesh to Points honors Position input', () => {
+  const t = new GeometryNodeTree('mesh-to-points-position');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const mtp = t.addNode(GeometryNodeMeshToPoints);
+  const comb = t.addNode(CombineXYZNode);
+  comb.inputs[0]!.default_value = 5;
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(cube.outputs[0]!, mtp.inputs[0]!);
+  t.addLink(comb.outputs[0]!, mtp.inputs[2]!);
+  t.addLink(mtp.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  assert(g.points, 'mesh to points produced points');
+  for (let i = 0; i < g.points!.numPoints; i++) close(g.points!.positions[i * 3]!, 5, 1e-6, 'position input overrides point X');
+});
+
+test('geom: Geometry Proximity samples nearest surface, not nearest vertex', () => {
+  const t = new GeometryNodeTree('geo-proximity-surface');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const target = t.addNode(GeometryNodeMeshCube);
+  const probe = t.addNode(GeometryNodeMeshCube);
+  const prox = t.addNode(GeometryNodeProximity);
+  prox.inputs.find((s) => s.identifier === 'Source Position')!.default_value = [0, 2, 0];
+  const comb = t.addNode(CombineXYZNode);
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(target.outputs[0]!, prox.inputs[0]!);
+  t.addLink(probe.outputs[0]!, setp.inputs[0]!);
+  t.addLink(prox.outputs.find((s) => s.identifier === 'Distance')!, comb.inputs[0]!);
+  t.addLink(comb.outputs[0]!, setp.inputs[3]!);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+  const g = t.depsgraph.evaluate()!.output as Geometry;
+  // Distance from (0,2,0) to the top face of a default cube is 1.0; nearest-vertex
+  // distance would be > 1.4 and would move the probe farther on X.
+  close(g.mesh!.positions[0]!, 0, 0.05, 'proximity distance ≈ 1 moves probe by ~1 on X from -1 to 0');
 });
 
 void {} as Field; // type-only import keep-alive
@@ -1596,6 +1783,31 @@ test('op History: undo/redo restores topology', () => {
   eq(redone.nodes.length, 3, 'redo restored the grid (3 nodes)');
 });
 
+test('ui add menu: nodeitems_utils categories are surfaced and settings are applied', () => {
+  const packId = 'TEST_ADD_MENU_PACK';
+  NodeCategories.register(packId, [
+    new NodeCategory('TEST', 'Test Category', [
+      new NodeItem('ShaderNodeValue', 'Value 0.25', { value: 0.25 }),
+    ], (treeKind) => treeKind === 'ShaderNodeTree'),
+  ]);
+  try {
+    const sections = buildAddMenuSections('ShaderNodeTree');
+    const section = sections.find((s) => s.category === 'Test Category');
+    assert(section, 'custom nodeitems_utils category is present');
+    const item = section!.items.find((i) => i.label === 'Value 0.25');
+    assert(item, 'custom menu item is present');
+
+    const t = new ShaderNodeTree('menu-test');
+    const node = createNodeFromAddMenuEntry(t, item!, [10, 20]) as ValueNode | null;
+    assert(node, 'menu entry creates a node');
+    close(node!.value, 0.25, 1e-6, 'NodeItem.settings applied to created node');
+    eq(node!.location[0], 10, 'node X location applied');
+    eq(node!.location[1], 20, 'node Y location applied');
+  } finally {
+    NodeCategories.unregister(packId);
+  }
+});
+
 test('op makeGroup + ungroup: round-trips and preserves evaluation', () => {
   // Build Cube -> Transform(+1 Y) -> Output. Group the Transform, evaluate;
   // ungroup, evaluate; both must match the inline result.
@@ -1630,6 +1842,21 @@ test('op makeGroup + ungroup: round-trips and preserves evaluation', () => {
 });
 
 // --------------------- Phase 1: Cycle detection -------------------------
+test('core: addLink rejects cycle creation', () => {
+  const t = new GeometryNodeTree('cycle-prevent');
+  const a = t.addNode(GeometryNodeTransform);
+  const b = t.addNode(GeometryNodeTransform);
+  t.addLink(a.outputs[0]!, b.inputs[0]!);
+  let threw = false;
+  try {
+    t.addLink(b.outputs[0]!, a.inputs[0]!);
+  } catch (e) {
+    threw = /cycle/i.test((e as Error).message);
+  }
+  assert(threw, 'reverse link creating a cycle is rejected');
+  eq(t.links.length, 1, 'cycle-causing link was not added');
+});
+
 test('core: cycle detection surfaces error in EvaluationResult', async () => {
   const t = new ShaderNodeTree('cycle-test');
   t.depsgraph.setEvaluator(new ShaderEvaluator());

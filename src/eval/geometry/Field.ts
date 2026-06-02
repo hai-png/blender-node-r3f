@@ -179,7 +179,7 @@ export function normalField(): Field {
 /*  Domain interpolation                                              */
 /* ------------------------------------------------------------------ */
 
-function interpolateAttribute(
+export function interpolateAttribute(
   attr: Attribute,
   geometry: Geometry,
   targetDomain: AttributeDomain,
@@ -191,50 +191,129 @@ function interpolateAttribute(
   if (attr.domain === targetDomain) {
     return convertKind(attr.data, dims, outKind, size);
   }
-  // Mesh-domain conversions
   const mesh = geometry.mesh;
-  if (!mesh) return allocFor(outKind, size);
+  const curves = geometry.curves;
 
-  if (attr.domain === 'FACE' && targetDomain === 'POINT') {
-    // Average all face values incident to each vertex.
-    const out = new Float32Array(size * dims);
-    const counts = new Uint32Array(size);
-    const t = mesh.triangles;
-    for (let i = 0; i < mesh.numTris; i++) {
-      for (let k = 0; k < 3; k++) {
-        const v = t[i * 3 + k]!;
-        if (v >= size) continue;
+  if (mesh) {
+    if (attr.domain === 'FACE' && targetDomain === 'POINT') {
+      // Average all face values incident to each vertex.
+      const out = new Float32Array(size * dims);
+      const counts = new Uint32Array(size);
+      const t = mesh.triangles;
+      for (let i = 0; i < mesh.numTris; i++) {
+        for (let k = 0; k < 3; k++) {
+          const v = t[i * 3 + k]!;
+          if (v >= size) continue;
+          for (let d = 0; d < dims; d++) {
+            const idx = v * dims + d;
+            out[idx] = (out[idx] ?? 0) + readScalar(attr.data, i * dims + d);
+          }
+          counts[v] = (counts[v] ?? 0) + 1;
+        }
+      }
+      for (let v = 0; v < size; v++) {
+        const c = (counts[v] ?? 0) || 1;
         for (let d = 0; d < dims; d++) {
           const idx = v * dims + d;
-          out[idx] = (out[idx] ?? 0) + readScalar(attr.data, i * dims + d);
+          out[idx] = (out[idx] ?? 0) / c;
         }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'POINT' && targetDomain === 'FACE') {
+      // Average the three vertex values of each triangle.
+      const out = new Float32Array(size * dims);
+      const t = mesh.triangles;
+      for (let i = 0; i < size; i++) {
+        for (let d = 0; d < dims; d++) {
+          const sum =
+            readScalar(attr.data, t[i * 3]! * dims + d) +
+            readScalar(attr.data, t[i * 3 + 1]! * dims + d) +
+            readScalar(attr.data, t[i * 3 + 2]! * dims + d);
+          out[i * dims + d] = sum / 3;
+        }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'POINT' && targetDomain === 'CORNER') {
+      const out = new Float32Array(size * dims);
+      const t = mesh.triangles;
+      for (let i = 0; i < size; i++) {
+        const v = t[i] ?? 0;
+        for (let d = 0; d < dims; d++) out[i * dims + d] = readScalar(attr.data, v * dims + d);
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'FACE' && targetDomain === 'CORNER') {
+      const out = new Float32Array(size * dims);
+      for (let i = 0; i < mesh.numTris; i++) {
+        for (let corner = 0; corner < 3; corner++) {
+          const base = (i * 3 + corner) * dims;
+          for (let d = 0; d < dims; d++) out[base + d] = readScalar(attr.data, i * dims + d);
+        }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'CORNER' && targetDomain === 'POINT') {
+      const out = new Float32Array(size * dims);
+      const counts = new Uint32Array(size);
+      const t = mesh.triangles;
+      for (let i = 0; i < mesh.numCorners; i++) {
+        const v = t[i] ?? 0;
+        if (v >= size) continue;
+        for (let d = 0; d < dims; d++) out[(v * dims + d)]! += readScalar(attr.data, i * dims + d);
         counts[v] = (counts[v] ?? 0) + 1;
       }
-    }
-    for (let v = 0; v < size; v++) {
-      const c = (counts[v] ?? 0) || 1;
-      for (let d = 0; d < dims; d++) {
-        const idx = v * dims + d;
-        out[idx] = (out[idx] ?? 0) / c;
+      for (let v = 0; v < size; v++) {
+        const c = counts[v] || 1;
+        for (let d = 0; d < dims; d++) out[(v * dims + d)]! /= c;
       }
+      return convertKind(out, dims, outKind, size);
     }
-    return convertKind(out, dims, outKind, size);
-  }
-  if (attr.domain === 'POINT' && targetDomain === 'FACE') {
-    // Average the three vertex values of each triangle.
-    const out = new Float32Array(size * dims);
-    const t = mesh.triangles;
-    for (let i = 0; i < size; i++) {
-      for (let d = 0; d < dims; d++) {
-        const sum =
-          readScalar(attr.data, t[i * 3]! * dims + d) +
-          readScalar(attr.data, t[i * 3 + 1]! * dims + d) +
-          readScalar(attr.data, t[i * 3 + 2]! * dims + d);
-        out[i * dims + d] = sum / 3;
+    if (attr.domain === 'CORNER' && targetDomain === 'FACE') {
+      const out = new Float32Array(size * dims);
+      for (let i = 0; i < size; i++) {
+        for (let d = 0; d < dims; d++) {
+          const base = i * 3 * dims + d;
+          out[i * dims + d] = (
+            readScalar(attr.data, base) +
+            readScalar(attr.data, base + dims) +
+            readScalar(attr.data, base + dims * 2)
+          ) / 3;
+        }
       }
+      return convertKind(out, dims, outKind, size);
     }
-    return convertKind(out, dims, outKind, size);
   }
+
+  if (curves) {
+    if (attr.domain === 'CURVE' && targetDomain === 'POINT') {
+      const out = new Float32Array(size * dims);
+      for (let ci = 0; ci < curves.numCurves; ci++) {
+        const start = curves.curveOffsets[ci] ?? 0;
+        const end = curves.curveOffsets[ci + 1] ?? start;
+        for (let i = start; i < end; i++) {
+          for (let d = 0; d < dims; d++) out[i * dims + d] = readScalar(attr.data, ci * dims + d);
+        }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+    if (attr.domain === 'POINT' && targetDomain === 'CURVE') {
+      const out = new Float32Array(size * dims);
+      for (let ci = 0; ci < curves.numCurves; ci++) {
+        const start = curves.curveOffsets[ci] ?? 0;
+        const end = curves.curveOffsets[ci + 1] ?? start;
+        const count = Math.max(1, end - start);
+        for (let d = 0; d < dims; d++) {
+          let sum = 0;
+          for (let i = start; i < end; i++) sum += readScalar(attr.data, i * dims + d);
+          out[ci * dims + d] = sum / count;
+        }
+      }
+      return convertKind(out, dims, outKind, size);
+    }
+  }
+
   // Fallback: re-broadcast first N values.
   const out = allocFor(outKind, size);
   const minLen = Math.min(out.length, attr.data.length);
@@ -390,6 +469,9 @@ export function liftToField(value: unknown, hintKind: FieldKind = 'FLOAT'): Fiel
   if (Array.isArray(value)) {
     if (value.length === 4) return constField(value as number[], 'COLOR');
     return constField(value as number[], 'VECTOR');
+  }
+  if (value && typeof value === 'object' && 'euler' in (value as object) && Array.isArray((value as { euler?: unknown }).euler)) {
+    return constField([...(value as { euler: number[] }).euler], 'VECTOR');
   }
   return constField(0, hintKind);
 }

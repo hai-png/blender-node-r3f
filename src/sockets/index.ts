@@ -138,6 +138,17 @@ export class NodeSocketRotation extends NodeSocket<Rotation> {
   static override kind: SocketKind = 'ROTATION';
   static override color: RGBA = ROT_COLOR;
   override default_value: Rotation = { quat: [0, 0, 0, 1], euler: [0, 0, 0] };
+  override coerceFrom(other: NodeSocket): Rotation {
+    const v = other.value;
+    if (v && typeof v === 'object' && 'euler' in (v as object) && Array.isArray((v as Rotation).euler)) {
+      return v as Rotation;
+    }
+    if (Array.isArray(v) && v.length >= 3) {
+      return { quat: [0, 0, 0, 1], euler: [Number(v[0] ?? 0), Number(v[1] ?? 0), Number(v[2] ?? 0)] };
+    }
+    if (typeof v === 'number') return { quat: [0, 0, 0, 1], euler: [v, v, v] };
+    return { quat: [0, 0, 0, 1], euler: [0, 0, 0] };
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -189,6 +189,7 @@ export function storeAttributeOn(
   domain: import('../../core/types').AttributeDomain,
   dataType: 'FLOAT' | 'INT' | 'BOOL' | 'FLOAT_VECTOR' | 'FLOAT_COLOR',
   data: ScalarTypedArray,
+  selection?: ScalarTypedArray | null,
 ): Geometry {
   const out = geo.cloneOwning();
   const blenderToAttr = {
@@ -197,17 +198,42 @@ export function storeAttributeOn(
   } as const;
   const ourType = blenderToAttr[dataType];
   const size = out.domainSize(domain);
+  const dims = ourType === 'VECTOR' ? 3 : ourType === 'COLOR' ? 4 : 1;
+  const map = out.attributesForDomain(domain);
+  const existing = map?.get(name);
   // Use newAttribute to get the right typed array, then copy/overwrite
   // with our (already correctly sized) data.
   const a = newAttribute(name, domain, ourType, size);
-  const len = Math.min(a.data.length, data.length);
-  // Safe per-typedarray copy:
-  if (a.data.constructor === data.constructor) {
-    a.data.set(data.subarray(0, len) as never);
-  } else {
-    for (let i = 0; i < len; i++) (a.data as unknown as number[])[i] = (data[i] as number);
+  const dst = a.data;
+
+  // Seed from existing values when present so Selection can preserve untouched
+  // elements. Otherwise seed with zeros.
+  if (existing) {
+    const seedLen = Math.min(dst.length, existing.data.length);
+    if (dst.constructor === existing.data.constructor) {
+      dst.set(existing.data.subarray(0, seedLen) as never);
+    } else {
+      for (let i = 0; i < seedLen; i++) (dst as unknown as number[])[i] = existing.data[i] as number;
+    }
   }
-  const map = out.attributesForDomain(domain);
+
+  const sourceDims = Math.max(1, Math.round(data.length / Math.max(1, size)));
+  const logicalSize = Math.min(size, selection ? selection.length : size, Math.floor(data.length / Math.max(1, sourceDims)));
+  const writeConverted = (i: number): void => {
+    for (let d = 0; d < dims; d++) {
+      const srcIndex = i * sourceDims + Math.min(d, sourceDims - 1);
+      (dst as unknown as number[])[i * dims + d] = data[srcIndex] as number;
+    }
+  };
+  if (selection) {
+    for (let i = 0; i < logicalSize; i++) {
+      if (!(selection[i] as number)) continue;
+      writeConverted(i);
+    }
+  } else {
+    for (let i = 0; i < logicalSize; i++) writeConverted(i);
+  }
+
   if (map) map.set(name, a);
   return out;
 }
@@ -491,6 +517,7 @@ export function subdivisionSurface(geo: Geometry, levels: number): Geometry {
 export function meshToPoints(
   geo: Geometry,
   selection: ScalarTypedArray | null,
+  positionsOverride: Float32Array | null,
   radii: ScalarTypedArray | null,
   mode: 'VERTICES' | 'EDGES' | 'FACES' | 'CORNERS',
 ): Geometry {
@@ -498,55 +525,96 @@ export function meshToPoints(
   const m = geo.mesh;
   const out = new Geometry();
 
+  const pickPos = (logicalIndex: number, fallback: Vec3): Vec3 => {
+    if (!positionsOverride || positionsOverride.length < (logicalIndex + 1) * 3) return fallback;
+    return [
+      positionsOverride[logicalIndex * 3]!,
+      positionsOverride[logicalIndex * 3 + 1]!,
+      positionsOverride[logicalIndex * 3 + 2]!,
+    ];
+  };
+  const pickRadius = (logicalIndex: number): number => radii ? ((radii[logicalIndex] as number) ?? 0.05) : 0.05;
+  const selected = (logicalIndex: number): boolean => !selection || !!selection[logicalIndex];
+
   if (mode === 'VERTICES' || mode === 'CORNERS') {
-    const idxs: number[] = [];
-    for (let i = 0; i < m.numVerts; i++) if (!selection || selection[i]) idxs.push(i);
-    const positions = new Float32Array(idxs.length * 3);
-    const radiiArr = new Float32Array(idxs.length).fill(0.05);
-    for (let k = 0; k < idxs.length; k++) {
-      const v = idxs[k]!;
-      positions[k * 3]     = m.positions[v * 3]!;
-      positions[k * 3 + 1] = m.positions[v * 3 + 1]!;
-      positions[k * 3 + 2] = m.positions[v * 3 + 2]!;
-      if (radii) radiiArr[k] = (radii[v] as number) ?? 0.05;
+    const sourceCount = mode === 'VERTICES' ? m.numVerts : m.numCorners;
+    const positions = new Float32Array(sourceCount * 3);
+    const radiiArr = new Float32Array(sourceCount);
+    let outCount = 0;
+    if (mode === 'VERTICES') {
+      for (let i = 0; i < m.numVerts; i++) {
+        if (!selected(i)) continue;
+        const p = pickPos(i, [m.positions[i * 3]!, m.positions[i * 3 + 1]!, m.positions[i * 3 + 2]!]);
+        positions[outCount * 3] = p[0];
+        positions[outCount * 3 + 1] = p[1];
+        positions[outCount * 3 + 2] = p[2];
+        radiiArr[outCount] = pickRadius(i);
+        outCount++;
+      }
+    } else {
+      for (let i = 0; i < m.numCorners; i++) {
+        if (!selected(i)) continue;
+        const v = m.triangles[i] ?? 0;
+        const p = pickPos(i, [m.positions[v * 3]!, m.positions[v * 3 + 1]!, m.positions[v * 3 + 2]!]);
+        positions[outCount * 3] = p[0];
+        positions[outCount * 3 + 1] = p[1];
+        positions[outCount * 3 + 2] = p[2];
+        radiiArr[outCount] = pickRadius(i);
+        outCount++;
+      }
     }
-    out.points = new PointCloudComponent(positions, radiiArr);
+    out.points = new PointCloudComponent(positions.subarray(0, outCount * 3), radiiArr.subarray(0, outCount));
     return out;
   }
 
-  // FACES: one point per triangle (centroid)
   if (mode === 'FACES') {
-    const n = m.numTris;
-    const positions = new Float32Array(n * 3);
-    const radiiArr = new Float32Array(n).fill(0.05);
-    for (let i = 0; i < n; i++) {
+    const positions = new Float32Array(m.numTris * 3);
+    const radiiArr = new Float32Array(m.numTris);
+    let outCount = 0;
+    for (let i = 0; i < m.numTris; i++) {
+      if (!selected(i)) continue;
       const a = m.triangles[i * 3]! * 3, b = m.triangles[i * 3 + 1]! * 3, c = m.triangles[i * 3 + 2]! * 3;
-      positions[i * 3]     = (m.positions[a]!     + m.positions[b]!     + m.positions[c]!) / 3;
-      positions[i * 3 + 1] = (m.positions[a + 1]! + m.positions[b + 1]! + m.positions[c + 1]!) / 3;
-      positions[i * 3 + 2] = (m.positions[a + 2]! + m.positions[b + 2]! + m.positions[c + 2]!) / 3;
+      const centroid: Vec3 = [
+        (m.positions[a]! + m.positions[b]! + m.positions[c]!) / 3,
+        (m.positions[a + 1]! + m.positions[b + 1]! + m.positions[c + 1]!) / 3,
+        (m.positions[a + 2]! + m.positions[b + 2]! + m.positions[c + 2]!) / 3,
+      ];
+      const p = pickPos(i, centroid);
+      positions[outCount * 3] = p[0];
+      positions[outCount * 3 + 1] = p[1];
+      positions[outCount * 3 + 2] = p[2];
+      radiiArr[outCount] = pickRadius(i);
+      outCount++;
     }
-    out.points = new PointCloudComponent(positions, radiiArr);
+    out.points = new PointCloudComponent(positions.subarray(0, outCount * 3), radiiArr.subarray(0, outCount));
     return out;
   }
 
-  // EDGES: midpoint of each unique edge
-  const seen = new Set<string>();
+  // EDGES: midpoint of each unique edge. Selection/Position/Radius are in EDGE domain.
   const points: number[] = [];
+  const radiiOut: number[] = [];
+  const seen = new Map<string, number>();
   const t = m.triangles, p = m.positions;
+  let edgeIndex = 0;
   for (let i = 0; i < m.numTris; i++) {
     const a = t[i * 3]!, b = t[i * 3 + 1]!, c = t[i * 3 + 2]!;
     for (const [u, v] of [[a, b], [b, c], [c, a]] as [number, number][]) {
       const k = u < v ? `${u}_${v}` : `${v}_${u}`;
       if (seen.has(k)) continue;
-      seen.add(k);
-      points.push(
-        (p[u * 3]!     + p[v * 3]!)     / 2,
+      seen.set(k, edgeIndex++);
+      const midpoint: Vec3 = [
+        (p[u * 3]! + p[v * 3]!) / 2,
         (p[u * 3 + 1]! + p[v * 3 + 1]!) / 2,
         (p[u * 3 + 2]! + p[v * 3 + 2]!) / 2,
-      );
+      ];
+      const logicalIndex = seen.get(k)!;
+      if (!selected(logicalIndex)) continue;
+      const pos = pickPos(logicalIndex, midpoint);
+      points.push(pos[0], pos[1], pos[2]);
+      radiiOut.push(pickRadius(logicalIndex));
     }
   }
-  out.points = new PointCloudComponent(new Float32Array(points));
+  out.points = new PointCloudComponent(new Float32Array(points), new Float32Array(radiiOut));
   return out;
 }
 
@@ -586,6 +654,8 @@ export function distributePointsOnFaces(
   seed: number,
   method: 'RANDOM' | 'POISSON',
   distanceMin: number,
+  selection?: ScalarTypedArray | null,
+  densityFactor?: ScalarTypedArray | null,
 ): { points: Geometry; normals: Float32Array; rotations: Float32Array } {
   if (!geo.mesh) return { points: Geometry.empty(), normals: new Float32Array(), rotations: new Float32Array() };
   const m = geo.mesh;
@@ -593,14 +663,31 @@ export function distributePointsOnFaces(
   const faceNormals = m.faceNormals();
   const rng = makeRng(seed);
 
-  // Estimate total count then sample per face proportional to area.
-  const totalArea = areas.reduce((s, a) => s + a, 0);
-  const totalCount = Math.max(0, Math.round(totalArea * density));
+  const includedFaces: number[] = [];
+  let weightedArea = 0;
+  for (let f = 0; f < m.numTris; f++) {
+    if (selection && !(selection[f] as number)) continue;
+    const factor = densityFactor ? Math.max(0, Number(densityFactor[f] ?? 0)) : 1;
+    const weight = areas[f]! * factor;
+    if (weight <= 0) continue;
+    includedFaces.push(f);
+    weightedArea += weight;
+  }
+  if (includedFaces.length === 0 || weightedArea <= 1e-9) {
+    return { points: Geometry.empty(), normals: new Float32Array(), rotations: new Float32Array() };
+  }
+
+  // Estimate total count then sample per face proportional to selected,
+  // density-factor-weighted area.
+  const totalCount = Math.max(0, Math.round(weightedArea * Math.max(0, density)));
 
   const positions: number[] = [];
   const normalsOut: number[] = [];
-  for (let f = 0; f < m.numTris; f++) {
-    const facePts = Math.max(0, Math.round((areas[f]! / Math.max(totalArea, 1e-9)) * totalCount));
+  for (const f of includedFaces) {
+    const factor = densityFactor ? Math.max(0, Number(densityFactor[f] ?? 0)) : 1;
+    const faceWeight = areas[f]! * factor;
+    const facePts = Math.max(0, Math.round((faceWeight / Math.max(weightedArea, 1e-9)) * totalCount));
+    if (facePts === 0) continue;
     const a = m.triangles[f * 3]! * 3, b = m.triangles[f * 3 + 1]! * 3, c = m.triangles[f * 3 + 2]! * 3;
     const nx = faceNormals[f * 3]!, ny = faceNormals[f * 3 + 1]!, nz = faceNormals[f * 3 + 2]!;
     for (let k = 0; k < facePts; k++) {
@@ -652,6 +739,15 @@ export function distributePointsOnFaces(
     rotations[i * 3 + 1] = Math.atan2(-nx, Math.hypot(ny, nz));
     rotations[i * 3 + 2] = 0;
   }
+
+  // Store companion attributes on the emitted point cloud so downstream field
+  // consumers (e.g. Instance on Points.Rotation) can read them naturally.
+  pts.attributes.set('normal', {
+    name: 'normal', domain: 'POINT', dimensions: 3, data_type: 'VECTOR', data: new Float32Array(finalNormals),
+  });
+  pts.attributes.set('rotation', {
+    name: 'rotation', domain: 'POINT', dimensions: 3, data_type: 'VECTOR', data: rotations,
+  });
   return {
     points: out,
     normals: new Float32Array(finalNormals),
@@ -667,6 +763,8 @@ export function instanceOnPoints(
   pointsGeo: Geometry,
   instance: Geometry,
   selection: ScalarTypedArray | null,
+  pickInstance: boolean,
+  instanceIndex: ScalarTypedArray | null,
   rotations: Float32Array | null,
   scales: Float32Array | null,
 ): Geometry {
@@ -676,11 +774,22 @@ export function instanceOnPoints(
     new Float32Array();
   const n = pos.length / 3;
   const ic = new InstancesComponent();
-  if (instance.mesh || instance.curves || instance.points || instance.instances) {
-    ic.sources.push(instance.cloneOwning());
-  } else {
-    return new Geometry();
+
+  const candidates: Geometry[] = [];
+  if (pickInstance && instance.instances && instance.instances.items.length > 0) {
+    for (const item of instance.instances.items) {
+      const src = instance.instances.sources[item.source];
+      if (!src) continue;
+      const g = src.cloneOwning();
+      transformMatBaked(g, item.transform);
+      candidates.push(g);
+    }
+  } else if (instance.mesh || instance.curves || instance.points || instance.instances) {
+    candidates.push(instance.cloneOwning());
   }
+  if (candidates.length === 0) return new Geometry();
+  ic.sources.push(...candidates);
+
   for (let i = 0; i < n; i++) {
     if (selection && !selection[i]) continue;
     const t: Vec3 = [pos[i * 3]!, pos[i * 3 + 1]!, pos[i * 3 + 2]!];
@@ -690,7 +799,12 @@ export function instanceOnPoints(
     const s: Vec3 = scales
       ? [scales[i * 3]!, scales[i * 3 + 1]!, scales[i * 3 + 2]!]
       : [1, 1, 1];
-    ic.items.push({ source: 0, transform: composeMat4(t, r, s) });
+    let source = 0;
+    if (pickInstance && candidates.length > 1) {
+      const idx = instanceIndex ? Math.round(Number(instanceIndex[i] ?? 0)) : i;
+      source = ((idx % candidates.length) + candidates.length) % candidates.length;
+    }
+    ic.items.push({ source, transform: composeMat4(t, r, s) });
   }
   const out = new Geometry();
   out.instances = ic;
@@ -1219,7 +1333,7 @@ export function fillCurve(geo: Geometry): Geometry {
   return out;
 }
 
-export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Geometry {
+export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null, fillCaps = false): Geometry {
   if (!curveGeo.curves) return Geometry.empty();
   const c = curveGeo.curves;
   // No profile → emit a polyline mesh (edges only). We approximate with a
@@ -1231,7 +1345,18 @@ export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Ge
   }
   // With a profile: sweep the profile along each curve.
   const profile = profileGeo.curves;
-  const profilePts = profile.numPoints;
+  const profileStart = profile.curveOffsets[0] ?? 0;
+  const profileEnd = profile.curveOffsets[1] ?? profile.numPoints;
+  const profilePts = Math.max(0, profileEnd - profileStart);
+  const profilePoints3: Vec3[] = [];
+  for (let i = profileStart; i < profileEnd; i++) {
+    profilePoints3.push([
+      profile.positions[i * 3] ?? 0,
+      profile.positions[i * 3 + 1] ?? 0,
+      profile.positions[i * 3 + 2] ?? 0,
+    ]);
+  }
+  const capTris = fillCaps && profilePts >= 3 ? earClipPolygon(profilePoints3) : [];
   const verts: number[] = [];
   const tris: number[] = [];
 
@@ -1239,7 +1364,7 @@ export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Ge
     const start = c.curveOffsets[ci] ?? 0;
     const end = c.curveOffsets[ci + 1] ?? 0;
     const count = end - start;
-    if (count < 2) continue;
+    if (count < 2 || profilePts < 2) continue;
 
     const ringBase = verts.length / 3;
     for (let i = 0; i < count; i++) {
@@ -1268,9 +1393,10 @@ export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Ge
       // v = t x u
       const vx = ty * uz - tz * uy, vy = tz * ux - tx * uz, vz = tx * uy - ty * ux;
       for (let p = 0; p < profilePts; p++) {
-        const px = profile.positions[p * 3]!;
-        const py = profile.positions[p * 3 + 1]!;
-        const _pz = profile.positions[p * 3 + 2]!; void _pz;
+        const pi = profileStart + p;
+        const px = profile.positions[pi * 3]!;
+        const py = profile.positions[pi * 3 + 1]!;
+        const _pz = profile.positions[pi * 3 + 2]!; void _pz;
         // Place profile in (u,v) plane around the curve point.
         verts.push(
           ax + ux * px + vx * py,
@@ -1291,6 +1417,22 @@ export function curveToMesh(curveGeo: Geometry, profileGeo: Geometry | null): Ge
         tris.push(b, d, cIdx);
       }
     }
+    if (capTris.length > 0) {
+      const startRing = ringBase;
+      const endRing = ringBase + (count - 1) * profilePts;
+      for (let i = 0; i < capTris.length; i += 3) {
+        tris.push(
+          startRing + capTris[i]!,
+          startRing + capTris[i + 2]!,
+          startRing + capTris[i + 1]!,
+        );
+        tris.push(
+          endRing + capTris[i]!,
+          endRing + capTris[i + 1]!,
+          endRing + capTris[i + 2]!,
+        );
+      }
+    }
   }
 
   const out = new Geometry();
@@ -1307,6 +1449,9 @@ export function curveToPoints(
   if (!geo.curves) return Geometry.empty();
   const c = geo.curves;
   const positions: number[] = [];
+  const tangents: number[] = [];
+  const normals: number[] = [];
+  const rotations: number[] = [];
   for (let ci = 0; ci < c.numCurves; ci++) {
     const start = c.curveOffsets[ci] ?? 0;
     const end = c.curveOffsets[ci + 1] ?? 0;
@@ -1337,15 +1482,38 @@ export function curveToPoints(
       const segLen = (cumLen[seg + 1]! - cumLen[seg]!) || 1;
       const u = (t - cumLen[seg]!) / segLen;
       const a = start + seg, b = start + Math.min(seg + 1, n - 1);
-      positions.push(
-        c.positions[a * 3]!     * (1 - u) + c.positions[b * 3]!     * u,
-        c.positions[a * 3 + 1]! * (1 - u) + c.positions[b * 3 + 1]! * u,
-        c.positions[a * 3 + 2]! * (1 - u) + c.positions[b * 3 + 2]! * u,
+      const px = c.positions[a * 3]! * (1 - u) + c.positions[b * 3]! * u;
+      const py = c.positions[a * 3 + 1]! * (1 - u) + c.positions[b * 3 + 1]! * u;
+      const pz = c.positions[a * 3 + 2]! * (1 - u) + c.positions[b * 3 + 2]! * u;
+      positions.push(px, py, pz);
+      let tx = c.positions[b * 3]! - c.positions[a * 3]!;
+      let ty = c.positions[b * 3 + 1]! - c.positions[a * 3 + 1]!;
+      let tz = c.positions[b * 3 + 2]! - c.positions[a * 3 + 2]!;
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      tx /= tl; ty /= tl; tz /= tl;
+      tangents.push(tx, ty, tz);
+      const normal = stableCurveNormal(tx, ty, tz);
+      normals.push(normal[0], normal[1], normal[2]);
+      rotations.push(
+        Math.atan2(normal[1], normal[2] || 1e-9),
+        Math.atan2(-normal[0], Math.hypot(normal[1], normal[2])),
+        0,
       );
     }
   }
   const out = new Geometry();
   out.points = new PointCloudComponent(new Float32Array(positions));
+  if (out.points) {
+    out.points.attributes.set('tangent', {
+      name: 'tangent', domain: 'POINT', dimensions: 3, data_type: 'VECTOR', data: new Float32Array(tangents),
+    });
+    out.points.attributes.set('normal', {
+      name: 'normal', domain: 'POINT', dimensions: 3, data_type: 'VECTOR', data: new Float32Array(normals),
+    });
+    out.points.attributes.set('rotation', {
+      name: 'rotation', domain: 'POINT', dimensions: 3, data_type: 'VECTOR', data: new Float32Array(rotations),
+    });
+  }
   return out;
 }
 
@@ -1354,6 +1522,7 @@ export function resampleCurve(
   mode: 'EVALUATED' | 'COUNT' | 'LENGTH',
   count: number,
   length: number,
+  selection?: ScalarTypedArray | null,
 ): Geometry {
   if (!geo.curves) return geo;
   const c = geo.curves;
@@ -1366,7 +1535,16 @@ export function resampleCurve(
     const start = c.curveOffsets[ci] ?? 0;
     const end = c.curveOffsets[ci + 1] ?? 0;
     const n = end - start;
-    if (n < 2) continue;
+    const selected = !selection || !!selection[ci];
+    if (n < 2 || !selected) {
+      for (let i = start; i < end; i++) {
+        newPositions.push(c.positions[i * 3] ?? 0, c.positions[i * 3 + 1] ?? 0, c.positions[i * 3 + 2] ?? 0);
+      }
+      newOffsets.push(newPositions.length / 3);
+      newCyclic.push(c.cyclic[ci] ?? 0);
+      newRes.push(c.resolution[ci] ?? 12);
+      continue;
+    }
 
     const cumLen: number[] = [0];
     for (let i = 1; i < n; i++) {
@@ -1376,7 +1554,15 @@ export function resampleCurve(
       cumLen.push(cumLen[i - 1]! + Math.hypot(dx, dy, dz));
     }
     const totalLen = cumLen[n - 1]!;
-    if (totalLen < 1e-9) continue;
+    if (totalLen < 1e-9) {
+      for (let i = start; i < end; i++) {
+        newPositions.push(c.positions[i * 3] ?? 0, c.positions[i * 3 + 1] ?? 0, c.positions[i * 3 + 2] ?? 0);
+      }
+      newOffsets.push(newPositions.length / 3);
+      newCyclic.push(c.cyclic[ci] ?? 0);
+      newRes.push(c.resolution[ci] ?? 12);
+      continue;
+    }
 
     let samples: number;
     if (mode === 'EVALUATED') samples = n;
@@ -1402,7 +1588,6 @@ export function resampleCurve(
     newRes.push(c.resolution[ci] ?? 12);
   }
 
-  
   const out = geo.copy();
   out.curves = new CurvesComponent(
     new Float32Array(newPositions),
@@ -1413,7 +1598,7 @@ export function resampleCurve(
   return out;
 }
 
-export function reverseCurve(geo: Geometry): Geometry {
+export function reverseCurve(geo: Geometry, selection?: ScalarTypedArray | null): Geometry {
   if (!geo.curves) return geo;
   const c = geo.curves;
   const positions = new Float32Array(c.positions.length);
@@ -1421,8 +1606,10 @@ export function reverseCurve(geo: Geometry): Geometry {
     const start = c.curveOffsets[ci] ?? 0;
     const end = c.curveOffsets[ci + 1] ?? 0;
     const n = end - start;
+    const selected = !selection || !!selection[ci];
     for (let i = 0; i < n; i++) {
-      const src = (start + (n - 1 - i)) * 3;
+      const srcIndex = selected ? (start + (n - 1 - i)) : (start + i);
+      const src = srcIndex * 3;
       const dst = (start + i) * 3;
       positions[dst]     = c.positions[src]!;
       positions[dst + 1] = c.positions[src + 1]!;
@@ -1430,7 +1617,7 @@ export function reverseCurve(geo: Geometry): Geometry {
     }
   }
   const out = geo.copy();
-  
+
   out.curves = new CurvesComponent(
     positions,
     new Uint32Array(c.curveOffsets),
@@ -1462,11 +1649,100 @@ export function sampleNearestIndex(geo: Geometry, sample: Vec3): number {
   return best;
 }
 
+function closestPointSegment(p: Vec3, a: Vec3, b: Vec3): Vec3 {
+  const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+  const apx = p[0] - a[0], apy = p[1] - a[1], apz = p[2] - a[2];
+  const denom = abx * abx + aby * aby + abz * abz;
+  const t = denom > 1e-12 ? Math.max(0, Math.min(1, (apx * abx + apy * aby + apz * abz) / denom)) : 0;
+  return [a[0] + abx * t, a[1] + aby * t, a[2] + abz * t];
+}
+
+function closestPointTriangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3): Vec3 {
+  const ab: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  const ac: Vec3 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+  const ap: Vec3 = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+  const d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+  const d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+  if (d1 <= 0 && d2 <= 0) return a;
+
+  const bp: Vec3 = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
+  const d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+  const d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+  if (d3 >= 0 && d4 <= d3) return b;
+
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+    const v = d1 / (d1 - d3);
+    return [a[0] + ab[0] * v, a[1] + ab[1] * v, a[2] + ab[2] * v];
+  }
+
+  const cp: Vec3 = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+  const d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+  const d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+  if (d6 >= 0 && d5 <= d6) return c;
+
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+    const w = d2 / (d2 - d6);
+    return [a[0] + ac[0] * w, a[1] + ac[1] * w, a[2] + ac[2] * w];
+  }
+
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+    const e: Vec3 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+    const w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+    return [b[0] + e[0] * w, b[1] + e[1] * w, b[2] + e[2] * w];
+  }
+
+  const denom = 1 / (va + vb + vc);
+  const v = vb * denom;
+  const w = vc * denom;
+  return [
+    a[0] + ab[0] * v + ac[0] * w,
+    a[1] + ab[1] * v + ac[1] * w,
+    a[2] + ab[2] * v + ac[2] * w,
+  ];
+}
+
 export function geometryProximity(geo: Geometry, sample: Vec3): { position: Vec3; distance: number } {
-  const pos =
-    geo.mesh?.positions ??
-    geo.curves?.positions ??
-    geo.points?.positions;
+  let best: Vec3 = [0, 0, 0];
+  let bestD = Infinity;
+
+  if (geo.mesh && geo.mesh.numTris > 0) {
+    const p = geo.mesh.positions;
+    const t = geo.mesh.triangles;
+    for (let i = 0; i < geo.mesh.numTris; i++) {
+      const ai = t[i * 3]! * 3, bi = t[i * 3 + 1]! * 3, ci = t[i * 3 + 2]! * 3;
+      const a: Vec3 = [p[ai]!, p[ai + 1]!, p[ai + 2]!];
+      const b: Vec3 = [p[bi]!, p[bi + 1]!, p[bi + 2]!];
+      const c: Vec3 = [p[ci]!, p[ci + 1]!, p[ci + 2]!];
+      const q = closestPointTriangle(sample, a, b, c);
+      const d = Math.hypot(q[0] - sample[0], q[1] - sample[1], q[2] - sample[2]);
+      if (d < bestD) { bestD = d; best = q; }
+    }
+    return { position: best, distance: bestD };
+  }
+
+  if (geo.curves && geo.curves.numPoints > 1) {
+    const c = geo.curves;
+    for (let ci = 0; ci < c.numCurves; ci++) {
+      const start = c.curveOffsets[ci] ?? 0;
+      const end = c.curveOffsets[ci + 1] ?? start;
+      const cyclic = !!c.cyclic[ci];
+      for (let i = start; i < end - 1 + (cyclic ? 1 : 0); i++) {
+        const aIdx = i;
+        const bIdx = (i + 1 < end) ? i + 1 : start;
+        const a: Vec3 = [c.positions[aIdx * 3]!, c.positions[aIdx * 3 + 1]!, c.positions[aIdx * 3 + 2]!];
+        const b: Vec3 = [c.positions[bIdx * 3]!, c.positions[bIdx * 3 + 1]!, c.positions[bIdx * 3 + 2]!];
+        const q = closestPointSegment(sample, a, b);
+        const d = Math.hypot(q[0] - sample[0], q[1] - sample[1], q[2] - sample[2]);
+        if (d < bestD) { bestD = d; best = q; }
+      }
+    }
+    return { position: best, distance: bestD };
+  }
+
+  const pos = geo.points?.positions ?? geo.mesh?.positions;
   if (!pos) return { position: [0, 0, 0], distance: 0 };
   const idx = sampleNearestIndex(geo, sample);
   const x = pos[idx * 3]!, y = pos[idx * 3 + 1]!, z = pos[idx * 3 + 2]!;
@@ -1479,6 +1755,23 @@ export function geometryProximity(geo: Geometry, sample: Vec3): { position: Vec3
 /* ------------------------------------------------------------------ */
 /*  Matrix helpers                                                    */
 /* ------------------------------------------------------------------ */
+
+export function translationMat4(t: Vec3): Float32Array {
+  const m = new Float32Array(16);
+  m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
+  m[12] = t[0]; m[13] = t[1]; m[14] = t[2];
+  return m;
+}
+
+export function scaleMat4(s: Vec3): Float32Array {
+  const m = new Float32Array(16);
+  m[0] = s[0]; m[5] = s[1]; m[10] = s[2]; m[15] = 1;
+  return m;
+}
+
+export function rotationMat4(r: Vec3): Float32Array {
+  return composeMat4([0, 0, 0], r, [1, 1, 1]);
+}
 
 /** Returns a column-major mat4 = T * R(XYZ) * S. */
 export function composeMat4(t: Vec3, r: Vec3, s: Vec3): Float32Array {
@@ -1510,15 +1803,40 @@ export function mat4Mul(a: Float32Array, b: Float32Array): Float32Array {
   return o;
 }
 
+export function transformAroundPivotMat4(transform: Float32Array, pivot: Vec3): Float32Array {
+  return mat4Mul(
+    translationMat4(pivot),
+    mat4Mul(transform, translationMat4([-pivot[0], -pivot[1], -pivot[2]])),
+  );
+}
+
+export function transformInstances(
+  geo: Geometry,
+  selection: ScalarTypedArray | null,
+  transform: Float32Array,
+  localSpace: boolean,
+): Geometry {
+  const out = geo.cloneOwning();
+  if (!out.instances) return out;
+  for (let i = 0; i < out.instances.items.length; i++) {
+    if (selection && !selection[i]) continue;
+    const it = out.instances.items[i]!;
+    it.transform = localSpace ? mat4Mul(it.transform, transform) : mat4Mul(transform, it.transform);
+  }
+  return out;
+}
+
 /**
- * Flip Faces — reverse the winding of every triangle (swap two indices per
- * triangle), inverting face normals. Selection-aware variant left for later.
+ * Flip Faces — reverse the winding of selected triangles (or all when no
+ * selection mask is supplied), inverting face normals.
  */
-export function flipFaces(geo: Geometry): Geometry {
+export function flipFaces(geo: Geometry, selection?: ScalarTypedArray | null): Geometry {
   const out = geo.cloneOwning();
   if (out.mesh) {
     const tris = out.mesh.triangles;
     for (let i = 0; i + 2 < tris.length; i += 3) {
+      const face = i / 3;
+      if (selection && !selection[face]) continue;
       const tmp = tris[i + 1]!;
       tris[i + 1] = tris[i + 2]!;
       tris[i + 2] = tmp;

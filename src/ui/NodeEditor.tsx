@@ -29,7 +29,7 @@ import { BlenderNodeView } from './BlenderNode';
 import { useTreeStore } from './store';
 import { AddMenu } from './AddMenu';
 import type { Node as BNode } from '../core/Node';
-import { History, autoLayout } from './operators';
+import { History, autoLayout, makeGroup, ungroup } from './operators';
 import { NodeRegistry } from '../registry/NodeRegistry';
 import type { NodeTreeKind } from '../core/types';
 
@@ -306,7 +306,30 @@ function OperatorBar({ tree, history, selectedNodeIds, setSelected, setTree }: O
         history.push(tree); autoLayout(tree); bump();
       }}>⊞ Auto-Layout</button>
       <button
-        style={selectedNodes.length >= 2 ? btn : disabledBtn}
+        style={selectedNodes.length > 0 ? btn : disabledBtn}
+        title="Group selected nodes"
+        onClick={() => {
+          if (selectedNodes.length === 0) return;
+          history.push(tree);
+          const { container } = makeGroup(tree, selectedNodes, getGroupCtors(tree));
+          setSelected([container.id]);
+          bump();
+        }}
+      >⬚ Group</button>
+      <button
+        style={(selectedNodes.length === 1 && (selectedNodes[0] as { resolvedTree?: unknown } | undefined)?.resolvedTree) ? btn : disabledBtn}
+        title="Ungroup selected group node"
+        onClick={() => {
+          const selected = selectedNodes[0] as (BNode & { resolvedTree?: unknown }) | undefined;
+          if (!selected?.resolvedTree) return;
+          history.push(tree);
+          const inlined = ungroup(tree, selected);
+          setSelected(inlined.map((n: BNode) => n.id));
+          bump();
+        }}
+      >⇤ Ungroup</button>
+      <button
+        style={selectedNodes.length >= 1 ? btn : disabledBtn}
         title="Mute selected (M)"
         onClick={() => {
           if (selectedNodes.length === 0) return;
@@ -338,11 +361,17 @@ function getGroupCtors(tree: import('../core/NodeTree').NodeTree) {
     : kind === 'GeometryNodeTree' ? 'Geometry'
     : kind === 'CompositorNodeTree' ? 'Compositor'
     : 'Texture';
+  const groupContainer = NodeRegistry.getNode(`${prefix}NodeGroup`);
+  const groupInput = NodeRegistry.getNode('NodeGroupInput');
+  const groupOutput = NodeRegistry.getNode('NodeGroupOutput');
+  if (!groupContainer || !groupInput || !groupOutput) {
+    throw new Error(`Missing group node constructors for ${kind}. Call bootstrapBuiltins() first.`);
+  }
   return {
     childTree: tree.constructor as new (name?: string) => import('../core/NodeTree').NodeTree,
-    groupContainer: NodeRegistry.getNode(`${prefix}NodeGroup`) ?? (() => class {} as unknown as new () => import('../core/Node').Node),
-    groupInput: NodeRegistry.getNode('NodeGroupInput') ?? (() => class {} as unknown as new () => import('../core/Node').Node),
-    groupOutput: NodeRegistry.getNode('NodeGroupOutput') ?? (() => class {} as unknown as new () => import('../core/Node').Node),
+    groupContainer: groupContainer as new () => import('../core/Node').Node,
+    groupInput: groupInput as new () => import('../core/Node').Node,
+    groupOutput: groupOutput as new () => import('../core/Node').Node,
   };
 }
 
