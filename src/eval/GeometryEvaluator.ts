@@ -113,6 +113,11 @@ import {
   GeometryNodeSetCurveRadius, GeometryNodeSetCurveTilt,
   GeometryNodeSetSplineCyclic, GeometryNodeSetSplineResolution,
 } from '../nodes/geometry/CurveRead';
+import {
+  GeometryNodeSetMaterial, GeometryNodeSetMaterialIndex,
+  GeometryNodeMaterialIndex, GeometryNodeMaterialSelection,
+  GeometryNodeReplaceMaterial,
+} from '../nodes/geometry/MaterialNodes';
 import { runZone, type ZoneEvalContext } from './zones/ZoneRunner';
 import type { ZoneIterContext } from './zones/types';
 
@@ -691,6 +696,82 @@ export class GeometryEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, flipFaces(geo, selV));
       return;
     }
+
+    /* ---- Material nodes ---- */
+    if (node instanceof GeometryNodeSetMaterialIndex) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const selField = this.socketField(node.inputs[1]!, cache);
+      const idxField = this.socketField(node.inputs[2]!, cache);
+      const nFaces = geo.domainSize('FACE');
+      const selArr = this.fieldOnDomain(selField, geo, 'FACE');
+      const idxArr = this.fieldOnDomain(idxField, geo, 'FACE');
+      const matIdx = new Int32Array(nFaces);
+      const existing = geo.mesh?.attributes.get('material_index');
+      for (let i = 0; i < nFaces; i++) {
+        const prev = existing ? (existing.data as ArrayLike<number>)[i] ?? 0 : 0;
+        matIdx[i] = selArr[i] ? (idxArr[i] as number) : prev;
+      }
+      cache.set(node.outputs[0]!.id, storeAttributeOn(geo, 'material_index', 'FACE', 'INT', matIdx));
+      return;
+    }
+    if (node instanceof GeometryNodeSetMaterial) {
+      // In our model, Set Material with a material ref sets material_index=0
+      // for all selected faces (the host resolves the actual material).
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const selField = this.socketField(node.inputs[1]!, cache);
+      const nFaces = geo.domainSize('FACE');
+      const selArr = this.fieldOnDomain(selField, geo, 'FACE');
+      const matIdx = new Int32Array(nFaces);
+      const existing = geo.mesh?.attributes.get('material_index');
+      for (let i = 0; i < nFaces; i++) {
+        const prev = existing ? (existing.data as ArrayLike<number>)[i] ?? 0 : 0;
+        matIdx[i] = selArr[i] ? 0 : prev;
+      }
+      cache.set(node.outputs[0]!.id, storeAttributeOn(geo, 'material_index', 'FACE', 'INT', matIdx));
+      return;
+    }
+    if (node instanceof GeometryNodeReplaceMaterial) {
+      // Pass geometry through unchanged — material resolution is on the host
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, geo);
+      return;
+    }
+    if (node instanceof GeometryNodeMaterialIndex) {
+      // Field: reads material_index attribute from FACE domain
+      const field: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const attr = ctx.geometry.mesh?.attributes.get('material_index');
+          if (attr && attr.domain === 'FACE') {
+            return interpolateAttribute(attr, ctx.geometry, ctx.domain, ctx.size, 'INT');
+          }
+          return new Int32Array(ctx.size); // default 0
+        },
+      };
+      cache.set(node.outputs[0]!.id, field);
+      return;
+    }
+    if (node instanceof GeometryNodeMaterialSelection) {
+      const targetIdx = (node as GeometryNodeMaterialSelection).material_index;
+      const field: Field = {
+        kind: 'BOOL',
+        eval(ctx) {
+          const attr = ctx.geometry.mesh?.attributes.get('material_index');
+          const out = new Uint8Array(ctx.size);
+          if (attr && attr.domain === 'FACE') {
+            const src = interpolateAttribute(attr, ctx.geometry, ctx.domain, ctx.size, 'INT');
+            for (let i = 0; i < ctx.size; i++) out[i] = (src[i] as number) === targetIdx ? 1 : 0;
+          } else {
+            // No material_index → everything is index 0
+            for (let i = 0; i < ctx.size; i++) out[i] = targetIdx === 0 ? 1 : 0;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, field);
+      return;
+    }
+
     if (node instanceof GeometryNodeAttributeDomainSize) {
       const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
       const cnt = (d: AttributeDomain): Field => constField(geo.domainSize(d), 'INT');

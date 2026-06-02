@@ -193,6 +193,20 @@ export function ColorProperty(opts: ColorPropertyOpts = {}): ColorProperty {
   return { kind: 'COLOR', default: def, name: opts.name, description: opts.description, update: opts.update };
 }
 
+export interface PointerPropertyOpts {
+  type: unknown;
+  name?: string;
+  description?: string;
+  update?: (node: Node) => void;
+}
+export interface PointerProperty extends BaseProperty<unknown> {
+  kind: 'POINTER';
+  type: unknown;
+}
+export function PointerProperty(opts: PointerPropertyOpts): PointerProperty {
+  return { kind: 'POINTER', default: null, type: opts.type, name: opts.name, description: opts.description, update: opts.update };
+}
+
 export type PropertyDescriptor =
   | FloatProperty
   | IntProperty
@@ -200,6 +214,7 @@ export type PropertyDescriptor =
   | StringProperty
   | EnumProperty
   | VectorProperty
-  | ColorProperty;
+  | ColorProperty
+  | PointerProperty;
 
 export type PropertyMap = Record<string, PropertyDescriptor>;

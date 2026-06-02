@@ -209,10 +209,6 @@ export class NodeTree {
 }
 ```
 
-> **Note (Phase 1 truth-alignment):** `invalidateFrom(node)` no longer exists.
-> Use `tree.depsgraph.invalidate(node)` instead — the depsgraph owns dirty tracking.
-> The evaluator is **injected** via `depsgraph.setEvaluator(ev)` rather than
-> selected automatically from `tree.bl_idname`. See §8 below.
 
 ## 6. `NodeTreeInterface`
 
@@ -286,9 +282,6 @@ host via `depsgraph.setEvaluator(ev)` — it is NOT auto-selected from
 path at runtime. Evaluation is scheduled via `queueMicrotask` so multiple
 synchronous edits coalesce into one evaluation tick.
 
-> **Current limitation (Phase 1):** evaluators perform full-tree re-traversal on
-> every `evaluate()` call. The `dirty` set is tracked and passed to the evaluator
-> but not yet exploited for incremental execution (Phase 3 work).
 
 ## 9. Per-system evaluators
 
@@ -454,4 +447,3 @@ Node 20+ required.
 
 ---
 
-See `ROADMAP.md` for the build-out order.

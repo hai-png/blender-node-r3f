@@ -143,8 +143,14 @@ export class NodeSocketRotation extends NodeSocket<Rotation> {
     if (v && typeof v === 'object' && 'euler' in (v as object) && Array.isArray((v as Rotation).euler)) {
       return v as Rotation;
     }
-    if (Array.isArray(v) && v.length >= 3) {
-      return { quat: [0, 0, 0, 1], euler: [Number(v[0] ?? 0), Number(v[1] ?? 0), Number(v[2] ?? 0)] };
+    if (Array.isArray(v)) {
+      // A 4-element numeric array is a quaternion [x, y, z, w].
+      if (v.length === 4 && v.every((x) => typeof x === 'number')) {
+        return { quat: [Number(v[0]), Number(v[1]), Number(v[2]), Number(v[3])] as Vec4, euler: [0, 0, 0] };
+      }
+      if (v.length >= 3) {
+        return { quat: [0, 0, 0, 1], euler: [Number(v[0] ?? 0), Number(v[1] ?? 0), Number(v[2] ?? 0)] };
+      }
     }
     if (typeof v === 'number') return { quat: [0, 0, 0, 1], euler: [v, v, v] };
     return { quat: [0, 0, 0, 1], euler: [0, 0, 0] };

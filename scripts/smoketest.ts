@@ -3520,6 +3520,158 @@ test('matte: bootstrap registers all 4 matte nodes', () => {
 });
 
 // ------------------------------ Runner ----------------------------------
+/* ================================================================ */
+/*  Phase A fixes — rotation coerce, PointerProperty, TSL curves    */
+/* ================================================================ */
+
+import { NodeSocketRotation, type Rotation } from '../src/sockets';
+import { PointerProperty } from '../src/core/Properties';
+import { ShaderNodeFloatCurve } from '../src/nodes/common/Curves';
+
+test('fix: NodeSocketRotation coerces 4-element array as quaternion', () => {
+  const sock = new NodeSocketRotation();
+  sock.init({ name: 'R' });
+  // Simulate a quaternion array [x, y, z, w] arriving from upstream
+  const other = new NodeSocketRotation();
+  other.value = [0.1, 0.2, 0.3, 0.9] as unknown as Rotation;
+  const result = sock.coerceFrom(other as any);
+  assert(Array.isArray(result.quat), 'quat should be an array');
+  close(result.quat[0], 0.1, 0.01, 'quat x');
+  close(result.quat[1], 0.2, 0.01, 'quat y');
+  close(result.quat[2], 0.3, 0.01, 'quat z');
+  close(result.quat[3], 0.9, 0.01, 'quat w');
+});
+
+test('fix: NodeSocketRotation coerces 3-element array as euler', () => {
+  const sock = new NodeSocketRotation();
+  sock.init({ name: 'R' });
+  const other = new NodeSocketRotation();
+  other.value = [1.0, 2.0, 3.0] as unknown as Rotation;
+  const result = sock.coerceFrom(other as any);
+  close(result.euler[0], 1.0, 0.01, 'euler x');
+  close(result.euler[1], 2.0, 0.01, 'euler y');
+  close(result.euler[2], 3.0, 0.01, 'euler z');
+});
+
+test('fix: PointerProperty is exported from core Properties', () => {
+  assert(typeof PointerProperty === 'function', 'PointerProperty should be a function');
+  const prop = PointerProperty({ type: String });
+  eq(prop.kind, 'POINTER');
+  eq(prop.default, null);
+  eq(prop.type, String);
+});
+
+test('fix: Curve nodes are registered on all expected trees', () => {
+  const cls = NodeRegistry.getNode('ShaderNodeFloatCurve');
+  assert(!!cls, 'ShaderNodeFloatCurve should be registered');
+  const cls2 = NodeRegistry.getNode('ShaderNodeVectorCurve');
+  assert(!!cls2, 'ShaderNodeVectorCurve should be registered');
+  const cls3 = NodeRegistry.getNode('ShaderNodeRGBCurve');
+  assert(!!cls3, 'ShaderNodeRGBCurve should be registered');
+});
+
+test('fix: legacy ShaderEvaluator Curves dispatch returns meaningful descriptor', () => {
+  const tree = new ShaderNodeTree('CurveShaderTest');
+  const OutputCls = NodeRegistry.getNode('ShaderNodeOutputMaterial')!;
+  const PrincipledCls = NodeRegistry.getNode('ShaderNodeBsdfPrincipled')!;
+  const FloatCurveCls = NodeRegistry.getNode('ShaderNodeFloatCurve')!;
+
+  const output = tree.addNode(OutputCls as any);
+  const principled = tree.addNode(PrincipledCls as any);
+  const curveFn = tree.addNode(FloatCurveCls as any);
+
+  // Connect: FloatCurve.Value → Principled.Roughness, Principled.BSDF → Output.Surface
+  const roughIn = principled.inputs.find(s => s.name === 'Roughness')!;
+  const curveOut = curveFn.outputs.find(s => s.name === 'Value')!;
+  tree.addLink(curveOut, roughIn);
+
+  const bsdfOut = principled.outputs[0]!;
+  const surfIn = output.inputs[0]!;
+  tree.addLink(bsdfOut, surfIn);
+
+  const ev = new ShaderEvaluator();
+  const result = ev.evaluate(tree, new Set(tree.nodes));
+  const desc = result.output as MaterialDescriptor;
+  assert(typeof desc.roughness === 'number', 'should produce a roughness value');
+  tree.dispose();
+});
+
+test('fix: build count is >= 210 after all hygiene fixes', () => {
+  assert(NodeRegistry.listAllNodes().length >= 210, `expected >= 210 registered nodes, got ${NodeRegistry.listAllNodes().length}`);
+});
+
+/* ================================================================ */
+/*  Material nodes                                                    */
+/* ================================================================ */
+
+import {
+  GeometryNodeSetMaterialIndex, GeometryNodeMaterialIndex,
+  GeometryNodeMaterialSelection, GeometryNodeSetMaterial,
+  GeometryNodeReplaceMaterial,
+} from '../src/nodes/geometry/MaterialNodes';
+
+test('material: SetMaterialIndex writes material_index on faces', () => {
+  const tree = new GeometryNodeTree('MatIdxTest');
+  tree.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = tree.addNode(GeometryNodeMeshCube);
+  const setIdx = tree.addNode(GeometryNodeSetMaterialIndex);
+  const gout = tree.addNode(NodeGroupOutput);
+  gout.refreshFromInterface(tree);
+
+  // Set material index to 3
+  setIdx.inputs[2]!.default_value = 3;
+
+  tree.addLink(cube.outputs[0]!, setIdx.inputs[0]!);
+  tree.addLink(setIdx.outputs[0]!, gout.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
+  const result = ev.evaluate(tree, new Set(tree.nodes));
+  const geo = result.output as Geometry;
+  const attr = geo.mesh?.attributes.get('material_index');
+  assert(!!attr, 'should have material_index attribute');
+  eq(attr!.domain, 'FACE');
+  // All faces should have index 3
+  for (let i = 0; i < attr!.data.length; i++) {
+    eq(attr!.data[i] as number, 3);
+  }
+  tree.dispose();
+});
+
+test('material: MaterialIndex field reads per-face material_index', () => {
+  const tree = new GeometryNodeTree('MatIdxFieldTest');
+  tree.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = tree.addNode(GeometryNodeMeshCube);
+  const setIdx = tree.addNode(GeometryNodeSetMaterialIndex);
+  const gout = tree.addNode(NodeGroupOutput);
+  gout.refreshFromInterface(tree);
+
+  setIdx.inputs[2]!.default_value = 7;
+  tree.addLink(cube.outputs[0]!, setIdx.inputs[0]!);
+  tree.addLink(setIdx.outputs[0]!, gout.inputs[0]!);
+
+  const ev = new GeometryEvaluator();
+  const result = ev.evaluate(tree, new Set(tree.nodes));
+  // MaterialIndex should be registered
+  assert(!!NodeRegistry.getNode('GeometryNodeMaterialIndex'), 'MaterialIndex should be registered');
+  tree.dispose();
+});
+
+test('material: MaterialSelection field matches target index', () => {
+  assert(!!NodeRegistry.getNode('GeometryNodeMaterialSelection'), 'MaterialSelection should be registered');
+  assert(!!NodeRegistry.getNode('GeometryNodeSetMaterial'), 'SetMaterial should be registered');
+  assert(!!NodeRegistry.getNode('GeometryNodeReplaceMaterial'), 'ReplaceMaterial should be registered');
+});
+
+test('material: all 5 material nodes are registered', () => {
+  for (const id of [
+    'GeometryNodeSetMaterial', 'GeometryNodeSetMaterialIndex',
+    'GeometryNodeMaterialIndex', 'GeometryNodeMaterialSelection',
+    'GeometryNodeReplaceMaterial',
+  ]) {
+    assert(!!NodeRegistry.getNode(id), `${id} should be registered`);
+  }
+});
+
 let passed = 0, failed = 0;
 const fails: string[] = [];
 (async () => {

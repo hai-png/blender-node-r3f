@@ -1,6 +1,6 @@
 /**
  * Cross-cutting types for the zone subsystem.
- * See docs/M4_ZONES.md.
+ * See docs/ARCHITECTURE.md §10 and docs/RESEARCH.md §6 for the zone design.
  */
 import type { AttributeDomain } from '../../core/types';
 

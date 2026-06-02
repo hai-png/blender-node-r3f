@@ -2,7 +2,7 @@
 
 A **Blender-compatible node system** for three.js + react-three-fiber. Mirrors `bpy.types.Node`, `NodeSocket`, `NodeTree`, `NodeTreeInterface`, `bpy.props.*`, `bpy.utils.register_class`, and `nodeitems_utils` closely enough that Blender Python addons that ship as node-group `.blend` files can be **ported** to TypeScript with minimal *structural* change. Porting is mechanical but **manual** — there is no automatic Python→TS translator; class structure transliterates 1:1 and per-node behaviour is supplied by an `executeGeo(ctx)` hook (see [`examples/falloff_addon.ts`](examples/falloff_addon.ts)).
 
-> **Status**: broad **M0–M8 prototype/subset implemented**, with active gap-closure in progress. All four node systems (Shader/Geometry/Compositor/Texture) evaluate, including **recursive node groups in every system**, node **mute**, **reroute**, interface reactivity, an M5-style **compositor** WebGL pipeline (+ a headless CPU pixel evaluator), the **texture** sampler graph with `DataTexture` baking, geometry **field utilities**, a worked **ported-addon example** through the `bpy` shim, and headless editor **operators** (undo/redo, make-group/ungroup, auto-layout). **176 unique node classes** register at runtime. **108 headless smoke tests pass; strict `tsc` clean; `vite build` clean.** Current baseline and gaps are documented in [`docs/PHASE0_AUDIT_2026-06-02.md`](docs/PHASE0_AUDIT_2026-06-02.md). Note: the depsgraph tracks dirtiness, but evaluators still perform **full-tree re-evaluation** per `evaluate()` call; true incremental execution remains future work.
+> **Status**: broad **M0–M8 prototype/subset implemented**, with active gap-closure in progress. All four node systems (Shader/Geometry/Compositor/Texture) evaluate, including **recursive node groups in every system**, node **mute**, **reroute**, interface reactivity, an M5-style **compositor** WebGL pipeline (+ a headless CPU pixel evaluator), the **texture** sampler graph with `DataTexture` baking, geometry **field utilities**, a worked **ported-addon example** through the `bpy` shim, and headless editor **operators** (undo/redo, make-group/ungroup, auto-layout). **215 unique node classes** register at runtime. **168 headless smoke tests pass; strict `tsc` clean; `vite build` clean.** Current baseline and gaps are documented in [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`analysis/COMPREHENSIVE_AUDIT.md`](analysis/COMPREHENSIVE_AUDIT.md). Note: the depsgraph tracks dirtiness; Geometry and Shader evaluators exploit per-node persistent caches for incremental skip, but Compositor and Texture re-plan/re-execute each call. True topological dirty-set propagation remains future work.
 
 ## Documents
 
@@ -10,8 +10,8 @@ A **Blender-compatible node system** for three.js + react-three-fiber. Mirrors `
 |---|---|
 | [`docs/RESEARCH.md`](docs/RESEARCH.md) | Deep research into Blender's node system — data model, evaluation per system, group nodes, zones, sockets, field model, references. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Concrete TypeScript architecture mapping every Blender concept onto our modules. |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone plan (M0 → M8). |
-| [`docs/PHASE0_AUDIT_2026-06-02.md`](docs/PHASE0_AUDIT_2026-06-02.md) | Verified repository baseline, current gaps, and recommended implementation order. |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone plan (M0 → M8), current state, and known gaps. |
+| [`analysis/COMPREHENSIVE_AUDIT.md`](analysis/COMPREHENSIVE_AUDIT.md) | Verified repository baseline, current gaps, and recommended implementation order. |
 
 ## Quick start
 

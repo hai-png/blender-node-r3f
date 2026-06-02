@@ -27,7 +27,7 @@ import { NodeTree } from '../core/NodeTree';
 import { NodeTreeInterface } from '../core/NodeTreeInterface';
 import {
   FloatProperty, IntProperty, BoolProperty, StringProperty,
-  EnumProperty, FloatVectorProperty, ColorProperty,
+  EnumProperty, FloatVectorProperty, ColorProperty, PointerProperty,
 } from '../core/Properties';
 import { NodeRegistry, NodeCategory, NodeCategories, NodeItem } from '../registry/NodeRegistry';
 import * as Sockets from '../sockets';
@@ -87,12 +87,7 @@ export const bpy = {
     EnumProperty,
     FloatVectorProperty,
     ColorProperty,
-    /** Python alias matching bpy.props.PointerProperty(type=…) */
-    PointerProperty: (opts: { type: unknown }) => ({
-      kind: 'POINTER' as const,
-      default: null,
-      type: opts.type,
-    }),
+    PointerProperty,
   },
   utils: {
     register_class(cls: unknown): void {

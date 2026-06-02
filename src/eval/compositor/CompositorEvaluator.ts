@@ -183,7 +183,7 @@ export class CompositorEvaluator implements SystemEvaluator {
             inputs.set(b.localId, b.defaultResult);
           }
         }
-        const outs = this.runOperation(op, inputs, refRelease);
+        const outs = this.runOperation(op, inputs, refRelease, errors);
         if (outs.size) resultByOp.set(op.id, outs);
 
         // Capture Composite / Viewer outputs to their dedicated targets.
@@ -411,13 +411,14 @@ export class CompositorEvaluator implements SystemEvaluator {
     op: PlannerOp,
     inputs: Map<string, Result>,
     keepAlive: (t: THREE.WebGLRenderTarget) => void,
+    errors?: Map<string, string>,
   ): Map<string, Result> {
     const outs = new Map<string, Result>();
     switch (op.kind) {
       case 'INPUT_IMAGE':  return this.execInputImage(op, outs, keepAlive);
       case 'INPUT_CONST':  return this.execInputConst(op, outs);
       case 'PIXEL_FUSED':  return this.execPixelFused(op, inputs, outs, keepAlive);
-      case 'KERNEL':       return this.execKernel(op, inputs, outs, keepAlive);
+      case 'KERNEL':       return this.execKernel(op, inputs, outs, keepAlive, errors);
       case 'OUTPUT':       return outs;
     }
   }
@@ -485,6 +486,7 @@ export class CompositorEvaluator implements SystemEvaluator {
   private execKernel(
     op: PlannerOp, inputs: Map<string, Result>, outs: Map<string, Result>,
     keepAlive: (t: THREE.WebGLRenderTarget) => void,
+    errors?: Map<string, string>,
   ): Map<string, Result> {
     const node = op.nodes[0]!;
     const imgIn = this.ensureImageResult(inputs.get('Image') ?? defaultResultForSocket(node.inputs[0]!), keepAlive);
@@ -584,7 +586,8 @@ export class CompositorEvaluator implements SystemEvaluator {
       mat.uniforms.u_crop!.value.set(node.min_x, node.min_y, node.max_x, node.max_y);
       this.renderToTarget(mat, tOut);
     } else {
-      // unknown kernel — just blit
+      // unknown kernel — blit input through and warn
+      errors?.set(node.id, `Compositor kernel node "${node.bl_idname}" (${node.name || node.bl_label}) is not implemented; input was passed through unchanged.`);
       const mat = this.cachedMaterial('__blit__', FULLSCREEN_VS, BLIT_FS, () => ({ tDiffuse: { value: null } }));
       mat.uniforms.tDiffuse!.value = inTex;
       this.renderToTarget(mat, tOut);

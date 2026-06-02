@@ -37,6 +37,8 @@ type MaterialDescriptorMaybe = {
 };
 import {
   ShaderNodeOutputMaterial,
+  ShaderNodeOutputWorld,
+  ShaderNodeOutputLight,
   ShaderNodeBsdfPrincipled,
   ShaderNodeEmission,
   ShaderNodeTexNoise,
@@ -197,7 +199,9 @@ export class ShaderEvaluator implements SystemEvaluator {
       timings.set(node.id, performance.now() - t0);
     }
 
-    const output = order.find((n) => n instanceof ShaderNodeOutputMaterial) as ShaderNodeOutputMaterial | undefined;
+    const output = (order.find((n) => n instanceof ShaderNodeOutputMaterial)
+      ?? order.find((n) => n instanceof ShaderNodeOutputWorld)
+      ?? order.find((n) => n instanceof ShaderNodeOutputLight)) as ShaderNodeOutputMaterial | undefined;
     let desc: MaterialDescriptor = { ...DEFAULT };
     if (output) {
       const surface = output.inputs[0]!;
@@ -564,63 +568,63 @@ export class ShaderEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, mixDesc(a ?? DEFAULT, b ?? DEFAULT, fac));
       return;
     }
-    if (node instanceof ShaderNodeOutputMaterial) {
+    if (node instanceof ShaderNodeOutputMaterial || node instanceof ShaderNodeOutputWorld || node instanceof ShaderNodeOutputLight) {
       return;
     }
     // ----------------------------------------------------------------
     //  Texture nodes — procedural samplers (CPU approximations)
     // ----------------------------------------------------------------
     if (node instanceof ShaderNodeTexVoronoi) {
-      /* TSL APPROX: CPU fallback returns mid-grey */
+      /* LEGACY PATH PLACEHOLDER: CPU fallback returns mid-grey */
       cache.set(node.outputs[0]!.id, 0.5);
       cache.set(node.outputs[1]!.id, 0.5);
       cache.set(node.outputs[2]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       return;
     }
     if (node instanceof ShaderNodeTexWave) {
-      /* TSL APPROX: CPU fallback */
+      /* LEGACY PATH PLACEHOLDER: CPU fallback */
       cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeTexChecker) {
-      /* TSL APPROX: CPU fallback — checkerboard at default scale */
+      /* LEGACY PATH PLACEHOLDER: CPU fallback — checkerboard at default scale */
       cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeTexBrick) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, [0.6, 0.5, 0.4, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeTexGradient) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeTexMagic) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, [0.5, 0.4, 0.7, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeTexWhiteNoise) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, Math.random());
       cache.set(node.outputs[1]!.id, [Math.random(), Math.random(), Math.random(), 1] as RGBA);
       return;
     }
     if (node instanceof ShaderNodeTexImage) {
-      /* TSL APPROX: image node without resolver returns white */
+      /* LEGACY PATH PLACEHOLDER: image node without resolver returns white */
       cache.set(node.outputs[0]!.id, [1, 1, 1, 1] as RGBA);
       cache.set(node.outputs[1]!.id, 1);
       return;
     }
     if (node instanceof ShaderNodeTexEnvironment) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       return;
     }
@@ -632,7 +636,7 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeAttribute) {
-      /* TSL APPROX: return default color/value for unknown attributes */
+      /* LEGACY PATH PLACEHOLDER: return default color/value for unknown attributes */
       cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
       cache.set(node.outputs[1]!.id, [0.5, 0.5, 0.5] as Vec3);
       cache.set(node.outputs[2]!.id, 0.5);
@@ -640,18 +644,18 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeFresnel) {
-      /* TSL APPROX: mid-factor */
+      /* LEGACY PATH PLACEHOLDER: mid-factor */
       cache.set(node.outputs[0]!.id, 0.05);
       return;
     }
     if (node instanceof ShaderNodeLayerWeight) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, 0.5);
       cache.set(node.outputs[1]!.id, 0.5);
       return;
     }
     if (node instanceof ShaderNodeObjectInfo) {
-      /* TSL APPROX: zeros */
+      /* LEGACY PATH PLACEHOLDER: zeros */
       cache.set(node.outputs[0]!.id, [0, 0, 0] as Vec3);
       cache.set(node.outputs[1]!.id, [0, 0, 0] as Vec3);
       cache.set(node.outputs[2]!.id, [0.8, 0.8, 0.8, 1] as RGBA);
@@ -661,14 +665,14 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeCameraData) {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       cache.set(node.outputs[0]!.id, [0, 0, 1] as Vec3);
       cache.set(node.outputs[1]!.id, 1);
       cache.set(node.outputs[2]!.id, 45);
       return;
     }
     if (node instanceof ShaderNodeLightPath) {
-      /* TSL APPROX: camera ray context */
+      /* LEGACY PATH PLACEHOLDER: camera ray context */
       const defaults = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
       for (let i = 0; i < node.outputs.length; i++) {
         cache.set(node.outputs[i]!.id, defaults[i] ?? 0);
@@ -676,13 +680,13 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node.bl_idname === 'ShaderNodeHueSaturation') {
-      /* TSL APPROX: pass through color unchanged */
+      /* LEGACY PATH PLACEHOLDER: pass through color unchanged */
       const c = this.socketValue(node.inputs[4]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
       cache.set(node.outputs[0]!.id, c);
       return;
     }
     if (node.bl_idname === 'ShaderNodeBrightContrast') {
-      /* TSL APPROX: approximate brightness/contrast */
+      /* LEGACY PATH PLACEHOLDER: approximate brightness/contrast */
       const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
       const bright = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0;
       const contrast = (this.socketValue(node.inputs[2]!, cache) as number) ?? 0;
@@ -691,7 +695,7 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node.bl_idname === 'ShaderNodeInvert') {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1;
       const c = this.socketValue(node.inputs[1]!, cache) as RGBA ?? [0, 0, 0, 1];
       const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -704,7 +708,7 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node.bl_idname === 'ShaderNodeGamma') {
-      /* TSL APPROX */
+      /* LEGACY PATH PLACEHOLDER */
       const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
       const g = (this.socketValue(node.inputs[1]!, cache) as number) ?? 1;
       const safe = (x: number) => Math.max(0, x) ** g;
@@ -712,7 +716,7 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node.bl_idname === 'ShaderNodeMixRGB') {
-      /* TSL APPROX: legacy MixRGB node */
+      /* LEGACY PATH PLACEHOLDER: legacy MixRGB node */
       const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 0.5;
       const a = this.socketValue(node.inputs[1]!, cache) as RGBA ?? [0, 0, 0, 1];
       const b = this.socketValue(node.inputs[2]!, cache) as RGBA ?? [0, 0, 0, 1];

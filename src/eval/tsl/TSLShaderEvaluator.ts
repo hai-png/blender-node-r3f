@@ -917,6 +917,108 @@ registerEmit('ShaderNodeAddShader', (n, c) => {
 });
 
 /* ---------------------------------------------------------------- */
+/*  Curve nodes (Float / Vector / RGB)                              */
+/*                                                                    */
+/*  Strategy: at emit-time, bake each CurveMappingCurve into a 64-   */
+/*  sample LUT, then build a TSL expression that does piecewise-      */
+/*  linear lookup via mix/clamp/floor.  This is exact for LINEAR      */
+/*  curves and a very close approximation for AUTO (Catmull-Rom);     */
+/*  64 samples captures virtually any shape a user would draw.        */
+/* ---------------------------------------------------------------- */
+import { sampleCurve, type CurveMappingCurve as CMC } from '../../nodes/common/Curves';
+
+const CURVE_LUT_SIZE = 64;
+
+/**
+ * Build a TSL node that samples a pre-baked 1-D LUT of `size` floats.
+ * The LUT is baked from `sampleCurve()` at emit-time, so the GPU shader
+ * receives a constant array lookup compiled into the source.
+ */
+function tslCurveLookup(curve: CMC, inputNode: TSLNode, doClamp: boolean): TSLNode {
+  // Bake LUT
+  const lut: number[] = [];
+  for (let i = 0; i < CURVE_LUT_SIZE; i++) {
+    lut.push(sampleCurve(curve, i / (CURVE_LUT_SIZE - 1), doClamp));
+  }
+  // Build piecewise-linear TSL expression:
+  //   t = clamp(input, 0, 1) * (N-1)
+  //   lo = floor(t), hi = min(lo+1, N-1), frac = t - lo
+  //   result = mix(lut[lo], lut[hi], frac)
+  // Since TSL doesn't have runtime array indexing from JS arrays, we build
+  // a chain of mix(step(...)) selections. For 64 entries this compiles to a
+  // compact conditional chain that GPUs handle efficiently.
+  //
+  // However, a more efficient approach for TSL: encode the LUT as a
+  // DataTexture and sample it. Let's use float uniforms + tslFn instead.
+  // Simplest correct path: emit the baked result as a float literal when
+  // the input is a constant, otherwise build a step-chain.
+  //
+  // Practical path: use TSL's `select` or build a texture.
+  // For now: build via float array uniform.
+
+  // Actually, the cleanest TSL approach: inline the LUT values and do a
+  // float mix. We'll generate the expression using TSL's functional API.
+  const t = float(CURVE_LUT_SIZE - 1).mul(inputNode.clamp(0, 1));
+  const lo = t.floor();
+  const frac = t.sub(lo);
+
+  // Build the lookup: start with lut[0], then for each i from 1..N-1,
+  // conditionally select lut[i] when lo >= i.
+  // result_lo = lut[0]; for i in 1..N-1: result_lo = mix(result_lo, lut[i], step(i, lo))
+  // Similarly for hi values.
+  // This is O(N) mix operations — for 64 entries, ~128 ops, well within
+  // GPU fragment shader limits.
+  let resLo: TSLNode = float(lut[0]!);
+  let resHi: TSLNode = float(lut.length > 1 ? lut[1]! : lut[0]!);
+  for (let i = 1; i < CURVE_LUT_SIZE; i++) {
+    const sel = lo.greaterThanEqual(float(i)).toFloat();
+    resLo = TSL.mix(resLo, float(lut[i]!), sel);
+    const hi = Math.min(i + 1, CURVE_LUT_SIZE - 1);
+    resHi = TSL.mix(resHi, float(lut[hi]!), sel);
+  }
+  return TSL.mix(resLo, resHi, frac);
+}
+
+registerEmit('ShaderNodeFloatCurve', (n, c) => {
+  const fac = scalarInputOr(n, 0, c, 1);
+  const value = scalarInputOr(n, 1, c, 0.5);
+  const curve = (n as import('../../nodes/common/Curves').ShaderNodeFloatCurve).curve;
+  const mapped = tslCurveLookup(curve, value, false);
+  // Factor mixes between original and mapped
+  const result = TSL.mix(value, mapped, fac.clamp(0, 1));
+  return { Value: result };
+});
+
+registerEmit('ShaderNodeVectorCurve', (n, c) => {
+  const fac = scalarInputOr(n, 0, c, 1);
+  const v = vectorInputOr(n, 1, c, vec3(0, 0, 0));
+  const curves = (n as import('../../nodes/common/Curves').ShaderNodeVectorCurve).curves;
+  const x = tslCurveLookup(curves[0], v.x, false);
+  const y = tslCurveLookup(curves[1], v.y, false);
+  const z = tslCurveLookup(curves[2], v.z, false);
+  const mapped = vec3(x, y, z);
+  const result = TSL.mix(v, mapped, fac.clamp(0, 1));
+  return { Vector: result };
+});
+
+registerEmit('ShaderNodeRGBCurve', (n, c) => {
+  const fac = scalarInputOr(n, 0, c, 1);
+  const col = c.input(n.inputs[1]!);
+  const curves = (n as import('../../nodes/common/Curves').ShaderNodeRGBCurve).curves;
+  // Combined curve (curves[0]) applied to all channels first
+  const cr = tslCurveLookup(curves[0], col.x, true);
+  const cg = tslCurveLookup(curves[0], col.y, true);
+  const cb = tslCurveLookup(curves[0], col.z, true);
+  // Per-channel curves
+  const r = tslCurveLookup(curves[1], cr, true);
+  const g = tslCurveLookup(curves[2], cg, true);
+  const b = tslCurveLookup(curves[3], cb, true);
+  const mapped = vec4(r, g, b, col.w);
+  const result = TSL.mix(col, mapped, fac.clamp(0, 1));
+  return { Color: result };
+});
+
+/* ---------------------------------------------------------------- */
 /*  Helpers — descriptor combination                                */
 /* ---------------------------------------------------------------- */
 function mixDescriptors(a: TSLMaterialDescriptor, b: TSLMaterialDescriptor, f: TSLNode): TSLMaterialDescriptor {
