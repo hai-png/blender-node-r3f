@@ -17,6 +17,48 @@ export type SampleFn = (u: number, v: number) => RGBA;
 type ScalarFn = (u: number, v: number) => number;
 type VectorFn = (u: number, v: number) => Vec3;
 
+/** Shared ColorRamp sampler for the texture evaluator. */
+function sampleColorRamp(
+  stops: { position: number; color: number[] }[],
+  interpolation: 'LINEAR' | 'CONSTANT' | 'EASE' | 'B_SPLINE' | 'CARDINAL',
+  t: number,
+): RGBA {
+  const sorted = stops.slice().sort((a, b) => a.position - b.position);
+  if (sorted.length === 0) return [t, t, t, 1];
+  if (t <= sorted[0]!.position) {
+    const c = sorted[0]!.color;
+    return [Number(c[0] ?? 0), Number(c[1] ?? 0), Number(c[2] ?? 0), Number(c[3] ?? 1)];
+  }
+  if (t >= sorted[sorted.length - 1]!.position) {
+    const c = sorted[sorted.length - 1]!.color;
+    return [Number(c[0] ?? 0), Number(c[1] ?? 0), Number(c[2] ?? 0), Number(c[3] ?? 1)];
+  }
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i]!, b = sorted[i + 1]!;
+    if (t >= a.position && t <= b.position) {
+      const denom = Math.max(1e-8, b.position - a.position);
+      let f = (t - a.position) / denom;
+      if (interpolation === 'CONSTANT') f = 0;
+      else if (interpolation === 'EASE') f = f * f * (3 - 2 * f);
+      const lerp = (x: number, y: number) => x + (y - x) * f;
+      return [
+        lerp(Number(a.color[0] ?? 0), Number(b.color[0] ?? 0)),
+        lerp(Number(a.color[1] ?? 0), Number(b.color[1] ?? 0)),
+        lerp(Number(a.color[2] ?? 0), Number(b.color[2] ?? 0)),
+        lerp(Number(a.color[3] ?? 1), Number(b.color[3] ?? 1)),
+      ];
+    }
+  }
+  return [t, t, t, 1];
+}
+
+/**
+ * Optional image resource resolver.
+ * When set on TextureEvaluator, TextureNodeImage will call this instead
+ * of emitting the UV-gradient placeholder.
+ */
+export type ImageResolver = (imageSrc: string) => ImageData | null;
+
 /* ---- noise helpers ---- */
 function hash2(i: number, j: number): number {
   const s = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
@@ -112,6 +154,16 @@ function colorToVectorFn(f?: SampleFn): VectorFn | undefined { return f ? (u, v)
 function scalarToVectorFn(f?: ScalarFn): VectorFn | undefined { return f ? (u, v) => { const x = f(u, v); return [x, x, x]; } : undefined; }
 
 export class TextureEvaluator implements SystemEvaluator {
+  /**
+   * Optional image resolver. When provided, TextureNodeImage will sample from
+   * the returned ImageData instead of emitting the UV-gradient placeholder.
+   */
+  resolveImage?: ImageResolver;
+
+  constructor(opts: { resolveImage?: ImageResolver } = {}) {
+    this.resolveImage = opts.resolveImage;
+  }
+
   evaluate(tree: NodeTree, _dirty: ReadonlySet<Node>): EvaluationResult {
     const start = performance.now();
     const flat = flattenTree(tree);
@@ -204,10 +256,25 @@ export class TextureEvaluator implements SystemEvaluator {
           break;
         }
         case 'TextureNodeImage': {
-          // No real image decode headlessly yet; emit a coordinate gradient so
-          // linked Coordinates still affect the placeholder deterministically.
           const coords = inVector(node, 'Coords', ctx);
-          setColor(node, 'Color', (u, v) => { const [x, y] = coords(u, v); return [x, y, 0.5, 1]; });
+          const imageSrc = (node as unknown as { image_src?: string }).image_src ?? '';
+          const resolvedImage = imageSrc && this.resolveImage ? this.resolveImage(imageSrc) : null;
+          if (resolvedImage) {
+            // Sample from the resolved ImageData.
+            const imgW = resolvedImage.width, imgH = resolvedImage.height;
+            const data = resolvedImage.data;
+            setColor(node, 'Color', (u, v) => {
+              const [cx, cy] = coords(u, v);
+              const px = Math.max(0, Math.min(imgW - 1, Math.floor(cx * imgW)));
+              const py = Math.max(0, Math.min(imgH - 1, Math.floor(cy * imgH)));
+              const i = (py * imgW + px) * 4;
+              return [data[i]! / 255, data[i + 1]! / 255, data[i + 2]! / 255, data[i + 3]! / 255];
+            });
+          } else {
+            // Fallback: emit a coordinate gradient so linked Coordinates
+            // still affect the placeholder deterministically.
+            setColor(node, 'Color', (u, v) => { const [x, y] = coords(u, v); return [x, y, 0.5, 1]; });
+          }
           break;
         }
         case 'TextureNodeMath': {
@@ -234,8 +301,23 @@ export class TextureEvaluator implements SystemEvaluator {
         }
         case 'TextureNodeValToRGB': {
           const fac = inScalar(node, 'Fac', ctx);
-          setColor(node, 'Color', (u, v) => { const x = Math.max(0, Math.min(1, fac(u, v))); return [x, x, x, 1]; });
-          setScalar(node, 'Alpha', () => 1);
+          const rawStops = (node as unknown as { stops?: { position: number; color: number[] }[] }).stops;
+          const interp = ((node as unknown as { interpolation?: string }).interpolation ?? 'LINEAR') as 'LINEAR' | 'CONSTANT' | 'EASE' | 'B_SPLINE' | 'CARDINAL';
+          setColor(node, 'Color', (u, v) => {
+            const t = Math.max(0, Math.min(1, fac(u, v)));
+            if (rawStops && rawStops.length) {
+              // Use the common ColorRamp sampler for custom stops
+              return sampleColorRamp(rawStops, interp, t);
+            }
+            return [t, t, t, 1];
+          });
+          setScalar(node, 'Alpha', (u, v) => {
+            const t = Math.max(0, Math.min(1, fac(u, v)));
+            if (rawStops && rawStops.length) {
+              return sampleColorRamp(rawStops, interp, t)[3];
+            }
+            return 1;
+          });
           break;
         }
         default:

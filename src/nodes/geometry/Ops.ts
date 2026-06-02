@@ -13,7 +13,7 @@ import { Node, type NodeInitContext } from '../../core/Node';
 import { EnumProperty, StringProperty } from '../../core/Properties';
 import type { NodeTreeKind } from '../../core/types';
 import {
-  NodeSocketBool, NodeSocketColor, NodeSocketFloat, NodeSocketGeometry,
+  NodeSocketBool, NodeSocketColor, NodeSocketFloat, NodeSocketFloatFactor, NodeSocketGeometry,
   NodeSocketInt, NodeSocketRotation, NodeSocketString, NodeSocketVector,
 } from '../../sockets';
 import { NodeRegistry } from '../../registry/NodeRegistry';
@@ -506,6 +506,68 @@ export class GeometryNodeProximity extends GeoDataFlow {
 /*  Registration                                                      */
 /* ------------------------------------------------------------------ */
 
+// -----------------------------------------------------------------------
+//  Curve ops — Fill, Fillet, Sample (stub implementations)
+//  NOTE: These are declared/registered so the bridge can import them.
+//  The GeometryEvaluator handles them via pass-through stubs.
+// -----------------------------------------------------------------------
+export class GeometryNodeFillCurve extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeFillCurve';
+  static override bl_label = 'Fill Curve';
+  static override category = 'Curve / Operations';
+  /* STUB: Converts planar curves to filled mesh faces.
+   * Full implementation requires earcut/triangulation of arbitrary poly loops.
+   * Returns empty geometry until implemented. */
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketGeometry, 'Curve');
+    this.addOutput(NodeSocketGeometry, 'Mesh');
+  }
+}
+
+export class GeometryNodeFilletCurve extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeFilletCurve';
+  static override bl_label = 'Fillet Curve';
+  static override category = 'Curve / Operations';
+  /* STUB: Rounds curve corners by inserting arc segments.
+   * Pass-through until full control-point arc insertion is implemented. */
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketGeometry, 'Curve');
+    this.addInput(NodeSocketFloat, 'Radius', { default_value: 0.1 });
+    this.addOutput(NodeSocketGeometry, 'Curve');
+  }
+}
+
+export class GeometryNodeSampleCurve extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeSampleCurve';
+  static override bl_label = 'Sample Curve';
+  static override category = 'Curve / Sample';
+  /* STUB: Samples a value along the curve at a given factor.
+   * Returns zeros until curve arc-length parameterisation is implemented. */
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketGeometry, 'Curves');
+    this.addInput(NodeSocketFloat, 'Value', { default_value: 0 });
+    this.addInput(NodeSocketFloatFactor, 'Factor', { default_value: 0 });
+    this.addOutput(NodeSocketVector, 'Position');
+    this.addOutput(NodeSocketVector, 'Tangent');
+    this.addOutput(NodeSocketVector, 'Normal');
+    this.addOutput(NodeSocketFloat, 'Value');
+    this.addOutput(NodeSocketInt, 'Index');
+    this.addOutput(NodeSocketInt, 'Curve Index');
+  }
+}
+
+export class GeometryNodeSubdivideCurve extends GeoDataFlow {
+  static override bl_idname = 'GeometryNodeSubdivideCurve';
+  static override bl_label = 'Subdivide Curve';
+  static override category = 'Curve / Operations';
+  /* Uses ResampleCurve pass-through until native segment subdivision lands. */
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketGeometry, 'Curve');
+    this.addInput(NodeSocketInt, 'Cuts', { default_value: 1 });
+    this.addOutput(NodeSocketGeometry, 'Curve');
+  }
+}
+
 let _registered = false;
 export class GeometryNodeFlipFaces extends Node {
   static override bl_idname = 'GeometryNodeFlipFaces';
@@ -552,6 +614,8 @@ export function registerGeometryOps(): void {
     GeometryNodeSampleIndex,
     GeometryNodeSampleNearest,
     GeometryNodeProximity, GeometryNodeFlipFaces,
+    GeometryNodeFillCurve, GeometryNodeFilletCurve,
+    GeometryNodeSampleCurve, GeometryNodeSubdivideCurve,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

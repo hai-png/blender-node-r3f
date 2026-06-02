@@ -73,6 +73,8 @@ import {
   GeometryNodeCurveLine, GeometryNodeCurveCircle, GeometryNodeCurveBezierSegment, GeometryNodeCurveSpiral,
   GeometryNodeSampleIndex, GeometryNodeSampleNearest, GeometryNodeProximity,
   GeometryNodeFlipFaces,
+  GeometryNodeFillCurve, GeometryNodeFilletCurve,
+  GeometryNodeSampleCurve, GeometryNodeSubdivideCurve,
 } from '../nodes/geometry/Ops';
 import { GeoZoneInputBase, GeoZoneOutputBase } from '../nodes/geometry/Zones';
 import {
@@ -323,6 +325,43 @@ export class GeometryEvaluator implements SystemEvaluator {
 
     /* ---------------- Group container (recursive) ---------------- */
     if (node instanceof NodeGroupBase) { this.executeGroup(node, cache, 0); return; }
+
+    /* ---- Curve stubs (declared but full algo not yet implemented) ---- */
+    if (node instanceof GeometryNodeFillCurve) {
+      /* STUB: FillCurve — converts a planar closed curve to a filled mesh.
+       * Requires earcut triangulation of arbitrary poly loops.
+       * Returns empty geometry until a triangulation pass is added. */
+      cache.set(node.outputs[0]!.id, Geometry.empty());
+      return;
+    }
+    if (node instanceof GeometryNodeFilletCurve) {
+      /* STUB: FilletCurve — rounds control-point corners with arc segments.
+       * Pass-through the curve unchanged until arc insertion is implemented. */
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, geo);
+      return;
+    }
+    if (node instanceof GeometryNodeSampleCurve) {
+      /* STUB: SampleCurve — samples a field value along the arc length.
+       * Returns zero vectors/values until arc-length parameterisation is added. */
+      const zero3 = constField([0, 0, 0] as [number, number, number], 'VECTOR');
+      cache.set(node.outputs[0]!.id, zero3);   // Position
+      cache.set(node.outputs[1]!.id, constField([0, 1, 0] as [number, number, number], 'VECTOR')); // Tangent
+      cache.set(node.outputs[2]!.id, constField([0, 0, 1] as [number, number, number], 'VECTOR')); // Normal
+      cache.set(node.outputs[3]!.id, constField(0, 'FLOAT'));   // Value
+      cache.set(node.outputs[4]!.id, constField(0, 'INT'));     // Index
+      cache.set(node.outputs[5]!.id, constField(0, 'INT'));     // Curve Index
+      return;
+    }
+    if (node instanceof GeometryNodeSubdivideCurve) {
+      /* STUB: SubdivideCurve — subdivides each curve segment N times.
+       * Pass-through for now (full segment insertion not yet implemented).
+       * Use ResampleCurve as the recommended approach until this is complete. */
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, geo);
+      return;
+    }
+
 
     /* ---------------- Field utilities ---------------- */
     if (node instanceof GeometryNodeFlipFaces) {

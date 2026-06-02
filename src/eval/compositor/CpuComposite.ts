@@ -225,6 +225,65 @@ function evalNode(node: Node, ctx: CpuCtx): void {
       }
       set('Value', [r, r, r, 1]); return;
     }
+    case 'CompositorNodeColorBalance': {
+      // CDL: out = clamp((in * gain + lift) ^ (1/gamma))
+      const img = inputRGBA(node, 'Image', ctx);
+      const fac = clamp01(scalar(node, 'Fac', ctx));
+      const p = node as unknown as { lift_r?: number; lift_g?: number; lift_b?: number; gain_r?: number; gain_g?: number; gain_b?: number; gamma_r?: number; gamma_g?: number; gamma_b?: number };
+      const lift = [p.lift_r ?? 0, p.lift_g ?? 0, p.lift_b ?? 0];
+      const gain = [p.gain_r ?? 1, p.gain_g ?? 1, p.gain_b ?? 1];
+      const gamma = [p.gamma_r ?? 1, p.gamma_g ?? 1, p.gamma_b ?? 1];
+      const cdl = (x: number, l: number, g: number, gm: number) =>
+        Math.max(0, Math.min(1, Math.pow(Math.max(0, x * g + l), 1 / Math.max(0.001, gm))));
+      const out: RGBA = [
+        cdl(img[0], lift[0]!, gain[0]!, gamma[0]!),
+        cdl(img[1], lift[1]!, gain[1]!, gamma[1]!),
+        cdl(img[2], lift[2]!, gain[2]!, gamma[2]!),
+        img[3],
+      ];
+      const blended: RGBA = [
+        img[0] + (out[0] - img[0]) * fac,
+        img[1] + (out[1] - img[1]) * fac,
+        img[2] + (out[2] - img[2]) * fac,
+        img[3],
+      ];
+      set('Image', blended);
+      return;
+    }
+    case 'CompositorNodeHueCorrect': {
+      // Simplified: honour saturation property, pass hue/value unchanged.
+      const img = inputRGBA(node, 'Image', ctx);
+      const fac = clamp01(scalar(node, 'Fac', ctx));
+      const sat = (node as unknown as { saturation?: number }).saturation ?? 1;
+      const [h, s, v] = rgb2hsv(img[0], img[1], img[2]);
+      const [nr, ng, nb] = hsv2rgb(h, clamp01(s * sat), v);
+      set('Image', [
+        img[0] + (nr - img[0]) * fac,
+        img[1] + (ng - img[1]) * fac,
+        img[2] + (nb - img[2]) * fac,
+        img[3],
+      ]);
+      return;
+    }
+    case 'CompositorNodeTonemap': {
+      // Reinhard tonemap approximation.
+      const img = inputRGBA(node, 'Image', ctx);
+      const type = (node as unknown as { tonemap_type?: string }).tonemap_type ?? 'RD_PHOTORECEPTOR';
+      const tonemap = (x: number) => type === 'RD_PHOTORECEPTOR' ? x / (1 + x) : Math.max(0, x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081);
+      set('Image', [tonemap(img[0]), tonemap(img[1]), tonemap(img[2]), img[3]]);
+      return;
+    }
+    case 'CompositorNodeZcombine': {
+      // Z-buffer combine: pick Image1 where Z1 < Z2, else Image2.
+      const img1 = inputRGBA(node, 'Image', ctx);
+      const z1 = scalar(node, 'Z', ctx);
+      const img2 = inputRGBA(node, 'Image_001', ctx);
+      const z2 = scalar(node, 'Z_001', ctx);
+      const minZ = Math.min(z1, z2);
+      set('Image', z1 <= z2 ? img1 : img2);
+      set('Z', [minZ, minZ, minZ, 1] as RGBA);
+      return;
+    }
     default: {
       // Unknown / kernel node: pass primary image input through unchanged.
       const img = inputRGBA(node, 'Image', ctx);

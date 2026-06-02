@@ -585,6 +585,67 @@ export class CompositorNodeSplitViewer extends CompNode {
   }
 }
 
+// -----------------------------------------------------------------------
+//  ColorBalance, HueCorrect, Tonemap — now properly declared as node classes
+//  (previously handled only via bl_idname dispatch in the evaluator)
+// -----------------------------------------------------------------------
+export class CompositorNodeColorBalance extends CompNode {
+  static override bl_idname = 'CompositorNodeColorBalance';
+  static override bl_label = 'Color Balance';
+  static override category = 'Color';
+  static override properties = {
+    lift_r: FloatProperty({ default: 0, min: -1, max: 1, name: 'Lift R' }),
+    lift_g: FloatProperty({ default: 0, min: -1, max: 1, name: 'Lift G' }),
+    lift_b: FloatProperty({ default: 0, min: -1, max: 1, name: 'Lift B' }),
+    gain_r: FloatProperty({ default: 1, min: 0, max: 4, name: 'Gain R' }),
+    gain_g: FloatProperty({ default: 1, min: 0, max: 4, name: 'Gain G' }),
+    gain_b: FloatProperty({ default: 1, min: 0, max: 4, name: 'Gain B' }),
+    gamma_r: FloatProperty({ default: 1, min: 0.01, max: 4, name: 'Gamma R' }),
+    gamma_g: FloatProperty({ default: 1, min: 0.01, max: 4, name: 'Gamma G' }),
+    gamma_b: FloatProperty({ default: 1, min: 0.01, max: 4, name: 'Gamma B' }),
+  };
+  declare lift_r: number; declare lift_g: number; declare lift_b: number;
+  declare gain_r: number; declare gain_g: number; declare gain_b: number;
+  declare gamma_r: number; declare gamma_g: number; declare gamma_b: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 1 });
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0.8, 0.8, 0.8, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+  }
+}
+
+export class CompositorNodeHueCorrect extends CompNode {
+  static override bl_idname = 'CompositorNodeHueCorrect';
+  static override bl_label = 'Hue Correct';
+  static override category = 'Color';
+  static override properties = {
+    saturation: FloatProperty({ default: 1, min: 0, max: 4, name: 'Saturation' }),
+  };
+  declare saturation: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 1 });
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0.8, 0.8, 0.8, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+  }
+}
+
+export class CompositorNodeTonemap extends CompNode {
+  static override bl_idname = 'CompositorNodeTonemap';
+  static override bl_label = 'Tonemap';
+  static override category = 'Color';
+  static override properties = {
+    tonemap_type: EnumProperty({
+      items: [['RD_PHOTORECEPTOR','Reinhard',''], ['RH_SIMPLE','Filmic','']],
+      default: 'RD_PHOTORECEPTOR',
+    }),
+  };
+  declare tonemap_type: string;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0.8, 0.8, 0.8, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Registration                                                      */
 /* ------------------------------------------------------------------ */
@@ -604,6 +665,7 @@ export function registerCompositorNodes(): void {
     CompositorNodePosterize, CompositorNodeZcombine, CompositorNodeMapRange,
     CompositorNodeCombineColor, CompositorNodeSeparateColor, CompositorNodeValToRGB,
     CompositorNodeSplitViewer,
+    CompositorNodeColorBalance, CompositorNodeHueCorrect, CompositorNodeTonemap,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

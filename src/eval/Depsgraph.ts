@@ -108,6 +108,12 @@ export class Depsgraph {
     const dirty = this._dirty;
     this._dirty = new Set();
     const result = this._evaluator.evaluate(this.tree, dirty);
+    // Detect and report cycles: NodeTree.topoOrder() annotates cycleNodes.
+    const order = this.tree.topoOrder() as ReturnType<typeof this.tree.topoOrder> & { cycleNodes?: import('../core/Node').Node[] };
+    if (order.cycleNodes && order.cycleNodes.length > 0) {
+      const names = order.cycleNodes.map((n) => n.name || n.bl_idname).join(', ');
+      result.errors.set('__cycle__', `Cycle detected involving nodes: ${names}. Blender forbids cycles — evaluation is partial.`);
+    }
     this._lastResult = result;
     for (const fn of this._listeners) fn(result);
     return result;

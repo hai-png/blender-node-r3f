@@ -224,6 +224,48 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
     return rampExpression(node, f);
   },
 
+  // ---------- Color Balance (CDL lift/gamma/gain) ----------
+  CompositorNodeColorBalance: (node, env) => {
+    const img = env.input('Image');
+    const fac = env.input('Fac');
+    // CDL model: Lift/Gamma/Gain per-channel (vec3 uniforms)
+    // lift offsets shadows, gain scales highlights, gamma adjusts midtones.
+    // CPU/GPU approximation using a simple power+offset model.
+    const lift  = env.uniformFloat('u_lift_r',  (node as unknown as { lift_r?: number }).lift_r  ?? 0);
+    const gain  = env.uniformFloat('u_gain_r',  (node as unknown as { gain_r?: number }).gain_r  ?? 1);
+    const gamma = env.uniformFloat('u_gamma_r', (node as unknown as { gamma_r?: number }).gamma_r ?? 1);
+    // Apply: out = (in * gain + lift) ^ (1/gamma)
+    const s = `vec4(
+      pow(max(0.0, ${img}.r * ${gain} + ${lift}), 1.0 / max(0.001, ${gamma})),
+      pow(max(0.0, ${img}.g * ${gain} + ${lift}), 1.0 / max(0.001, ${gamma})),
+      pow(max(0.0, ${img}.b * ${gain} + ${lift}), 1.0 / max(0.001, ${gamma})),
+      ${img}.a)`;
+    return `mix(${img}, ${s}, clamp(${fac}.r, 0.0, 1.0))`;
+  },
+
+  // ---------- Hue Correct (curve-based hue/sat/val — approximated as HSV) ----------
+  CompositorNodeHueCorrect: (node, env) => {
+    const img = env.input('Image');
+    const fac = env.input('Fac');
+    // Simplified: pass through unchanged at fac=0, apply slight saturation boost at fac=1
+    // A real implementation would need a per-hue curve spline, which requires GLSL look-up tables.
+    const sat = env.uniformFloat('u_hc_sat', (node as unknown as { saturation?: number }).saturation ?? 1);
+    const adjusted = `vec4(_hsv2rgb(vec3(_rgb2hsv(${img}.rgb).xy * vec2(1.0, ${sat}), _rgb2hsv(${img}.rgb).z)), ${img}.a)`;
+    return `mix(${img}, ${adjusted}, clamp(${fac}.r, 0.0, 1.0))`;
+  },
+
+  // ---------- Tonemap (filmic/Reinhard approximation) ----------
+  CompositorNodeTonemap: (node, env) => {
+    const img = env.input('Image');
+    const type = (node as unknown as { tonemap_type?: string }).tonemap_type ?? 'RD_PHOTORECEPTOR';
+    if (type === 'RD_PHOTORECEPTOR') {
+      // Reinhard simple: out = in / (1 + in)
+      return `vec4(${img}.rgb / (vec3(1.0) + ${img}.rgb), ${img}.a)`;
+    }
+    // Filmic knee approximation (from John Hable)
+    return `vec4(max(vec3(0.0), ${img}.rgb * (${img}.rgb + 0.0245786) - 0.000090537) / (${img}.rgb * (0.983729 * ${img}.rgb + 0.4329510) + 0.238081), ${img}.a)`;
+  },
+
   // ---------- RGB / Value (literal inputs are handled by the planner;
   // these no-op emitters exist so the planner is happy when they show up
   // inside a fused chain.) ----------

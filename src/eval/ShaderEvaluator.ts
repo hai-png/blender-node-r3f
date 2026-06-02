@@ -60,6 +60,15 @@ import {
 } from '../nodes/common/CombineSeparate';
 import { RerouteNode, NodeGroupInput, NodeGroupOutput } from '../nodes/common';
 import { NodeGroupBase } from '../nodes/common/Group';
+import {
+  ShaderNodeTexImage, ShaderNodeTexEnvironment, ShaderNodeTexVoronoi,
+  ShaderNodeTexWave, ShaderNodeTexChecker, ShaderNodeTexBrick,
+  ShaderNodeTexGradient, ShaderNodeTexMagic, ShaderNodeTexWhiteNoise,
+} from '../nodes/shader/Textures';
+import {
+  ShaderNodeUVMap, ShaderNodeAttribute, ShaderNodeFresnel, ShaderNodeLayerWeight,
+  ShaderNodeObjectInfo, ShaderNodeCameraData, ShaderNodeLightPath,
+} from '../nodes/shader/Inputs';
 
 export interface MaterialDescriptor {
   color: RGBA;
@@ -408,6 +417,220 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeOutputMaterial) {
+      return;
+    }
+    // ----------------------------------------------------------------
+    //  Texture nodes — procedural samplers (CPU approximations)
+    // ----------------------------------------------------------------
+    if (node instanceof ShaderNodeTexVoronoi) {
+      /* TSL APPROX: CPU fallback returns mid-grey */
+      cache.set(node.outputs[0]!.id, 0.5);
+      cache.set(node.outputs[1]!.id, 0.5);
+      cache.set(node.outputs[2]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      return;
+    }
+    if (node instanceof ShaderNodeTexWave) {
+      /* TSL APPROX: CPU fallback */
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeTexChecker) {
+      /* TSL APPROX: CPU fallback — checkerboard at default scale */
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeTexBrick) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, [0.6, 0.5, 0.4, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeTexGradient) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeTexMagic) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, [0.5, 0.4, 0.7, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeTexWhiteNoise) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, Math.random());
+      cache.set(node.outputs[1]!.id, [Math.random(), Math.random(), Math.random(), 1] as RGBA);
+      return;
+    }
+    if (node instanceof ShaderNodeTexImage) {
+      /* TSL APPROX: image node without resolver returns white */
+      cache.set(node.outputs[0]!.id, [1, 1, 1, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 1);
+      return;
+    }
+    if (node instanceof ShaderNodeTexEnvironment) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      return;
+    }
+    // ----------------------------------------------------------------
+    //  Input nodes — geometry/scene data (CPU stubs)
+    // ----------------------------------------------------------------
+    if (node instanceof ShaderNodeUVMap) {
+      cache.set(node.outputs[0]!.id, [0, 0, 0] as Vec3);
+      return;
+    }
+    if (node instanceof ShaderNodeAttribute) {
+      /* TSL APPROX: return default color/value for unknown attributes */
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, [0.5, 0.5, 0.5] as Vec3);
+      cache.set(node.outputs[2]!.id, 0.5);
+      cache.set(node.outputs[3]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeFresnel) {
+      /* TSL APPROX: mid-factor */
+      cache.set(node.outputs[0]!.id, 0.05);
+      return;
+    }
+    if (node instanceof ShaderNodeLayerWeight) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, 0.5);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node instanceof ShaderNodeObjectInfo) {
+      /* TSL APPROX: zeros */
+      cache.set(node.outputs[0]!.id, [0, 0, 0] as Vec3);
+      cache.set(node.outputs[1]!.id, [0, 0, 0] as Vec3);
+      cache.set(node.outputs[2]!.id, [0.8, 0.8, 0.8, 1] as RGBA);
+      cache.set(node.outputs[3]!.id, 0);
+      cache.set(node.outputs[4]!.id, 0);
+      cache.set(node.outputs[5]!.id, 0);
+      return;
+    }
+    if (node instanceof ShaderNodeCameraData) {
+      /* TSL APPROX */
+      cache.set(node.outputs[0]!.id, [0, 0, 1] as Vec3);
+      cache.set(node.outputs[1]!.id, 1);
+      cache.set(node.outputs[2]!.id, 45);
+      return;
+    }
+    if (node instanceof ShaderNodeLightPath) {
+      /* TSL APPROX: camera ray context */
+      const defaults = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      for (let i = 0; i < node.outputs.length; i++) {
+        cache.set(node.outputs[i]!.id, defaults[i] ?? 0);
+      }
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeHueSaturation') {
+      /* TSL APPROX: pass through color unchanged */
+      const c = this.socketValue(node.inputs[4]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
+      cache.set(node.outputs[0]!.id, c);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeBrightContrast') {
+      /* TSL APPROX: approximate brightness/contrast */
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
+      const bright = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0;
+      const contrast = (this.socketValue(node.inputs[2]!, cache) as number) ?? 0;
+      const apply = (x: number) => Math.max(0, Math.min(1, x * (1 + contrast / 100) + bright / 100 + 0.5 * (1 - (1 + contrast / 100))));
+      cache.set(node.outputs[0]!.id, [apply(c[0]), apply(c[1]), apply(c[2]), c[3]] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeInvert') {
+      /* TSL APPROX */
+      const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1;
+      const c = this.socketValue(node.inputs[1]!, cache) as RGBA ?? [0, 0, 0, 1];
+      const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+      cache.set(node.outputs[0]!.id, [
+        lerp(c[0], 1 - c[0], fac),
+        lerp(c[1], 1 - c[1], fac),
+        lerp(c[2], 1 - c[2], fac),
+        c[3],
+      ] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeGamma') {
+      /* TSL APPROX */
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
+      const g = (this.socketValue(node.inputs[1]!, cache) as number) ?? 1;
+      const safe = (x: number) => Math.max(0, x) ** g;
+      cache.set(node.outputs[0]!.id, [safe(c[0]), safe(c[1]), safe(c[2]), c[3]] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeMixRGB') {
+      /* TSL APPROX: legacy MixRGB node */
+      const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 0.5;
+      const a = this.socketValue(node.inputs[1]!, cache) as RGBA ?? [0, 0, 0, 1];
+      const b = this.socketValue(node.inputs[2]!, cache) as RGBA ?? [0, 0, 0, 1];
+      const t = Math.max(0, Math.min(1, fac));
+      cache.set(node.outputs[0]!.id, [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t, a[3]] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeValToRGB') {
+      /* ColorRamp — use common ColorRampNode if available else linear b/w */
+      const t = (this.socketValue(node.inputs[0]!, cache) as number) ?? 0;
+      const stops = (node as unknown as { stops?: { position: number; color: number[] }[] }).stops;
+      const interp = ((node as unknown as { interpolation?: string }).interpolation ?? 'LINEAR') as 'LINEAR' | 'CONSTANT' | 'EASE' | 'B_SPLINE' | 'CARDINAL';
+      let out: RGBA;
+      if (stops && stops.length) {
+        out = ColorRampNode.sample(stops as import('../nodes/common/ColorRamp').ColorRampStop[], interp, t);
+      } else {
+        out = [t, t, t, 1];
+      }
+      cache.set(node.outputs[0]!.id, out);
+      cache.set(node.outputs[1]!.id, out[3]);
+      return;
+    }
+    // ----------------------------------------------------------------
+    //  TexCoord — geometry-based coordinate outputs (CPU stubs)
+    // ----------------------------------------------------------------
+    if (node.bl_idname === 'ShaderNodeTexCoord') {
+      const zero3: Vec3 = [0, 0, 0];
+      cache.set(node.outputs[0]?.id ?? '', zero3); // Generated
+      cache.set(node.outputs[1]?.id ?? '', zero3); // Normal
+      cache.set(node.outputs[2]?.id ?? '', zero3); // UV
+      cache.set(node.outputs[3]?.id ?? '', zero3); // Object
+      cache.set(node.outputs[4]?.id ?? '', zero3); // Camera
+      cache.set(node.outputs[5]?.id ?? '', zero3); // Window
+      cache.set(node.outputs[6]?.id ?? '', zero3); // Reflection
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeGeometry') {
+      const zero3: Vec3 = [0, 0, 0];
+      for (const out of node.outputs) cache.set(out.id, zero3);
+      return;
+    }
+    // ----------------------------------------------------------------
+    //  Vector ops — Mapping, Displacement, NormalMap (CPU stubs)
+    // ----------------------------------------------------------------
+    if (node.bl_idname === 'ShaderNodeMapping') {
+      const v = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 0];
+      cache.set(node.outputs[0]!.id, v);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeNormalMap') {
+      const c = this.socketValue(node.inputs[2]!, cache) as Vec3 ?? [0, 0, 0];
+      cache.set(node.outputs[0]!.id, c);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeBump') {
+      cache.set(node.outputs[0]!.id, [0, 0, 1] as Vec3);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeDisplacement' || node.bl_idname === 'ShaderNodeVectorDisplacement') {
+      const h = (this.socketValue(node.inputs[0]!, cache) as number) ?? 0;
+      cache.set(node.outputs[0]!.id, [0, h, 0] as Vec3);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeVectorRotate') {
+      const v = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 0];
+      cache.set(node.outputs[0]!.id, v);
       return;
     }
     // unknown node — propagate defaults

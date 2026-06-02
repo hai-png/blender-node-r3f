@@ -267,7 +267,13 @@ export class NodeTree {
    * Skips muted nodes correctly: a muted node's downstream still sees the
    * upstream values via internal_links (pass-through).
    */
-  topoOrder(): Node[] {
+  /**
+   * Kahn's algorithm — returns nodes in evaluation order (sources first).
+   * When a cycle is detected, nodes that are part of the cycle are appended
+   * at the end and the `cycleNodes` property on the returned array is set so
+   * evaluators can surface the error. Blender forbids cycles entirely.
+   */
+  topoOrder(): Node[] & { cycleNodes?: Node[] } {
     const indegree = new Map<Node, number>();
     for (const n of this.nodes) indegree.set(n, 0);
     for (const l of this.links) {
@@ -276,7 +282,7 @@ export class NodeTree {
     }
     const queue: Node[] = [];
     for (const n of this.nodes) if ((indegree.get(n) ?? 0) === 0) queue.push(n);
-    const out: Node[] = [];
+    const out: Node[] & { cycleNodes?: Node[] } = [];
     while (queue.length) {
       const n = queue.shift()!;
       out.push(n);
@@ -289,8 +295,11 @@ export class NodeTree {
       }
     }
     if (out.length !== this.nodes.length) {
-      // a cycle — return partial order; evaluator will report
-      // Blender forbids cycles entirely.
+      // Collect nodes that are part of a cycle (still have indegree > 0).
+      const cycleNodes = this.nodes.filter((n) => !out.includes(n));
+      out.cycleNodes = cycleNodes;
+      // Append them so evaluation can continue (with limited correctness).
+      for (const n of cycleNodes) out.push(n);
     }
     return out;
   }
