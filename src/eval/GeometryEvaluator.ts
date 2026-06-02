@@ -41,6 +41,8 @@ import {
   sampleNearestIndex, geometryProximity, sampleCurveAtFactor, subdivideCurve,
   fillCurve, filletCurve, meshBoolean, triangulateMesh,
   translationMat4, rotationMat4, scaleMat4, transformAroundPivotMat4, mat4Mul, flipFaces,
+  raycastMesh, deleteGeometry, separateGeometry, meshToCurve, extrudeMesh,
+  duplicateElements, splitEdges,
 } from './geometry/MeshOps';
 
 import { ValueNode, VectorNode, RGBNode } from '../nodes/common/Value';
@@ -94,6 +96,12 @@ import {
 } from '../nodes/geometry/Ops';
 import { GeoZoneInputBase, GeoZoneOutputBase } from '../nodes/geometry/Zones';
 import {
+  GeometryNodeRaycast, GeometryNodeExtrudeMesh,
+  GeometryNodeDeleteGeometry, GeometryNodeSeparateGeometry, GeometryNodeDuplicateElements,
+  GeometryNodeMeshToCurve, GeometryNodeSplitEdges, GeometryNodeSubdivideMesh,
+  GeometryNodeSetShadeSmooth,
+} from '../nodes/geometry/MoreOps';
+import {
   GeometryNodeAccumulateField, GeometryNodeFieldOnDomain, GeometryNodeFieldAtIndex,
   GeometryNodeAttributeDomainSize,
 } from '../nodes/geometry/FieldUtils';
@@ -138,9 +146,29 @@ const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const smooth = (t: number): number => t * t * (3 - 2 * t);
 const fract = (x: number): number => x - Math.floor(x);
+/**
+ * 32-bit integer hash (PCG / Wang-style) — returns a deterministic uniform
+ * float in [0,1). Replaces the legacy `sin(x*127.1)*43758.5` ShaderToy hash,
+ * which produced visible banding/repetition at large scales and was not
+ * platform-stable.
+ *
+ * Operates on the integer (and fractional, quantised) parts of the inputs so
+ * non-integer call sites still produce smooth pseudo-random values when used
+ * inside value-noise lattices.
+ */
 function hash2(x: number, y: number): number {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-  return fract(s);
+  // Quantise the fractional part to 24 bits to retain sub-cell variation.
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const xf = Math.floor((x - xi) * 0xffffff);
+  const yf = Math.floor((y - yi) * 0xffffff);
+  let h = (xi * 0x27d4eb2d) ^ (yi * 0x165667b1) ^ (xf * 0x9e3779b1) ^ (yf * 0x85ebca6b);
+  h = (h ^ (h >>> 15)) >>> 0;
+  h = Math.imul(h, 0x2c1b3c6d) >>> 0;
+  h = (h ^ (h >>> 12)) >>> 0;
+  h = Math.imul(h, 0x297a2d39) >>> 0;
+  h = (h ^ (h >>> 15)) >>> 0;
+  return (h >>> 0) / 0x100000000;
 }
 function valueNoise2(x: number, y: number): number {
   const xi = Math.floor(x), yi = Math.floor(y);
@@ -836,22 +864,68 @@ export class GeometryEvaluator implements SystemEvaluator {
     if (node instanceof GeometryNodeAccumulateField) {
       const valF = this.socketField(node.inputs[0]!, cache);
       const dom = (node.domain as AttributeDomain) ?? 'POINT';
-      const leading: Field = { kind: 'FLOAT', eval(ctx) {
+      const dt = node.data_type;
+      // Choose a result kind that propagates correctly to downstream nodes.
+      const kind: FieldKind = dt === 'FLOAT_VECTOR' ? 'VECTOR' : dt === 'INT' ? 'INT' : 'FLOAT';
+      const dims = kind === 'VECTOR' ? 3 : 1;
+
+      const makeArr = (n: number): Float32Array | Int32Array =>
+        kind === 'INT' ? new Int32Array(n) : new Float32Array(n);
+
+      const leading: Field = { kind, eval(ctx) {
         const arr = valF.eval({ geometry: ctx.geometry, domain: dom, size: ctx.geometry.domainSize(dom) }) as ArrayLike<number>;
-        const out = new Float32Array(ctx.size); let acc = 0;
-        for (let i = 0; i < ctx.size; i++) { acc += Number(arr[i] ?? 0); out[i] = acc; }
+        const out = makeArr(ctx.size * dims);
+        if (dims === 1) {
+          let acc = 0;
+          for (let i = 0; i < ctx.size; i++) { acc += Number(arr[i] ?? 0); (out as any)[i] = acc; }
+        } else {
+          let ax = 0, ay = 0, az = 0;
+          for (let i = 0; i < ctx.size; i++) {
+            ax += Number(arr[i * 3] ?? 0);
+            ay += Number(arr[i * 3 + 1] ?? 0);
+            az += Number(arr[i * 3 + 2] ?? 0);
+            (out as any)[i * 3] = ax; (out as any)[i * 3 + 1] = ay; (out as any)[i * 3 + 2] = az;
+          }
+        }
         return out;
       } };
-      const trailing: Field = { kind: 'FLOAT', eval(ctx) {
+      const trailing: Field = { kind, eval(ctx) {
         const arr = valF.eval({ geometry: ctx.geometry, domain: dom, size: ctx.geometry.domainSize(dom) }) as ArrayLike<number>;
-        const out = new Float32Array(ctx.size); let acc = 0;
-        for (let i = 0; i < ctx.size; i++) { out[i] = acc; acc += Number(arr[i] ?? 0); }
+        const out = makeArr(ctx.size * dims);
+        if (dims === 1) {
+          let acc = 0;
+          for (let i = 0; i < ctx.size; i++) { (out as any)[i] = acc; acc += Number(arr[i] ?? 0); }
+        } else {
+          let ax = 0, ay = 0, az = 0;
+          for (let i = 0; i < ctx.size; i++) {
+            (out as any)[i * 3] = ax; (out as any)[i * 3 + 1] = ay; (out as any)[i * 3 + 2] = az;
+            ax += Number(arr[i * 3] ?? 0);
+            ay += Number(arr[i * 3 + 1] ?? 0);
+            az += Number(arr[i * 3 + 2] ?? 0);
+          }
+        }
         return out;
       } };
-      const total: Field = { kind: 'FLOAT', eval(ctx) {
+      const total: Field = { kind, eval(ctx) {
         const arr = valF.eval({ geometry: ctx.geometry, domain: dom, size: ctx.geometry.domainSize(dom) }) as ArrayLike<number>;
-        let acc = 0; for (let i = 0; i < arr.length; i++) acc += Number(arr[i] ?? 0);
-        const out = new Float32Array(ctx.size); out.fill(acc); return out;
+        const out = makeArr(ctx.size * dims);
+        if (dims === 1) {
+          let acc = 0;
+          for (let i = 0; i < arr.length; i++) acc += Number(arr[i] ?? 0);
+          (out as any).fill(acc);
+        } else {
+          let tx = 0, ty = 0, tz = 0;
+          const elems = (arr.length / 3) | 0;
+          for (let i = 0; i < elems; i++) {
+            tx += Number(arr[i * 3] ?? 0);
+            ty += Number(arr[i * 3 + 1] ?? 0);
+            tz += Number(arr[i * 3 + 2] ?? 0);
+          }
+          for (let i = 0; i < ctx.size; i++) {
+            (out as any)[i * 3] = tx; (out as any)[i * 3 + 1] = ty; (out as any)[i * 3 + 2] = tz;
+          }
+        }
+        return out;
       } };
       cache.set(node.outputs[0]!.id, leading);
       cache.set(node.outputs[1]!.id, trailing);
@@ -1240,19 +1314,41 @@ export class GeometryEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof CompareNode) {
-      const a = this.socketField(node.inputs[0]!, cache);
-      const b = this.socketField(node.inputs[1]!, cache);
-      const eps = this.socketField(node.inputs[2]!, cache);
+      const sockA = node.inputs.find((s) => s.name === 'A');
+      const sockB = node.inputs.find((s) => s.name === 'B');
+      const sockE = node.inputs.find((s) => s.name === 'Epsilon');
+      const a = sockA ? this.socketField(sockA, cache) : liftToField(0, 'FLOAT');
+      const b = sockB ? this.socketField(sockB, cache) : liftToField(0, 'FLOAT');
+      const eps = sockE ? this.socketField(sockE, cache) : liftToField(0, 'FLOAT');
       const op = node.operation;
+      const dt = node.data_type;
       cache.set(node.outputs[0]!.id, {
         kind: 'BOOL',
         eval(ctx) {
-          const av = a.eval(ctx) as Float32Array;
-          const bv = b.eval(ctx) as Float32Array;
           const ev = eps.eval(ctx) as Float32Array;
           const out = new Uint8Array(ctx.size);
-          for (let i = 0; i < ctx.size; i++) {
-            out[i] = CompareNode.compute(op, av[i]!, bv[i]!, ev[i]!) ? 1 : 0;
+          if (dt === 'VECTOR') {
+            const av = a.eval(ctx) as Float32Array; // length size*3
+            const bv = b.eval(ctx) as Float32Array;
+            for (let i = 0; i < ctx.size; i++) {
+              const aa: Vec3 = [av[i*3]!, av[i*3+1]!, av[i*3+2]!];
+              const bb: Vec3 = [bv[i*3]!, bv[i*3+1]!, bv[i*3+2]!];
+              out[i] = CompareNode.computeVec(op, aa, bb, ev[i]!) ? 1 : 0;
+            }
+          } else if (dt === 'RGBA') {
+            const av = a.eval(ctx) as Float32Array; // length size*4
+            const bv = b.eval(ctx) as Float32Array;
+            for (let i = 0; i < ctx.size; i++) {
+              const aa = [av[i*4]!, av[i*4+1]!, av[i*4+2]!, av[i*4+3]!] as const;
+              const bb = [bv[i*4]!, bv[i*4+1]!, bv[i*4+2]!, bv[i*4+3]!] as const;
+              out[i] = CompareNode.computeColor(op, aa as any, bb as any, ev[i]!) ? 1 : 0;
+            }
+          } else {
+            const av = a.eval(ctx) as Float32Array;
+            const bv = b.eval(ctx) as Float32Array;
+            for (let i = 0; i < ctx.size; i++) {
+              out[i] = CompareNode.compute(op, Number(av[i] ?? 0), Number(bv[i] ?? 0), Number(ev[i] ?? 0)) ? 1 : 0;
+            }
           }
           return out;
         },
@@ -2389,6 +2485,187 @@ export class GeometryEvaluator implements SystemEvaluator {
           return out;
         },
       } satisfies Field);
+      return;
+    }
+
+    /* ---------------- Additional ops (Phase 3 audit) ---------------- */
+    if (node instanceof GeometryNodeRaycast) {
+      const target = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const srcF = this.socketField(node.inputs[2]!, cache);
+      const dirF = this.socketField(node.inputs[3]!, cache);
+      const lenF = this.socketField(node.inputs[4]!, cache);
+      const wrap = (axis: 0 | 1 | 2, pickHit: boolean, isNormal: boolean, scalar: boolean): Field => ({
+        kind: scalar ? 'FLOAT' : (isNormal || !pickHit ? 'VECTOR' : 'VECTOR'),
+        eval(ctx) {
+          const sv = srcF.eval(ctx) as Float32Array;
+          const dv = dirF.eval(ctx) as Float32Array;
+          const lv = lenF.eval(ctx) as Float32Array;
+          if (scalar) {
+            const out = new Float32Array(ctx.size);
+            for (let i = 0; i < ctx.size; i++) {
+              const r = raycastMesh(
+                target,
+                [sv[i * 3]!, sv[i * 3 + 1]!, sv[i * 3 + 2]!],
+                [dv[i * 3]!, dv[i * 3 + 1]!, dv[i * 3 + 2]!],
+                lv[i] ?? 100,
+              );
+              out[i] = r.distance;
+            }
+            return out;
+          }
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = raycastMesh(
+              target,
+              [sv[i * 3]!, sv[i * 3 + 1]!, sv[i * 3 + 2]!],
+              [dv[i * 3]!, dv[i * 3 + 1]!, dv[i * 3 + 2]!],
+              lv[i] ?? 100,
+            );
+            const v = isNormal ? r.normal : r.position;
+            out[i * 3] = v[0]; out[i * 3 + 1] = v[1]; out[i * 3 + 2] = v[2];
+          }
+          return out;
+        },
+      });
+      const isHitF: Field = {
+        kind: 'BOOL',
+        eval(ctx) {
+          const sv = srcF.eval(ctx) as Float32Array;
+          const dv = dirF.eval(ctx) as Float32Array;
+          const lv = lenF.eval(ctx) as Float32Array;
+          const out = new Uint8Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = raycastMesh(
+              target,
+              [sv[i * 3]!, sv[i * 3 + 1]!, sv[i * 3 + 2]!],
+              [dv[i * 3]!, dv[i * 3 + 1]!, dv[i * 3 + 2]!],
+              lv[i] ?? 100,
+            );
+            out[i] = r.hit ? 1 : 0;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, isHitF);
+      cache.set(node.outputs[1]!.id, wrap(0, true, false, false));
+      cache.set(node.outputs[2]!.id, wrap(0, true, true, false));
+      cache.set(node.outputs[3]!.id, wrap(0, true, false, true));
+      // Attribute output: pass-through the input attribute field (we don't
+      // do nearest-face attribute interpolation yet — Blender-accurate
+      // INTERPOLATED mode would require barycentric lookup).
+      cache.set(node.outputs[4]!.id, this.socketField(node.inputs[1]!, cache));
+      return;
+    }
+    if (node instanceof GeometryNodeExtrudeMesh) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const selF = this.socketField(node.inputs[1]!, cache);
+      const offsetF = this.socketField(node.inputs[2]!, cache);
+      const scaleF = this.socketField(node.inputs[3]!, cache);
+      const individual = !!this.socketSingle<boolean>(node.inputs[4]!, cache, geo);
+      const ctx: FieldContext = { geometry: geo, domain: 'FACE', size: geo.domainSize('FACE') };
+      const selV = selF.eval(ctx);
+      const offV = offsetF.eval(ctx) as Float32Array;
+      const sclV = scaleF.eval(ctx) as Float32Array;
+      const off: Vec3 = offV.length >= 3
+        ? [offV[0]!, offV[1]!, offV[2]!]
+        : [0, 0, 0];
+      const sc = sclV[0] ?? 1;
+      const r = extrudeMesh(geo, selV, off, sc, node.mode, individual);
+      cache.set(node.outputs[0]!.id, r.mesh);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'BOOL',
+        eval(c) {
+          const out = new Uint8Array(c.size);
+          const src = r.topSelection;
+          for (let i = 0; i < Math.min(c.size, src.length); i++) out[i] = src[i]!;
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[2]!.id, {
+        kind: 'BOOL',
+        eval(c) {
+          const out = new Uint8Array(c.size);
+          const src = r.sideSelection;
+          for (let i = 0; i < Math.min(c.size, src.length); i++) out[i] = src[i]!;
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeDeleteGeometry) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const dom = (node.domain === 'CURVE' || node.domain === 'INSTANCE') ? 'POINT' : (node.domain as 'POINT' | 'EDGE' | 'FACE');
+      const ctx: FieldContext = { geometry: geo, domain: dom as AttributeDomain, size: geo.domainSize(dom as AttributeDomain) };
+      cache.set(node.outputs[0]!.id, deleteGeometry(geo, sel.eval(ctx), dom));
+      return;
+    }
+    if (node instanceof GeometryNodeSeparateGeometry) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const dom = (node.domain === 'CURVE' || node.domain === 'INSTANCE') ? 'POINT' : (node.domain as 'POINT' | 'EDGE' | 'FACE');
+      const ctx: FieldContext = { geometry: geo, domain: dom as AttributeDomain, size: geo.domainSize(dom as AttributeDomain) };
+      const r = separateGeometry(geo, sel.eval(ctx), dom);
+      cache.set(node.outputs[0]!.id, r.selected);
+      cache.set(node.outputs[1]!.id, r.inverted);
+      return;
+    }
+    if (node instanceof GeometryNodeDuplicateElements) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const amount = Math.max(0, Math.floor(this.socketSingle<number>(node.inputs[2]!, cache, geo) || 1));
+      const dom = node.domain as 'POINT' | 'EDGE' | 'FACE' | 'CURVE' | 'INSTANCE';
+      const fdom: AttributeDomain = (dom === 'CURVE' || dom === 'INSTANCE') ? 'POINT' : (dom as AttributeDomain);
+      const ctx: FieldContext = { geometry: geo, domain: fdom, size: geo.domainSize(fdom) };
+      const r = duplicateElements(geo, sel.eval(ctx), amount, dom);
+      cache.set(node.outputs[0]!.id, r.geometry);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'INT',
+        eval(c) {
+          const out = new Int32Array(c.size);
+          for (let i = 0; i < Math.min(c.size, r.duplicateIndex.length); i++) out[i] = r.duplicateIndex[i]!;
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeMeshToCurve) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const selV = node.inputs[1]!.is_linked
+        ? this.fieldOnDomain(sel, geo, 'FACE')
+        : null;
+      cache.set(node.outputs[0]!.id, meshToCurve(geo, selV));
+      return;
+    }
+    if (node instanceof GeometryNodeSplitEdges) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const selV = this.fieldOnDomain(sel, geo, 'EDGE');
+      cache.set(node.outputs[0]!.id, splitEdges(geo, selV));
+      return;
+    }
+    if (node instanceof GeometryNodeSubdivideMesh) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const level = Math.max(0, Math.min(6, Math.floor(this.socketSingle<number>(node.inputs[1]!, cache, geo) || 1)));
+      // Subdivide Mesh is the simple (non-Catmull-Clark) variant; reuse SubSurf level=N as approximation.
+      cache.set(node.outputs[0]!.id, subdivisionSurface(geo, level));
+      return;
+    }
+    if (node instanceof GeometryNodeSetShadeSmooth) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const smooth = this.socketField(node.inputs[2]!, cache);
+      const nFaces = geo.domainSize('FACE');
+      const selArr = this.fieldOnDomain(sel, geo, 'FACE');
+      const smArr = this.fieldOnDomain(smooth, geo, 'FACE');
+      const out = new Uint8Array(nFaces);
+      const existing = geo.mesh?.attributes.get('shade_smooth');
+      for (let i = 0; i < nFaces; i++) {
+        const prev = existing ? ((existing.data as ArrayLike<number>)[i] ?? 0) : 0;
+        out[i] = selArr[i] ? (smArr[i] ? 1 : 0) : prev;
+      }
+      cache.set(node.outputs[0]!.id, storeAttributeOn(geo, 'shade_smooth', 'FACE', 'BOOL', out));
       return;
     }
 

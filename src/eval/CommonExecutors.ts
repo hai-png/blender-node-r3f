@@ -10,10 +10,11 @@
  * by bl_idname, falling back to evaluator-specific handlers for system-
  * specific nodes (BSDFs, geo ops, etc.).
  */
-import type { Node, ValueCache, ExecCtx } from './NodeExecute';
+import type { ValueCache, ExecCtx } from './NodeExecute';
 import { registerExecutor } from './NodeExecute';
+import type { Node } from '../core/Node';
 import type { Vec3, RGBA } from '../core/types';
-import type { NodeSocket } from '../core/NodeSocket';
+// (NodeSocket type re-imported transitively via Node; kept implicit to avoid unused.)
 
 import { ValueNode, RGBNode, VectorNode } from '../nodes/common/Value';
 import { MathNode } from '../nodes/common/Math';
@@ -277,13 +278,45 @@ export function registerCommonExecutors(): void {
     out(node, 'Boolean', cache, BooleanMathNode.compute(bn.operation as any, a, b2));
   });
 
-  // Compare
+  // Compare (Float / Int / Vector / Color)
   registerExecutor(CompareNode.bl_idname, (node, cache, ctx) => {
     const cn = node as unknown as { operation: string; data_type: string };
-    const a = inp<number>(node, 'A', cache, ctx, 0);
-    const b = inp<number>(node, 'B', cache, ctx, 0);
     const eps = inp<number>(node, 'Epsilon', cache, ctx, 0);
-    out(node, 'Result', cache, CompareNode.compute(cn.operation as any, a, b, eps));
+    let result = false;
+    switch (cn.data_type) {
+      case 'INT': {
+        const a = inp<number>(node, 'A', cache, ctx, 0) | 0;
+        const b = inp<number>(node, 'B', cache, ctx, 0) | 0;
+        result = CompareNode.compute(cn.operation as any, a, b, 0);
+        break;
+      }
+      case 'VECTOR': {
+        const a = inp<Vec3>(node, 'A', cache, ctx, [0, 0, 0]);
+        const b = inp<Vec3>(node, 'B', cache, ctx, [0, 0, 0]);
+        result = CompareNode.computeVec(cn.operation as any, a, b, eps);
+        break;
+      }
+      case 'RGBA': {
+        const a = inp<RGBA>(node, 'A', cache, ctx, [0, 0, 0, 1]);
+        const b = inp<RGBA>(node, 'B', cache, ctx, [0, 0, 0, 1]);
+        result = CompareNode.computeColor(cn.operation as any, a, b, eps);
+        break;
+      }
+      case 'STRING': {
+        const a = inp<unknown>(node, 'A', cache, ctx, '');
+        const b = inp<unknown>(node, 'B', cache, ctx, '');
+        const as = String(a), bs = String(b);
+        result = cn.operation === 'NOT_EQUAL' ? as !== bs : as === bs;
+        break;
+      }
+      case 'FLOAT':
+      default: {
+        const a = inp<number>(node, 'A', cache, ctx, 0);
+        const b = inp<number>(node, 'B', cache, ctx, 0);
+        result = CompareNode.compute(cn.operation as any, a, b, eps);
+      }
+    }
+    out(node, 'Result', cache, result);
   });
 
   // Random Value
@@ -294,11 +327,13 @@ export function registerCommonExecutors(): void {
     out(node, 'Value', cache, r0); // float output
   });
 
-  // Switch
+  // Switch (dynamic-typed: looks up by name "False"/"True"/"Output").
   registerExecutor(SwitchNode.bl_idname, (node, cache, ctx) => {
     const cond = !!inp<boolean>(node, 'Switch', cache, ctx, false);
-    const falseV = ctx.socketValue(node.inputs[1]!, cache);
-    const trueV = ctx.socketValue(node.inputs[2]!, cache);
+    const falseSock = node.inputs.find((s) => s.name === 'False');
+    const trueSock  = node.inputs.find((s) => s.name === 'True');
+    const falseV = falseSock ? ctx.socketValue(falseSock, cache) : undefined;
+    const trueV  = trueSock  ? ctx.socketValue(trueSock,  cache) : undefined;
     out(node, 'Output', cache, cond ? trueV : falseV);
   });
 

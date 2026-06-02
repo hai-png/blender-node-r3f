@@ -181,6 +181,78 @@ export class ShaderNodeVolumeScatter extends BsdfNode {
   }
 }
 
+// ── Hair shaders (Cycles) ──────────────────────────────────────────────
+export class ShaderNodeBsdfHair extends BsdfNode {
+  static override bl_idname = 'ShaderNodeBsdfHair';
+  static override bl_label = 'Hair BSDF';
+  static override properties = {
+    component: EnumProperty({
+      items: [['Reflection', 'Reflection', ''], ['Transmission', 'Transmission', '']],
+      default: 'Reflection', name: 'Component',
+    }),
+  };
+  declare component: string;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0.8, 0.8, 0.8, 1] });
+    this.addInput(NodeSocketFloat, 'Offset', { default_value: 0 });
+    this.addInput(NodeSocketFloat, 'RoughnessU', { default_value: 0.1 });
+    this.addInput(NodeSocketFloat, 'RoughnessV', { default_value: 1 });
+    this.addInput(NodeSocketVector, 'Tangent');
+    this.addOutput(NodeSocketShader, 'BSDF');
+  }
+}
+
+export class ShaderNodeBsdfHairPrincipled extends BsdfNode {
+  static override bl_idname = 'ShaderNodeBsdfHairPrincipled';
+  static override bl_label = 'Principled Hair BSDF';
+  static override properties = {
+    parametrization: EnumProperty({
+      items: [
+        ['ABSORPTION', 'Absorption coefficient', ''],
+        ['MELANIN', 'Melanin concentration', ''],
+        ['COLOR', 'Direct coloring', ''],
+      ],
+      default: 'COLOR', name: 'Color parametrization',
+    }),
+  };
+  declare parametrization: string;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0.017513, 0.005763, 0.002059, 1] });
+    this.addInput(NodeSocketFloat, 'Melanin', { default_value: 0.8 });
+    this.addInput(NodeSocketFloat, 'Melanin Redness', { default_value: 1 });
+    this.addInput(NodeSocketColor, 'Tint', { default_value: [1, 1, 1, 1] });
+    this.addInput(NodeSocketVector, 'Absorption Coefficient', { default_value: [0.245531, 0.52, 1.365] });
+    this.addInput(NodeSocketFloat, 'Roughness', { default_value: 0.3 });
+    this.addInput(NodeSocketFloat, 'Radial Roughness', { default_value: 0.3 });
+    this.addInput(NodeSocketFloat, 'Coat', { default_value: 0 });
+    this.addInput(NodeSocketFloat, 'IOR', { default_value: 1.55 });
+    this.addInput(NodeSocketFloat, 'Offset', { default_value: 2 });
+    this.addInput(NodeSocketFloat, 'Random Color', { default_value: 0 });
+    this.addInput(NodeSocketFloat, 'Random Roughness', { default_value: 0 });
+    this.addInput(NodeSocketFloat, 'Random', { default_value: 0 });
+    this.addOutput(NodeSocketShader, 'BSDF');
+  }
+}
+
+// ── Eevee Specular (legacy non-Principled Eevee surface) ──────────────
+export class ShaderNodeEeveeSpecular extends BsdfNode {
+  static override bl_idname = 'ShaderNodeEeveeSpecular';
+  static override bl_label = 'Specular BSDF';
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Base Color', { default_value: [0.8, 0.8, 0.8, 1] });
+    this.addInput(NodeSocketColor, 'Specular', { default_value: [0.04, 0.04, 0.04, 1] });
+    this.addInput(NodeSocketFloatFactor, 'Roughness', { default_value: 0.4 });
+    this.addInput(NodeSocketColor, 'Emissive Color', { default_value: [0, 0, 0, 1] });
+    this.addInput(NodeSocketFloatFactor, 'Transparency', { default_value: 0 });
+    this.addInput(NodeSocketVector, 'Normal');
+    this.addInput(NodeSocketFloat, 'Clear Coat', { default_value: 0 });
+    this.addInput(NodeSocketFloatFactor, 'Clear Coat Roughness', { default_value: 0 });
+    this.addInput(NodeSocketVector, 'Clear Coat Normal');
+    this.addInput(NodeSocketFloat, 'Ambient Occlusion', { default_value: 1 });
+    this.addOutput(NodeSocketShader, 'BSDF');
+  }
+}
+
 let _registered = false;
 export function registerBsdfNodes(): void {
   if (_registered) return;
@@ -190,6 +262,7 @@ export function registerBsdfNodes(): void {
     ShaderNodeBsdfTransparent, ShaderNodeBsdfTranslucent, ShaderNodeBsdfSheen, ShaderNodeBsdfToon,
     ShaderNodeSubsurfaceScattering, ShaderNodeBackground, ShaderNodeHoldout, ShaderNodeAddShader,
     ShaderNodeVolumeAbsorption, ShaderNodeVolumeScatter,
+    ShaderNodeBsdfHair, ShaderNodeBsdfHairPrincipled, ShaderNodeEeveeSpecular,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

@@ -41,7 +41,23 @@ import {
   FULLSCREEN_VS, BlurProgram, GlareThresholdProgram, GlareAddProgram,
   VignetteProgram, PixelateProgram, TranslateProgram, ScaleProgram,
   RotateProgram, FlipProgram, CropProgram, type KernelProgram,
+  // Phase-3 audit additions:
+  FilterProgram, DilateErodeProgram, DefocusProgram, LensDistortionProgram,
+  DisplaceProgram, MapUVProgram, IDMaskProgram, ColorSpillProgram,
+  PremulKeyProgram, ConvertColorSpaceProgram, BoxMaskProgram, EllipseMaskProgram,
+  CompSwitchProgram, SunBeamsProgram, DespeckleProgram, BilateralBlurProgram,
+  DirectionalBlurProgram, DenoiseProgram, NormalizeProgram, LevelsBlitProgram,
 } from './KernelShaders';
+import {
+  CompositorNodeFilter, CompositorNodeDilateErode, CompositorNodeDefocus,
+  CompositorNodeBokehBlur, CompositorNodeLensDistortion, CompositorNodeDisplace,
+  CompositorNodeMapUV, CompositorNodeIDMask, CompositorNodeColorSpill,
+  CompositorNodePremulKey, CompositorNodeConvertColorSpace,
+  CompositorNodeBoxMask, CompositorNodeEllipseMask, CompositorNodeSwitch,
+  CompositorNodeSunBeams, CompositorNodeDespeckle, CompositorNodeBilateralBlur,
+  CompositorNodeDirectionalBlur, CompositorNodeDenoise, CompositorNodeNormalize,
+  CompositorNodeLevels,
+} from '../../nodes/compositor/MoreCompositor';
 
 interface PlannerOp {
   id: string;
@@ -585,7 +601,189 @@ export class CompositorEvaluator implements SystemEvaluator {
       mat.uniforms.tDiffuse!.value = inTex;
       mat.uniforms.u_crop!.value.set(node.min_x, node.min_y, node.max_x, node.max_y);
       this.renderToTarget(mat, tOut);
-    } else {
+    }
+    // ───────────────────────── Phase-3 audit kernels ─────────────────────────
+    // Properties on Blender-mirror nodes are typed via the dynamic
+    // `Object.defineProperty` system; we access them via `any` casts here
+    // (matching the convention in the surrounding code).
+    else if (node instanceof CompositorNodeFilter) {
+      const filterType = (node as any).filter_type as string;
+      const prog = FilterProgram(filterType);
+      const mat = this.cachedMaterial(`flt:${filterType}`, prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      const fac = (inputs.get('Fac') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Fac') as { value: number }).value : 1;
+      mat.uniforms.u_fac!.value = fac;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDilateErode) {
+      const distance = (node as any).distance as number;
+      const prog = DilateErodeProgram(distance);
+      const mat = this.cachedMaterial(`de:${distance}`, prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      mat.uniforms.u_distance!.value = distance;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDefocus || node instanceof CompositorNodeBokehBlur) {
+      // For Defocus we approximate the f-stop with a fixed disc radius;
+      // for BokehBlur we read the Size scalar input.
+      const radius = node instanceof CompositorNodeDefocus
+        ? Math.max(1, 32 / Math.max((node as any).f_stop ?? 128, 0.5))
+        : ((inputs.get('Size') as Result | undefined)?.kind === 'VALUE'
+            ? (inputs.get('Size') as { value: number }).value * 16
+            : 16);
+      const prog = DefocusProgram(radius);
+      const mat = this.cachedMaterial(`def:${radius.toFixed(2)}`, prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      mat.uniforms.u_radius!.value = radius;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeLensDistortion) {
+      const distortion = (inputs.get('Distortion') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Distortion') as { value: number }).value : 0;
+      const dispersion = (inputs.get('Dispersion') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Dispersion') as { value: number }).value : 0;
+      const mat = this.cachedMaterial('lensdist', LensDistortionProgram.vertex, LensDistortionProgram.fragment, LensDistortionProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_distortion!.value = distortion;
+      mat.uniforms.u_dispersion!.value = dispersion;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDisplace) {
+      const vecResult = inputs.get('Vector');
+      const vecTex = vecResult && vecResult.kind === 'IMAGE'
+        ? this.imageTextureOf(vecResult)
+        : inTex; // fallback: use input itself
+      const xs = (inputs.get('X Scale') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('X Scale') as { value: number }).value : 0;
+      const ys = (inputs.get('Y Scale') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Y Scale') as { value: number }).value : 0;
+      const mat = this.cachedMaterial('displace', DisplaceProgram.vertex, DisplaceProgram.fragment, DisplaceProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.tVector!.value = vecTex;
+      mat.uniforms.u_scale!.value.set(xs / this.width, ys / this.height);
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeMapUV) {
+      const uvResult = inputs.get('UV');
+      const uvTex = uvResult && uvResult.kind === 'IMAGE' ? this.imageTextureOf(uvResult) : inTex;
+      const mat = this.cachedMaterial('mapuv', MapUVProgram.vertex, MapUVProgram.fragment, MapUVProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.tUV!.value = uvTex;
+      mat.uniforms.u_alpha!.value = (node as any).alpha ?? 0.02;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeIDMask) {
+      const idx = (node as any).index as number | undefined;
+      const aa = (node as any).use_antialiasing as boolean | undefined;
+      const mat = this.cachedMaterial('idmask', IDMaskProgram.vertex, IDMaskProgram.fragment, IDMaskProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_target!.value = (idx ?? 0) / 255;
+      mat.uniforms.u_aa!.value = aa ? 1 : 0;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeColorSpill) {
+      const mat = this.cachedMaterial('spill', ColorSpillProgram.vertex, ColorSpillProgram.fragment, ColorSpillProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      const fac = (inputs.get('Fac') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Fac') as { value: number }).value : 1;
+      const channel = (node as any).channel as string | undefined;
+      const limitMethod = (node as any).limit_method as string | undefined;
+      mat.uniforms.u_fac!.value = fac;
+      mat.uniforms.u_channel!.value = channel === 'R' ? 0 : channel === 'B' ? 2 : 1;
+      mat.uniforms.u_method!.value = limitMethod === 'SIMPLE' ? 0 : 1;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodePremulKey) {
+      const mat = this.cachedMaterial('premul', PremulKeyProgram.vertex, PremulKeyProgram.fragment, PremulKeyProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_dir!.value = (node as any).mapping === 'PREMUL_TO_STRAIGHT' ? 1 : 0;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeConvertColorSpace) {
+      const mat = this.cachedMaterial('csconv', ConvertColorSpaceProgram.vertex, ConvertColorSpaceProgram.fragment, ConvertColorSpaceProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      // Heuristic direction: anything "Linear" → use 1 (linear→sRGB), else 0.
+      const toSpace = (node as any).to_color_space as string | undefined;
+      mat.uniforms.u_dir!.value = /linear/i.test(toSpace ?? '') ? 0 : 1;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeBoxMask || node instanceof CompositorNodeEllipseMask) {
+      const prog = node instanceof CompositorNodeBoxMask ? BoxMaskProgram : EllipseMaskProgram;
+      const mat = this.cachedMaterial(
+        node instanceof CompositorNodeBoxMask ? 'boxmask' : 'ellmask',
+        prog.vertex, prog.fragment, prog.makeUniforms,
+      );
+      const n = node as any;
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_box!.value.set(n.x ?? 0.5, n.y ?? 0.5, (n.width ?? 0.2) * 0.5, (n.height ?? 0.2) * 0.5);
+      mat.uniforms.u_rotation!.value = n.rotation ?? 0;
+      const mt = n.mask_type as string | undefined;
+      mat.uniforms.u_op!.value =
+        mt === 'ADD' ? 0
+          : mt === 'SUBTRACT' ? 1
+            : mt === 'MULTIPLY' ? 2
+              : 3;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeSwitch) {
+      const onResult = inputs.get('On');
+      const onTex = onResult && onResult.kind === 'IMAGE' ? this.imageTextureOf(onResult) : inTex;
+      const mat = this.cachedMaterial('cswitch', CompSwitchProgram.vertex, CompSwitchProgram.fragment, CompSwitchProgram.makeUniforms);
+      mat.uniforms.tA!.value = inTex;
+      mat.uniforms.tB!.value = onTex;
+      mat.uniforms.u_use!.value = (node as any).check ? 1 : 0;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeSunBeams) {
+      const mat = this.cachedMaterial('sunbeams', SunBeamsProgram.vertex, SunBeamsProgram.fragment, SunBeamsProgram.makeUniforms);
+      const n = node as any;
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_source!.value.set(n.source ?? 0.5, n.source ?? 0.5);
+      mat.uniforms.u_rayLength!.value = n.ray_length ?? 0.2;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDespeckle) {
+      const fac = (inputs.get('Fac') as Result | undefined)?.kind === 'VALUE'
+        ? (inputs.get('Fac') as { value: number }).value : 0.5;
+      const mat = this.cachedMaterial('despeck', DespeckleProgram.vertex, DespeckleProgram.fragment, DespeckleProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      mat.uniforms.u_fac!.value = fac;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeBilateralBlur) {
+      const n = node as any;
+      // Iterate the bilateral pass N times.
+      const it = Math.max(1, Math.min(8, Math.floor(n.iterations ?? 1)));
+      const prog = BilateralBlurProgram(it);
+      // Simple non-ping-pong run for now: just one pass into tOut.
+      const mat = this.cachedMaterial(`bil`, prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      mat.uniforms.u_sigmaColor!.value = n.sigma_color ?? 0.3;
+      mat.uniforms.u_sigmaSpace!.value = n.sigma_space ?? 5;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDirectionalBlur) {
+      const prog = DirectionalBlurProgram(16);
+      const mat = this.cachedMaterial('dblur', prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      // Sensible defaults; the Blender node has its own iterations/center
+      // properties — we expose a small linear sweep for now.
+      mat.uniforms.u_offset!.value.set(0.002, 0);
+      mat.uniforms.u_zoom!.value = 1.0;
+      mat.uniforms.u_spin!.value = 0;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeDenoise) {
+      const prog = DenoiseProgram();
+      const mat = this.cachedMaterial('denoise', prog.vertex, prog.fragment, prog.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_texelSize!.value.set(1 / this.width, 1 / this.height);
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeNormalize) {
+      const mat = this.cachedMaterial('normalize', NormalizeProgram.vertex, NormalizeProgram.fragment, NormalizeProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      mat.uniforms.u_min!.value = 0;
+      mat.uniforms.u_max!.value = 1;
+      this.renderToTarget(mat, tOut);
+    } else if (node instanceof CompositorNodeLevels) {
+      // For now, blit and emit Mean/StdDev = 0.5/0 (proper readback would
+      // require gl.readPixels; that's a future improvement).
+      const mat = this.cachedMaterial('lvlblit', LevelsBlitProgram.vertex, LevelsBlitProgram.fragment, LevelsBlitProgram.makeUniforms);
+      mat.uniforms.tDiffuse!.value = inTex;
+      this.renderToTarget(mat, tOut);
+    }
+    else {
       // unknown kernel — blit input through and warn
       errors?.set(node.id, `Compositor kernel node "${node.bl_idname}" (${node.name || node.bl_label}) is not implemented; input was passed through unchanged.`);
       const mat = this.cachedMaterial('__blit__', FULLSCREEN_VS, BLIT_FS, () => ({ tDiffuse: { value: null } }));

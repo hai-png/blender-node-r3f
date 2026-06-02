@@ -22,7 +22,7 @@ import { NodeRegistry } from '../../registry/NodeRegistry';
 /** Marker enum used by the planner's dispatcher. */
 export type CompKind = 'INPUT' | 'OUTPUT' | 'PIXEL' | 'KERNEL';
 
-abstract class CompNode extends Node {
+export abstract class CompNode extends Node {
   static override tree_types: NodeTreeKind[] = ['CompositorNodeTree'];
   /**
    * Marker for the evaluator's dispatcher.
@@ -773,5 +773,7 @@ export function registerCompositorNodes(): void {
   }
 }
 
-/** Re-exports for type narrowing in the evaluator. */
-export { CompNode };
+// CompNode is already exported at its declaration site (Phase-3 audit
+// made it `export abstract class CompNode` so MoreCompositor.ts can extend
+// the same shared base — required for the planner's `instanceof CompNode`
+// check to match the additional nodes).

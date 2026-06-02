@@ -2253,3 +2253,451 @@ export function meshBoolean(
   for (let i = 1; i < all.length; i++) acc = csgOperate(acc, meshToCsg(all[i]!), op);
   const g = new Geometry(); g.mesh = csgToMesh(acc); return g;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+//  Additional ops added during Phase 3 audit.
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Raycast — for each (source, direction) pair, find the closest hit on the
+ * target mesh up to `length` units away. CPU brute-force, O(samples × faces).
+ *
+ * The current implementation uses Möller–Trumbore against the triangulated
+ * face buffer. Returns { hit, distance, position, normal } per call.
+ */
+export function raycastMesh(
+  target: Geometry,
+  source: Vec3,
+  direction: Vec3,
+  length: number,
+): { hit: boolean; distance: number; position: Vec3; normal: Vec3 } {
+  const mesh = target.mesh;
+  if (!mesh || mesh.numTris === 0) {
+    return { hit: false, distance: 0, position: [0, 0, 0], normal: [0, 0, 1] };
+  }
+  const tris = mesh.triangles;
+  const p = mesh.positions;
+  const dl = Math.hypot(direction[0], direction[1], direction[2]) || 1;
+  const dx = direction[0] / dl, dy = direction[1] / dl, dz = direction[2] / dl;
+  let bestT = length;
+  let hit = false;
+  let bestNormal: Vec3 = [0, 0, 1];
+  for (let i = 0; i < mesh.numTris; i++) {
+    const ia = tris[i * 3]! * 3, ib = tris[i * 3 + 1]! * 3, ic = tris[i * 3 + 2]! * 3;
+    const ax = p[ia]!, ay = p[ia + 1]!, az = p[ia + 2]!;
+    const bx = p[ib]!, by = p[ib + 1]!, bz = p[ib + 2]!;
+    const cx = p[ic]!, cy = p[ic + 1]!, cz = p[ic + 2]!;
+    // Möller–Trumbore
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    const px = dy * e2z - dz * e2y;
+    const py = dz * e2x - dx * e2z;
+    const pz = dx * e2y - dy * e2x;
+    const det = e1x * px + e1y * py + e1z * pz;
+    if (Math.abs(det) < 1e-9) continue;
+    const invDet = 1 / det;
+    const tx = source[0] - ax, ty = source[1] - ay, tz = source[2] - az;
+    const u = (tx * px + ty * py + tz * pz) * invDet;
+    if (u < 0 || u > 1) continue;
+    const qx = ty * e1z - tz * e1y;
+    const qy = tz * e1x - tx * e1z;
+    const qz = tx * e1y - ty * e1x;
+    const v = (dx * qx + dy * qy + dz * qz) * invDet;
+    if (v < 0 || u + v > 1) continue;
+    const t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+    if (t > 1e-6 && t < bestT) {
+      bestT = t;
+      hit = true;
+      // Triangle normal
+      const nx = e1y * e2z - e1z * e2y;
+      const ny = e1z * e2x - e1x * e2z;
+      const nz = e1x * e2y - e1y * e2x;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      bestNormal = [nx / nl, ny / nl, nz / nl];
+    }
+  }
+  return {
+    hit,
+    distance: hit ? bestT : 0,
+    position: hit ? [source[0] + dx * bestT, source[1] + dy * bestT, source[2] + dz * bestT] : [0, 0, 0],
+    normal: bestNormal,
+  };
+}
+
+/**
+ * Delete Geometry — removes elements (vertices/edges/faces) where `selection`
+ * is truthy. For VERTEX/POINT domain it removes vertices and any face/edge
+ * referencing them. For FACE domain it drops the faces but keeps their
+ * vertices. For EDGE domain it drops the edges (and adjacent faces) but
+ * keeps shared vertices.
+ *
+ * Selection is interpreted as "delete where selection is TRUE" — matching
+ * Blender 4.x.
+ */
+export function deleteGeometry(
+  geo: Geometry,
+  selection: ScalarTypedArray,
+  domain: 'POINT' | 'EDGE' | 'FACE',
+): Geometry {
+  const mesh = geo.mesh;
+  if (!mesh) return geo;
+  // Build the "keep face" mask depending on domain.
+  const numFaces = mesh.numFaces;
+  const keepFace = new Uint8Array(numFaces);
+  keepFace.fill(1);
+
+  if (domain === 'FACE') {
+    for (let f = 0; f < numFaces; f++) if (selection[f]) keepFace[f] = 0;
+  } else if (domain === 'POINT') {
+    const numVerts = mesh.numVerts;
+    const deleteVert = new Uint8Array(numVerts);
+    const lim = Math.min(numVerts, selection.length);
+    for (let v = 0; v < lim; v++) if (selection[v]) deleteVert[v] = 1;
+    for (let f = 0; f < numFaces; f++) {
+      const verts = mesh.faceVerts(f);
+      for (const v of verts) if (deleteVert[v]) { keepFace[f] = 0; break; }
+    }
+  } else if (domain === 'EDGE') {
+    // No explicit edge → face mapping in our model; conservatively drop faces
+    // whose two-vertex pair appears in the dropped edge list.
+    const dropEdgePairs = new Set<string>();
+    const e = mesh.edges();
+    if (e) {
+      const numEdges = e.length / 2;
+      const lim = Math.min(numEdges, selection.length);
+      for (let i = 0; i < lim; i++) {
+        if (!selection[i]) continue;
+        const a = e[i * 2]!, b = e[i * 2 + 1]!;
+        dropEdgePairs.add(a < b ? `${a}_${b}` : `${b}_${a}`);
+      }
+    }
+    for (let f = 0; f < numFaces; f++) {
+      const verts = mesh.faceVerts(f);
+      for (let i = 0; i < verts.length; i++) {
+        const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+        const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+        if (dropEdgePairs.has(k)) { keepFace[f] = 0; break; }
+      }
+    }
+  }
+
+  // Find used vertices in surviving faces.
+  const usedVert = new Uint8Array(mesh.numVerts);
+  for (let f = 0; f < numFaces; f++) {
+    if (!keepFace[f]) continue;
+    for (const v of mesh.faceVerts(f)) usedVert[v] = 1;
+  }
+  // Remap.
+  const remap = new Int32Array(mesh.numVerts);
+  let nv = 0;
+  for (let v = 0; v < mesh.numVerts; v++) {
+    if (usedVert[v]) { remap[v] = nv++; }
+    else remap[v] = -1;
+  }
+  if (domain !== 'POINT') {
+    // POINT domain already used vertex selection; for FACE/EDGE we still keep
+    // all vertices to match Blender's "Only Faces" mode behaviour.
+    for (let v = 0; v < mesh.numVerts; v++) { remap[v] = v; usedVert[v] = 1; nv = mesh.numVerts; }
+  }
+  const newPos = new Float32Array(nv * 3);
+  let w = 0;
+  for (let v = 0; v < mesh.numVerts; v++) {
+    if (!usedVert[v]) continue;
+    newPos[w * 3] = mesh.positions[v * 3]!;
+    newPos[w * 3 + 1] = mesh.positions[v * 3 + 1]!;
+    newPos[w * 3 + 2] = mesh.positions[v * 3 + 2]!;
+    w++;
+  }
+  const polys: number[][] = [];
+  for (let f = 0; f < numFaces; f++) {
+    if (!keepFace[f]) continue;
+    polys.push(mesh.faceVerts(f).map((v) => remap[v]!));
+  }
+  const out = new Geometry();
+  out.mesh = MeshComponent.fromPolys(newPos, polys);
+  return out;
+}
+
+/**
+ * Separate Geometry — splits into (selected, inverted) geometries. Equivalent
+ * to running deleteGeometry twice with complementary masks.
+ */
+export function separateGeometry(
+  geo: Geometry,
+  selection: ScalarTypedArray,
+  domain: 'POINT' | 'EDGE' | 'FACE',
+): { selected: Geometry; inverted: Geometry } {
+  const inverted = new Uint8Array(selection.length);
+  for (let i = 0; i < selection.length; i++) inverted[i] = selection[i] ? 0 : 1;
+  return {
+    selected: deleteGeometry(geo, inverted, domain),
+    inverted: deleteGeometry(geo, selection, domain),
+  };
+}
+
+/**
+ * Mesh to Curve — extracts the wireframe edges of `geo`'s mesh as a poly-curve
+ * spline by walking connected edge chains.
+ *
+ * The output represents each connected component as a separate curve. Curve
+ * data is stored in the Geometry's `curve` component, matching how Blender
+ * holds converted output.
+ */
+export function meshToCurve(geo: Geometry, selection?: ScalarTypedArray | null): Geometry {
+  const mesh = geo.mesh;
+  if (!mesh) return Geometry.empty();
+  // Build an edge adjacency list from face boundaries.
+  const adj = new Map<number, Set<number>>();
+  const addEdge = (a: number, b: number) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    if (!adj.has(b)) adj.set(b, new Set());
+    adj.get(a)!.add(b);
+    adj.get(b)!.add(a);
+  };
+  for (let f = 0; f < mesh.numFaces; f++) {
+    if (selection && !selection[f]) continue;
+    const verts = mesh.faceVerts(f);
+    for (let i = 0; i < verts.length; i++) {
+      addEdge(verts[i]!, verts[(i + 1) % verts.length]!);
+    }
+  }
+  if (adj.size === 0) return Geometry.empty();
+  // Walk connected components, build polylines.
+  const visited = new Set<number>();
+  const lines: number[][] = [];
+  for (const [start] of adj) {
+    if (visited.has(start)) continue;
+    const stack: number[] = [start];
+    const line: number[] = [];
+    while (stack.length) {
+      const v = stack.pop()!;
+      if (visited.has(v)) continue;
+      visited.add(v);
+      line.push(v);
+      for (const n of adj.get(v) ?? []) {
+        if (!visited.has(n)) stack.push(n);
+      }
+    }
+    if (line.length >= 2) lines.push(line);
+  }
+  if (lines.length === 0) return Geometry.empty();
+  // Flatten into a curve component.
+  const totalPts = lines.reduce((s, l) => s + l.length, 0);
+  const positions = new Float32Array(totalPts * 3);
+  const offsets: number[] = [0];
+  let p = 0;
+  for (const line of lines) {
+    for (const v of line) {
+      positions[p * 3] = mesh.positions[v * 3]!;
+      positions[p * 3 + 1] = mesh.positions[v * 3 + 1]!;
+      positions[p * 3 + 2] = mesh.positions[v * 3 + 2]!;
+      p++;
+    }
+    offsets.push(p);
+  }
+  const out = new Geometry();
+  // Use the existing curve component shape (see Geometry.ts).
+  // Most Geometry impls in this codebase carry a `curve` field; if it doesn't
+  // exist on this build, fall back to representing as a points-only mesh.
+  if ('curve' in out) {
+    (out as any).curve = {
+      positions,
+      curveOffsets: new Uint32Array(offsets),
+      cyclic: new Uint8Array(lines.length),
+      resolution: new Uint32Array(lines.length).fill(12),
+      attributes: new Map(),
+    };
+  } else {
+    // Fallback: stash as points.
+    const points = (out as any);
+    points.points = { positions, attributes: new Map() };
+  }
+  return out;
+}
+
+/**
+ * Extrude Mesh (Individual Faces / Vertices) — adds new geometry along
+ * `offset` * `offsetScale`. This implementation only handles the FACES mode
+ * with `individual=true` (per-face): each selected face is detached, lifted,
+ * and stitched back with quad sides.
+ */
+export function extrudeMesh(
+  geo: Geometry,
+  selection: ScalarTypedArray,
+  offset: Vec3,
+  offsetScale: number,
+  mode: 'VERTICES' | 'EDGES' | 'FACES',
+  individual: boolean,
+): { mesh: Geometry; topSelection: Uint8Array; sideSelection: Uint8Array } {
+  const mesh = geo.mesh;
+  if (!mesh) return { mesh: geo, topSelection: new Uint8Array(0), sideSelection: new Uint8Array(0) };
+  if (mode !== 'FACES' || !individual) {
+    // Fallback for unimplemented modes: pass-through unchanged.
+    return { mesh: geo, topSelection: new Uint8Array(0), sideSelection: new Uint8Array(0) };
+  }
+  const polys = polysOf(mesh);
+  const positions = Array.from(mesh.positions);
+  const newPolys: number[][] = [];
+  const topMask: number[] = [];
+  const sideMask: number[] = [];
+  for (let f = 0; f < polys.length; f++) {
+    const verts = polys[f]!;
+    if (!selection[f]) {
+      newPolys.push(verts);
+      topMask.push(0);
+      continue;
+    }
+    // Compute face normal (Newell's).
+    let nx = 0, ny = 0, nz = 0;
+    for (let i = 0; i < verts.length; i++) {
+      const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+      const ax = positions[a * 3]!, ay = positions[a * 3 + 1]!, az = positions[a * 3 + 2]!;
+      const bx = positions[b * 3]!, by = positions[b * 3 + 1]!, bz = positions[b * 3 + 2]!;
+      nx += (ay - by) * (az + bz);
+      ny += (az - bz) * (ax + bx);
+      nz += (ax - bx) * (ay + by);
+    }
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+    // Duplicate verts upward.
+    const ox = (offset[0] + nx) * offsetScale;
+    const oy = (offset[1] + ny) * offsetScale;
+    const oz = (offset[2] + nz) * offsetScale;
+    const top: number[] = [];
+    for (const v of verts) {
+      const idx = positions.length / 3;
+      positions.push(
+        positions[v * 3]! + ox,
+        positions[v * 3 + 1]! + oy,
+        positions[v * 3 + 2]! + oz,
+      );
+      top.push(idx);
+    }
+    // Replace the original face with the top face (Blender drops the cap).
+    newPolys.push(top);
+    topMask.push(1);
+    // Side quads.
+    for (let i = 0; i < verts.length; i++) {
+      const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+      const at = top[i]!, bt = top[(i + 1) % top.length]!;
+      newPolys.push([a, b, bt, at]);
+      sideMask.push(1);
+    }
+  }
+  const out = new Geometry();
+  out.mesh = MeshComponent.fromPolys(new Float32Array(positions), newPolys);
+  const topSelection = new Uint8Array(newPolys.length);
+  const sideSelection = new Uint8Array(newPolys.length);
+  // Naive layout: topMask first, then sides — we built them in that order.
+  let i = 0, j = 0;
+  for (let f = 0; f < newPolys.length; f++) {
+    if (i < topMask.length) { topSelection[f] = topMask[i++]!; }
+    else if (j < sideMask.length) { sideSelection[f] = sideMask[j++]!; }
+  }
+  return { mesh: out, topSelection, sideSelection };
+}
+
+/**
+ * Duplicate Elements — copies selected elements `amount` times. POINT and
+ * FACE domains supported; EDGE/CURVE/INSTANCE fall back to pass-through.
+ *
+ * Each duplicate is placed in-place (positions unchanged); the caller is
+ * expected to transform them downstream. Returns the new geometry plus a
+ * "duplicate index" per produced element (0 for originals).
+ */
+export function duplicateElements(
+  geo: Geometry,
+  selection: ScalarTypedArray,
+  amount: number,
+  domain: 'POINT' | 'EDGE' | 'FACE' | 'CURVE' | 'INSTANCE',
+): { geometry: Geometry; duplicateIndex: Int32Array } {
+  const mesh = geo.mesh;
+  if (!mesh || amount <= 0) {
+    return { geometry: geo, duplicateIndex: new Int32Array(0) };
+  }
+  if (domain === 'POINT') {
+    const verts = mesh.numVerts;
+    const dupCount = amount;
+    const newVerts = verts + dupCount * Array.from(selection).filter((x) => x).length;
+    const pos = new Float32Array(newVerts * 3);
+    pos.set(mesh.positions);
+    let cursor = verts;
+    const dupIdx = new Int32Array(newVerts);
+    for (let v = 0; v < verts; v++) {
+      if (!selection[v]) continue;
+      for (let k = 1; k <= dupCount; k++) {
+        pos[cursor * 3] = mesh.positions[v * 3]!;
+        pos[cursor * 3 + 1] = mesh.positions[v * 3 + 1]!;
+        pos[cursor * 3 + 2] = mesh.positions[v * 3 + 2]!;
+        dupIdx[cursor] = k;
+        cursor++;
+      }
+    }
+    const out = new Geometry();
+    out.mesh = new MeshComponent(pos, new Uint32Array(0), new Uint32Array(0));
+    return { geometry: out, duplicateIndex: dupIdx };
+  }
+  if (domain === 'FACE') {
+    const polys = polysOf(mesh);
+    const positions = Array.from(mesh.positions);
+    const newPolys: number[][] = [...polys];
+    const dups: number[] = [];
+    for (const _ of polys) dups.push(0);
+    for (let f = 0; f < polys.length; f++) {
+      if (!selection[f]) continue;
+      for (let k = 1; k <= amount; k++) {
+        const newFace = polys[f]!.map((v) => {
+          const idx = positions.length / 3;
+          positions.push(
+            mesh.positions[v * 3]!,
+            mesh.positions[v * 3 + 1]!,
+            mesh.positions[v * 3 + 2]!,
+          );
+          return idx;
+        });
+        newPolys.push(newFace);
+        dups.push(k);
+      }
+    }
+    const out = new Geometry();
+    out.mesh = MeshComponent.fromPolys(new Float32Array(positions), newPolys);
+    return { geometry: out, duplicateIndex: new Int32Array(dups) };
+  }
+  // EDGE / CURVE / INSTANCE fall through.
+  return { geometry: geo, duplicateIndex: new Int32Array(0) };
+}
+
+/**
+ * Split Edges — duplicates vertices along edges flagged by `selection` so
+ * adjacent faces become topologically disconnected at that seam. Useful for
+ * sharp-edge / hard-edge workflows.
+ *
+ * Simple implementation: rebuilds every face independently with its own
+ * unique vertex copies, which is the limiting case of "split all edges".
+ * When `selection` is fully true this is the desired behaviour; partial
+ * selections fall back to the same conservative split (a finer-grained
+ * implementation can be added without changing the call signature).
+ */
+export function splitEdges(geo: Geometry, _selection: ScalarTypedArray): Geometry {
+  const mesh = geo.mesh;
+  if (!mesh) return geo;
+  const polys = polysOf(mesh);
+  const positions: number[] = [];
+  const newPolys: number[][] = [];
+  for (const verts of polys) {
+    const face: number[] = [];
+    for (const v of verts) {
+      const idx = positions.length / 3;
+      positions.push(
+        mesh.positions[v * 3]!,
+        mesh.positions[v * 3 + 1]!,
+        mesh.positions[v * 3 + 2]!,
+      );
+      face.push(idx);
+    }
+    newPolys.push(face);
+  }
+  const out = new Geometry();
+  out.mesh = MeshComponent.fromPolys(new Float32Array(positions), newPolys);
+  return out;
+}

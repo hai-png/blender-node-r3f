@@ -36,16 +36,32 @@ export class GeometryNodeAccumulateField extends GeoFieldUtil {
         ['FLOAT_VECTOR', 'Vector', ''],
       ],
       default: 'FLOAT',
+      update: (n) => (n as unknown as GeometryNodeAccumulateField).rebuildSockets(),
     }),
     domain: EnumProperty({ items: DOMAIN_ITEMS, default: 'POINT' }),
   };
   declare data_type: 'FLOAT' | 'INT' | 'FLOAT_VECTOR';
   declare domain: string;
   override init(_ctx: NodeInitContext): void {
-    this.addInput(NodeSocketFloat, 'Value', { default_value: 1 });
-    this.addOutput(NodeSocketFloat, 'Leading');   // inclusive prefix sum
-    this.addOutput(NodeSocketFloat, 'Trailing');   // exclusive prefix sum
-    this.addOutput(NodeSocketFloat, 'Total');      // grand total (single)
+    this.rebuildSockets();
+  }
+  rebuildSockets(): void {
+    const tree = this.tree;
+    if (tree) {
+      for (const sock of [...this.inputs]) {
+        for (const link of [...sock.links]) tree.removeLink(link);
+      }
+    }
+    this.inputs.length = 0;
+    this.outputs.length = 0;
+    let Cls: typeof NodeSocketFloat = NodeSocketFloat;
+    let def: any = 1;
+    if (this.data_type === 'INT') { Cls = NodeSocketInt as any; def = 1; }
+    else if (this.data_type === 'FLOAT_VECTOR') { Cls = NodeSocketVector as any; def = [0, 0, 0]; }
+    this.addInput(Cls, 'Value', { default_value: def });
+    this.addOutput(Cls, 'Leading');
+    this.addOutput(Cls, 'Trailing');
+    this.addOutput(Cls, 'Total');
   }
 }
 

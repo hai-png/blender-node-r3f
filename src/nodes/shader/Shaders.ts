@@ -162,6 +162,73 @@ export class ShaderNodeOutputLight extends Node {
   }
 }
 
+// ── Color operations (registered classes so they show up in the Add menu) ──
+
+export class ShaderNodeHueSaturation extends Node {
+  static override bl_idname = 'ShaderNodeHueSaturation';
+  static override bl_label = 'Hue/Saturation/Value';
+  static override category = 'Color';
+  static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'CompositorNodeTree'];
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketFloatFactor, 'Hue', { default_value: 0.5 });
+    this.addInput(NodeSocketFloatFactor, 'Saturation', { default_value: 1 });
+    this.addInput(NodeSocketFloatFactor, 'Value', { default_value: 1 });
+    this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 1 });
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0.5, 0.5, 0.5, 1] });
+    this.addOutput(NodeSocketColor, 'Color');
+  }
+}
+
+export class ShaderNodeBrightContrast extends Node {
+  static override bl_idname = 'ShaderNodeBrightContrast';
+  static override bl_label = 'Bright/Contrast';
+  static override category = 'Color';
+  static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'CompositorNodeTree'];
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0.5, 0.5, 0.5, 1] });
+    this.addInput(NodeSocketFloat, 'Bright', { default_value: 0 });
+    this.addInput(NodeSocketFloat, 'Contrast', { default_value: 0 });
+    this.addOutput(NodeSocketColor, 'Color');
+  }
+}
+
+export class ShaderNodeInvert extends Node {
+  static override bl_idname = 'ShaderNodeInvert';
+  static override bl_label = 'Invert Color';
+  static override category = 'Color';
+  static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'CompositorNodeTree'];
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 1 });
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0, 0, 0, 1] });
+    this.addOutput(NodeSocketColor, 'Color');
+  }
+}
+
+export class ShaderNodeGamma extends Node {
+  static override bl_idname = 'ShaderNodeGamma';
+  static override bl_label = 'Gamma';
+  static override category = 'Color';
+  static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'CompositorNodeTree'];
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Color', { default_value: [0.5, 0.5, 0.5, 1] });
+    this.addInput(NodeSocketFloat, 'Gamma', { default_value: 1 });
+    this.addOutput(NodeSocketColor, 'Color');
+  }
+}
+
+export class ShaderNodeMixRGB extends Node {
+  static override bl_idname = 'ShaderNodeMixRGB';
+  static override bl_label = 'Mix (Legacy)';
+  static override category = 'Color';
+  static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'CompositorNodeTree'];
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketFloatFactor, 'Fac', { default_value: 0.5 });
+    this.addInput(NodeSocketColor, 'Color1', { default_value: [0.5, 0.5, 0.5, 1] });
+    this.addInput(NodeSocketColor, 'Color2', { default_value: [0.5, 0.5, 0.5, 1] });
+    this.addOutput(NodeSocketColor, 'Color');
+  }
+}
+
 let _registered = false;
 export function registerCoreShaderNodes(): void {
   if (_registered) return;
@@ -175,6 +242,11 @@ export function registerCoreShaderNodes(): void {
     ShaderNodeMixShader,
     ShaderNodeOutputWorld,
     ShaderNodeOutputLight,
+    ShaderNodeHueSaturation,
+    ShaderNodeBrightContrast,
+    ShaderNodeInvert,
+    ShaderNodeGamma,
+    ShaderNodeMixRGB,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

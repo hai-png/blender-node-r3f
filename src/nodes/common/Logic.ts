@@ -8,6 +8,7 @@ import { EnumProperty } from '../../core/Properties';
 import type { NodeTreeKind, Vec3, RGBA } from '../../core/types';
 import {
   NodeSocketBool, NodeSocketColor, NodeSocketFloat, NodeSocketInt, NodeSocketVector,
+  NodeSocketGeometry, NodeSocketString,
 } from '../../sockets';
 import { NodeRegistry } from '../../registry/NodeRegistry';
 
@@ -58,6 +59,13 @@ const COMPARE_TYPES = [
   ['FLOAT', 'Float', ''], ['INT', 'Integer', ''], ['VECTOR', 'Vector', ''],
   ['STRING', 'String', ''], ['RGBA', 'Color', ''],
 ] as const;
+const COMPARE_MODES = [
+  ['ELEMENT', 'Element-Wise', ''],
+  ['LENGTH', 'Length', ''],
+  ['AVERAGE', 'Average', ''],
+  ['DOT_PRODUCT', 'Dot Product', ''],
+  ['DIRECTION', 'Direction', ''],
+] as const;
 
 export class CompareNode extends Node {
   static override bl_idname = 'FunctionNodeCompare';
@@ -66,16 +74,89 @@ export class CompareNode extends Node {
   static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'GeometryNodeTree', 'CompositorNodeTree', 'TextureNodeTree'];
   static override properties = {
     operation: EnumProperty({ items: COMPARE_OPS, default: 'GREATER_THAN', name: 'Operation' }),
-    data_type: EnumProperty({ items: COMPARE_TYPES, default: 'FLOAT', name: 'Type' }),
+    data_type: EnumProperty({
+      items: COMPARE_TYPES,
+      default: 'FLOAT',
+      name: 'Type',
+      update: (n) => (n as unknown as CompareNode).rebuildSockets(),
+    }),
+    mode: EnumProperty({ items: COMPARE_MODES, default: 'ELEMENT', name: 'Mode' }),
   };
   declare operation: typeof COMPARE_OPS[number][0];
   declare data_type: typeof COMPARE_TYPES[number][0];
+  declare mode: typeof COMPARE_MODES[number][0];
 
   override init(_ctx: NodeInitContext): void {
-    this.addInput(NodeSocketFloat, 'A', { identifier: 'A' });
-    this.addInput(NodeSocketFloat, 'B', { identifier: 'B' });
-    this.addInput(NodeSocketFloat, 'Epsilon', { default_value: 0.001 });
+    this.rebuildSockets();
+  }
+
+  /**
+   * Rebuild the input/output socket set based on `data_type`. Mirrors
+   * Blender's behaviour where switching the Compare node's Type swaps the
+   * A/B inputs (and adds Epsilon for FLOAT/VECTOR). Existing links are
+   * preserved by identifier (rename-safe via the standard A/B/Epsilon).
+   */
+  rebuildSockets(): void {
+    // Snapshot existing links so we can re-attach them after the rebuild.
+    const tree = this.tree;
+    const carry: { fromOutId: string; toId: string }[] = [];
+    if (tree) {
+      for (const sock of this.inputs) {
+        for (const link of sock.links) carry.push({ fromOutId: link.from_socket.identifier, toId: sock.identifier });
+      }
+      // Remove all existing input links.
+      for (const sock of [...this.inputs]) {
+        for (const link of [...sock.links]) tree.removeLink(link);
+      }
+    }
+    this.inputs.length = 0;
+    this.outputs.length = 0;
+    switch (this.data_type) {
+      case 'INT':
+        this.addInput(NodeSocketInt, 'A', { identifier: 'A_INT', default_value: 0 });
+        this.addInput(NodeSocketInt, 'B', { identifier: 'B_INT', default_value: 0 });
+        break;
+      case 'VECTOR':
+        this.addInput(NodeSocketVector, 'A', { identifier: 'A_VEC3', default_value: [0, 0, 0] });
+        this.addInput(NodeSocketVector, 'B', { identifier: 'B_VEC3', default_value: [0, 0, 0] });
+        this.addInput(NodeSocketFloat, 'Epsilon', { identifier: 'Epsilon', default_value: 0.001 });
+        break;
+      case 'STRING':
+        this.addInput(NodeSocketColor, 'A', { identifier: 'A_STR', default_value: [0, 0, 0, 1] });
+        this.addInput(NodeSocketColor, 'B', { identifier: 'B_STR', default_value: [0, 0, 0, 1] });
+        // Use color sockets as a stand-in for string until a string socket exists in this code base.
+        break;
+      case 'RGBA':
+        this.addInput(NodeSocketColor, 'A', { identifier: 'A_RGBA', default_value: [0, 0, 0, 1] });
+        this.addInput(NodeSocketColor, 'B', { identifier: 'B_RGBA', default_value: [0, 0, 0, 1] });
+        this.addInput(NodeSocketFloat, 'Epsilon', { identifier: 'Epsilon', default_value: 0.001 });
+        break;
+      case 'FLOAT':
+      default:
+        this.addInput(NodeSocketFloat, 'A', { identifier: 'A', default_value: 0 });
+        this.addInput(NodeSocketFloat, 'B', { identifier: 'B', default_value: 0 });
+        this.addInput(NodeSocketFloat, 'Epsilon', { identifier: 'Epsilon', default_value: 0.001 });
+        break;
+    }
     this.addOutput(NodeSocketBool, 'Result');
+    // Re-attach surviving links: only for inputs that still exist.
+    if (tree) {
+      // We can't fully restore arbitrary cross-tree links (the previous
+      // from_socket might still exist on its owning node); attempt a best-effort
+      // restore for the canonical A/B identifiers.
+      for (const c of carry) {
+        const target = this.inputs.find((s) => s.identifier === c.toId);
+        if (!target) continue;
+        // Find the original source socket on whichever node had it.
+        for (const n of tree.nodes) {
+          const fromSock = n.outputs.find((o) => o.identifier === c.fromOutId);
+          if (fromSock) {
+            try { tree.addLink(fromSock, target); } catch { /* swallow re-link errors */ }
+            break;
+          }
+        }
+      }
+    }
   }
 
   static compute(op: CompareNode['operation'], a: number, b: number, eps = 0): boolean {
@@ -124,15 +205,65 @@ export class SwitchNode extends Node {
   static override category = 'Utilities';
   static override tree_types: NodeTreeKind[] = ['ShaderNodeTree', 'GeometryNodeTree', 'CompositorNodeTree', 'TextureNodeTree'];
   static override properties = {
-    input_type: EnumProperty({ items: SWITCH_TYPES, default: 'FLOAT', name: 'Type' }),
+    input_type: EnumProperty({
+      items: SWITCH_TYPES,
+      default: 'FLOAT',
+      name: 'Type',
+      update: (n) => (n as unknown as SwitchNode).rebuildSockets(),
+    }),
   };
   declare input_type: typeof SWITCH_TYPES[number][0];
 
   override init(_ctx: NodeInitContext): void {
-    this.addInput(NodeSocketBool, 'Switch');
-    this.addInput(NodeSocketFloat, 'False', { identifier: 'False' });
-    this.addInput(NodeSocketFloat, 'True', { identifier: 'True' });
-    this.addOutput(NodeSocketFloat, 'Output');
+    this.rebuildSockets();
+  }
+
+  /**
+   * Rebuild False/True/Output sockets based on `input_type`. Preserves the
+   * Switch boolean input. Mirrors GeometryNodeSwitch's dynamic socket
+   * behaviour in Blender 4.x.
+   */
+  rebuildSockets(): void {
+    const tree = this.tree;
+    // Save existing condition link (Switch boolean input) so we don't drop it.
+    let switchLink: { fromOutId: string; nodeId: string } | null = null;
+    if (tree && this.inputs[0]?.links[0]) {
+      const l = this.inputs[0].links[0];
+      switchLink = { fromOutId: l.from_socket.identifier, nodeId: l.from_node.id };
+    }
+    if (tree) {
+      for (const sock of [...this.inputs]) {
+        for (const link of [...sock.links]) tree.removeLink(link);
+      }
+    }
+    this.inputs.length = 0;
+    this.outputs.length = 0;
+    this.addInput(NodeSocketBool, 'Switch', { identifier: 'Switch' });
+    // Helper to pick socket constructor + defaults for the data type.
+    const make = (): { Cls: any; defF: unknown; defT: unknown; name: string } => {
+      switch (this.input_type) {
+        case 'INT':      return { Cls: NodeSocketInt,      defF: 0,     defT: 0,     name: 'Int' };
+        case 'BOOLEAN':  return { Cls: NodeSocketBool,     defF: false, defT: false, name: 'Bool' };
+        case 'VECTOR':   return { Cls: NodeSocketVector,   defF: [0, 0, 0], defT: [0, 0, 0], name: 'Vector' };
+        case 'RGBA':     return { Cls: NodeSocketColor,    defF: [0, 0, 0, 1], defT: [1, 1, 1, 1], name: 'Color' };
+        case 'STRING':   return { Cls: NodeSocketString,   defF: '',    defT: '',    name: 'String' };
+        case 'GEOMETRY': return { Cls: NodeSocketGeometry, defF: undefined, defT: undefined, name: 'Geometry' };
+        case 'FLOAT':
+        default:         return { Cls: NodeSocketFloat,    defF: 0,     defT: 0,     name: 'Float' };
+      }
+    };
+    const { Cls, defF, defT } = make();
+    this.addInput(Cls, 'False', { identifier: `False_${this.input_type}`, default_value: defF as any });
+    this.addInput(Cls, 'True',  { identifier: `True_${this.input_type}`,  default_value: defT as any });
+    this.addOutput(Cls, 'Output', { identifier: `Output_${this.input_type}` });
+    // Re-link the Switch input if possible.
+    if (tree && switchLink) {
+      const src = tree.nodes.find((n) => n.id === switchLink!.nodeId);
+      const fromSock = src?.outputs.find((o) => o.identifier === switchLink!.fromOutId);
+      if (fromSock) {
+        try { tree.addLink(fromSock, this.inputs[0]!); } catch { /* ignore */ }
+      }
+    }
   }
 }
 

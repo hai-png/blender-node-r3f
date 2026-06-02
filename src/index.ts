@@ -61,8 +61,14 @@ import { registerShaderNodes } from './nodes/shader';
 import { registerGeometryNodes } from './nodes/geometry';
 import { registerCompositorNodes } from './nodes/compositor';
 import { registerTextureNodes } from './nodes/texture';
+import { registerCommonExecutors } from './eval/CommonExecutors';
 import { NodeTree as _NodeTree } from './core/NodeTree';
 import { NodeRegistry as _NodeRegistry } from './registry/NodeRegistry';
+
+// Re-export the registry-based dispatch helpers so consumers can register
+// custom node executors without reaching into eval/ internals.
+export { registerExecutor, getExecutor, dispatchNode } from './eval/NodeExecute';
+export { registerCommonExecutors } from './eval/CommonExecutors';
 
 /**
  * One-call bootstrap. Registers every built-in socket, tree, and node.
@@ -79,6 +85,9 @@ export function bootstrapBuiltins(): void {
   registerGeometryNodes();
   registerCompositorNodes();
   registerTextureNodes();
+  // Wire registry-based executors for common nodes. Evaluators that opt into
+  // dispatchNode() will use these instead of inlining instanceof chains.
+  registerCommonExecutors();
   // Install the registry hook so NodeTree.addZone() can find zone classes
   // without core/ depending on the registry module.
   _NodeTree._registryLookup = (id: string) => {

@@ -1,6 +1,7 @@
 export * from './Primitives';
 export * from './FieldInputs';
 export * from './Ops';
+export * from './MoreOps';
 export * from './Zones';
 export * from './FieldUtils';
 export * from './SceneInputs';
@@ -10,6 +11,7 @@ export * from './MaterialNodes';
 import { registerGeometryPrimitives } from './Primitives';
 import { registerGeoFieldInputs } from './FieldInputs';
 import { registerGeometryOps } from './Ops';
+import { registerMoreGeometryOps } from './MoreOps';
 import { registerZoneNodes } from './Zones';
 import { registerFieldUtilNodes } from './FieldUtils';
 import { registerSceneInputNodes } from './SceneInputs';
@@ -21,6 +23,7 @@ export function registerGeometryNodes(): void {
   registerGeometryPrimitives();
   registerGeoFieldInputs();
   registerGeometryOps();
+  registerMoreGeometryOps();
   registerZoneNodes();
   registerFieldUtilNodes();
   registerSceneInputNodes();

@@ -99,6 +99,60 @@ const DEFAULT: MaterialDescriptor = {
 
 const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+const smooth01 = (t: number): number => t * t * (3 - 2 * t);
+const fract = (x: number): number => x - Math.floor(x);
+// Integer hash (Wang/PCG-style) — deterministic uniform in [0,1).
+function ihash3(x: number, y: number, z: number): number {
+  let h = (x | 0) * 0x27d4eb2d ^ (y | 0) * 0x165667b1 ^ (z | 0) * 0x9e3779b1;
+  h = (h ^ (h >>> 15)) >>> 0;
+  h = Math.imul(h, 0x2c1b3c6d) >>> 0;
+  h = (h ^ (h >>> 12)) >>> 0;
+  h = Math.imul(h, 0x297a2d39) >>> 0;
+  h = (h ^ (h >>> 15)) >>> 0;
+  return (h >>> 0) / 0x100000000;
+}
+function valueNoise3(x: number, y: number, z: number): number {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = smooth01(x - xi), yf = smooth01(y - yi), zf = smooth01(z - zi);
+  const n = (i: number, j: number, k: number): number => ihash3(xi + i, yi + j, zi + k);
+  const c000 = n(0, 0, 0), c100 = n(1, 0, 0), c010 = n(0, 1, 0), c110 = n(1, 1, 0);
+  const c001 = n(0, 0, 1), c101 = n(1, 0, 1), c011 = n(0, 1, 1), c111 = n(1, 1, 1);
+  const x00 = lerp(c000, c100, xf), x10 = lerp(c010, c110, xf);
+  const x01 = lerp(c001, c101, xf), x11 = lerp(c011, c111, xf);
+  return lerp(lerp(x00, x10, yf), lerp(x01, x11, yf), zf);
+}
+function fbm3(x: number, y: number, z: number, detail: number, roughness: number): number {
+  const octaves = Math.min(8, Math.max(1, Math.round(detail) + 1));
+  let sum = 0, amp = 1, norm = 0, freq = 1;
+  for (let i = 0; i < octaves; i++) {
+    sum += valueNoise3(x * freq, y * freq, z * freq) * amp;
+    norm += amp; amp *= roughness; freq *= 2;
+  }
+  return norm > 0 ? sum / norm : 0;
+}
+function voronoiSampleF1(x: number, y: number, z: number, randomness: number): { dist: number; color: Vec3; pos: Vec3 } {
+  const cx = Math.floor(x), cy = Math.floor(y), cz = Math.floor(z);
+  let best = Infinity;
+  let bcol: Vec3 = [0, 0, 0];
+  let bpos: Vec3 = [0, 0, 0];
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const ix = cx + dx, iy = cy + dy, iz = cz + dz;
+        const jx = ix + (ihash3(ix, iy, iz) - 0.5) * randomness + 0.5;
+        const jy = iy + (ihash3(iy, iz, ix) - 0.5) * randomness + 0.5;
+        const jz = iz + (ihash3(iz, ix, iy) - 0.5) * randomness + 0.5;
+        const ddx = jx - x, ddy = jy - y, ddz = jz - z;
+        const d = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (d < best) {
+          best = d; bpos = [jx, jy, jz];
+          bcol = [ihash3(ix, iy, iz), ihash3(iy, iz, ix), ihash3(iz, ix, iy)];
+        }
+      }
+    }
+  }
+  return { dist: Math.sqrt(best), color: bcol, pos: bpos };
+}
 function rgb2hsv(r: number, g: number, b: number): [number, number, number] {
   const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
   let h = 0;
@@ -405,15 +459,35 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof CompareNode) {
-      const a = this.socketValue(node.inputs[0]!, cache) as number;
-      const b = this.socketValue(node.inputs[1]!, cache) as number;
-      const eps = this.socketValue(node.inputs[2]!, cache) as number;
-      cache.set(node.outputs[0]!.id, CompareNode.compute(node.operation, a, b, eps));
+      const sa = node.inputs.find((s) => s.name === 'A');
+      const sb = node.inputs.find((s) => s.name === 'B');
+      const se = node.inputs.find((s) => s.name === 'Epsilon');
+      const eps = se ? (this.socketValue(se, cache) as number) : 0;
+      let r = false;
+      if (node.data_type === 'VECTOR') {
+        const a = (sa ? this.socketValue(sa, cache) : [0, 0, 0]) as Vec3;
+        const b = (sb ? this.socketValue(sb, cache) : [0, 0, 0]) as Vec3;
+        r = CompareNode.computeVec(node.operation, a, b, eps);
+      } else if (node.data_type === 'RGBA') {
+        const a = (sa ? this.socketValue(sa, cache) : [0, 0, 0, 1]) as RGBA;
+        const b = (sb ? this.socketValue(sb, cache) : [0, 0, 0, 1]) as RGBA;
+        r = CompareNode.computeColor(node.operation, a, b, eps);
+      } else {
+        const a = (sa ? this.socketValue(sa, cache) : 0) as number;
+        const b = (sb ? this.socketValue(sb, cache) : 0) as number;
+        r = CompareNode.compute(node.operation, a, b, eps);
+      }
+      cache.set(node.outputs[0]!.id, r);
       return;
     }
     if (node instanceof SwitchNode) {
       const cond = !!(this.socketValue(node.inputs[0]!, cache) as boolean);
-      cache.set(node.outputs[0]!.id, this.socketValue(node.inputs[cond ? 2 : 1]!, cache));
+      const falseSock = node.inputs.find((s) => s.name === 'False');
+      const trueSock = node.inputs.find((s) => s.name === 'True');
+      const v = cond
+        ? (trueSock ? this.socketValue(trueSock, cache) : undefined)
+        : (falseSock ? this.socketValue(falseSock, cache) : undefined);
+      cache.set(node.outputs[0]!.id, v);
       return;
     }
     if (node instanceof RandomValueNode) {
@@ -440,11 +514,18 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node instanceof ShaderNodeTexNoise) {
-      // Emit a procedural color = vec3(0.5 + 0.5*sin(scale * uv))
-      const scale = this.socketValue(node.inputs[1]!, cache) as number;
-      cache.set(node.outputs[0]!.id, 0.5);
-      cache.set(node.outputs[1]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
-      // expose as a side-channel for the descriptor (M0 demo trick)
+      // Real procedural value-noise fBm at the supplied vector. Inputs:
+      //   [0] Vector  [1] Scale  [2] Detail  [3] Roughness  [4] Distortion (unused here)
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const scale = (this.socketValue(node.inputs[1]!, cache) as number) ?? 5;
+      const detail = (this.socketValue(node.inputs[2]!, cache) as number) ?? 2;
+      const rough = (this.socketValue(node.inputs[3]!, cache) as number) ?? 0.5;
+      const x = v[0] * scale, y = v[1] * scale, z = v[2] * scale;
+      const f = fbm3(x, y, z, detail, rough);
+      const fx = fbm3(x + 17.3, y, z, detail, rough);
+      const fy = fbm3(x, y + 23.7, z, detail, rough);
+      cache.set(node.outputs[0]!.id, f);
+      cache.set(node.outputs[1]!.id, [fx, fy, f, 1] as RGBA);
       (cache as Map<string, unknown>).set(`__noise_scale_${node.id}`, scale);
       return;
     }
@@ -580,46 +661,102 @@ export class ShaderEvaluator implements SystemEvaluator {
     //  Texture nodes — procedural samplers (CPU approximations)
     // ----------------------------------------------------------------
     if (node instanceof ShaderNodeTexVoronoi) {
-      /* LEGACY PATH PLACEHOLDER: CPU fallback returns mid-grey */
-      cache.set(node.outputs[0]!.id, 0.5);
-      cache.set(node.outputs[1]!.id, 0.5);
-      cache.set(node.outputs[2]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const scale = (this.socketValue(node.inputs[1]!, cache) as number) ?? 5;
+      const rnd = (this.socketValue(node.inputs[4]!, cache) as number) ?? 1;
+      const s = voronoiSampleF1(v[0] * scale, v[1] * scale, v[2] * scale, Math.max(0, Math.min(1, rnd)));
+      cache.set(node.outputs[0]!.id, s.dist);
+      cache.set(node.outputs[1]!.id, s.dist);
+      cache.set(node.outputs[2]!.id, [s.color[0], s.color[1], s.color[2], 1] as RGBA);
       return;
     }
     if (node instanceof ShaderNodeTexWave) {
-      /* LEGACY PATH PLACEHOLDER: CPU fallback */
-      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
-      cache.set(node.outputs[1]!.id, 0.5);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const scale = (this.socketValue(node.inputs[1]!, cache) as number) ?? 5;
+      const dist = (this.socketValue(node.inputs[2]!, cache) as number) ?? 0;
+      const det = (this.socketValue(node.inputs[3]!, cache) as number) ?? 2;
+      const rough = (this.socketValue(node.inputs[4]!, cache) as number) ?? 0.5;
+      const phase = (v[0] + v[1] + v[2]) * scale + dist * fbm3(v[0] * scale, v[1] * scale, v[2] * scale, det, rough);
+      const w = 0.5 + 0.5 * Math.sin(phase * Math.PI * 2);
+      cache.set(node.outputs[0]!.id, [w, w, w, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, w);
       return;
     }
     if (node instanceof ShaderNodeTexChecker) {
-      /* LEGACY PATH PLACEHOLDER: CPU fallback — checkerboard at default scale */
-      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
-      cache.set(node.outputs[1]!.id, 0.5);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const c1 = (this.socketValue(node.inputs[1]!, cache) as RGBA) ?? [1, 1, 1, 1];
+      const c2 = (this.socketValue(node.inputs[2]!, cache) as RGBA) ?? [0.2, 0.2, 0.2, 1];
+      const scale = (this.socketValue(node.inputs[3]!, cache) as number) ?? 5;
+      const sx = Math.floor(v[0] * scale), sy = Math.floor(v[1] * scale), sz = Math.floor(v[2] * scale);
+      const which = ((sx + sy + sz) & 1) === 0;
+      cache.set(node.outputs[0]!.id, (which ? c1 : c2));
+      cache.set(node.outputs[1]!.id, which ? 1 : 0);
       return;
     }
     if (node instanceof ShaderNodeTexBrick) {
-      /* LEGACY PATH PLACEHOLDER */
-      cache.set(node.outputs[0]!.id, [0.6, 0.5, 0.4, 1] as RGBA);
-      cache.set(node.outputs[1]!.id, 0.5);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const c1 = (this.socketValue(node.inputs[1]!, cache) as RGBA) ?? [0.6, 0.3, 0.2, 1];
+      const c2 = (this.socketValue(node.inputs[2]!, cache) as RGBA) ?? [0.5, 0.25, 0.15, 1];
+      const mortar = (this.socketValue(node.inputs[3]!, cache) as RGBA) ?? [0.1, 0.1, 0.1, 1];
+      const scale = (this.socketValue(node.inputs[4]!, cache) as number) ?? 5;
+      const mortarSize = (this.socketValue(node.inputs[5]!, cache) as number) ?? 0.02;
+      // Half-offset every other row.
+      const row = Math.floor(v[1] * scale);
+      const offset = (row & 1) ? 0.5 : 0;
+      const u = fract(v[0] * scale + offset);
+      const vt = fract(v[1] * scale);
+      const inMortar = u < mortarSize || u > 1 - mortarSize || vt < mortarSize || vt > 1 - mortarSize;
+      const tint = (ihash3(Math.floor(v[0] * scale + offset), row, 0) > 0.5) ? c1 : c2;
+      cache.set(node.outputs[0]!.id, inMortar ? mortar : tint);
+      cache.set(node.outputs[1]!.id, inMortar ? 0 : 1);
       return;
     }
     if (node instanceof ShaderNodeTexGradient) {
-      /* LEGACY PATH PLACEHOLDER */
-      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
-      cache.set(node.outputs[1]!.id, 0.5);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const mode = (node as unknown as { gradient_type?: string }).gradient_type ?? 'LINEAR';
+      let t = 0;
+      switch (mode) {
+        case 'QUADRATIC': t = v[0] * v[0]; break;
+        case 'EASING':    t = smooth01(clamp01(v[0])); break;
+        case 'DIAGONAL':  t = (v[0] + v[1]) * 0.5; break;
+        case 'SPHERICAL': t = Math.max(0, 1 - Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2])); break;
+        case 'QUADRATIC_SPHERE': { const r = Math.max(0, 1 - Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2])); t = r * r; break; }
+        case 'RADIAL': t = Math.atan2(v[1], v[0]) / (2 * Math.PI) + 0.5; break;
+        case 'LINEAR':
+        default: t = v[0];
+      }
+      t = clamp01(t);
+      cache.set(node.outputs[0]!.id, [t, t, t, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, t);
       return;
     }
     if (node instanceof ShaderNodeTexMagic) {
-      /* LEGACY PATH PLACEHOLDER */
-      cache.set(node.outputs[0]!.id, [0.5, 0.4, 0.7, 1] as RGBA);
-      cache.set(node.outputs[1]!.id, 0.5);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const scale = (this.socketValue(node.inputs[1]!, cache) as number) ?? 5;
+      const dist = (this.socketValue(node.inputs[2]!, cache) as number) ?? 1;
+      let x = v[0] * scale, y = v[1] * scale, z = v[2] * scale;
+      for (let i = 0; i < 5; i++) {
+        const sx = Math.sin(x + dist * Math.cos(y));
+        const sy = Math.sin(y + dist * Math.cos(z));
+        const sz = Math.sin(z + dist * Math.cos(x));
+        x = sx; y = sy; z = sz;
+      }
+      const rgb: RGBA = [0.5 + 0.5 * x, 0.5 + 0.5 * y, 0.5 + 0.5 * z, 1];
+      cache.set(node.outputs[0]!.id, rgb);
+      cache.set(node.outputs[1]!.id, (rgb[0] + rgb[1] + rgb[2]) / 3);
       return;
     }
     if (node instanceof ShaderNodeTexWhiteNoise) {
-      /* LEGACY PATH PLACEHOLDER */
-      cache.set(node.outputs[0]!.id, Math.random());
-      cache.set(node.outputs[1]!.id, [Math.random(), Math.random(), Math.random(), 1] as RGBA);
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 0];
+      const w = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0;
+      const f = ihash3(Math.floor(v[0] * 1024), Math.floor(v[1] * 1024 + w * 17), Math.floor(v[2] * 1024));
+      cache.set(node.outputs[0]!.id, f);
+      cache.set(node.outputs[1]!.id, [
+        ihash3(Math.floor(v[0] * 1024 + 11), Math.floor(v[1] * 1024 + w * 17), Math.floor(v[2] * 1024)),
+        ihash3(Math.floor(v[0] * 1024), Math.floor(v[1] * 1024 + w * 17 + 7), Math.floor(v[2] * 1024)),
+        ihash3(Math.floor(v[0] * 1024), Math.floor(v[1] * 1024 + w * 17), Math.floor(v[2] * 1024 + 13)),
+        1,
+      ] as RGBA);
       return;
     }
     if (node instanceof ShaderNodeTexImage) {
@@ -685,9 +822,27 @@ export class ShaderEvaluator implements SystemEvaluator {
       return;
     }
     if (node.bl_idname === 'ShaderNodeHueSaturation') {
-      /* LEGACY PATH PLACEHOLDER: pass through color unchanged */
-      const c = this.socketValue(node.inputs[4]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
-      cache.set(node.outputs[0]!.id, c);
+      // Real Hue/Saturation/Value transformation. Inputs: [0]=Hue [1]=Sat
+      // [2]=Value [3]=Fac [4]=Color.
+      const h  = (this.socketValue(node.inputs[0]!, cache) as number) ?? 0.5;
+      const s  = (this.socketValue(node.inputs[1]!, cache) as number) ?? 1;
+      const v  = (this.socketValue(node.inputs[2]!, cache) as number) ?? 1;
+      const fac = (this.socketValue(node.inputs[3]!, cache) as number) ?? 1;
+      const c  = (this.socketValue(node.inputs[4]!, cache) as RGBA) ?? [0.5, 0.5, 0.5, 1];
+      const [ch, cs, cv] = rgb2hsv(c[0], c[1], c[2]);
+      // Blender's Hue input shifts by hue-0.5 (so 0.5 is no-op).
+      let nh = ch + (h - 0.5);
+      nh = nh - Math.floor(nh);
+      const ns = clamp01(cs * s);
+      const nv = cv * v;
+      const [rr, gg, bb] = hsv2rgb(nh, ns, nv);
+      const t = clamp01(fac);
+      cache.set(node.outputs[0]!.id, [
+        lerp(c[0], rr, t),
+        lerp(c[1], gg, t),
+        lerp(c[2], bb, t),
+        c[3],
+      ] as RGBA);
       return;
     }
     if (node.bl_idname === 'ShaderNodeBrightContrast') {
