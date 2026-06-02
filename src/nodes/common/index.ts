@@ -9,6 +9,7 @@ export * from './ColorRamp';
 export * from './Logic';
 export * from './Frame';
 export * from './Group';
+export * from './Curves';
 
 import { registerMathNode } from './Math';
 import { registerVectorMathNode } from './VectorMath';
@@ -21,6 +22,7 @@ import { registerColorRampNode } from './ColorRamp';
 import { registerLogicNodes } from './Logic';
 import { registerLayoutNodes } from './Frame';
 import { registerGroupNodes } from './Group';
+import { registerCurveNodes } from './Curves';
 
 export function registerCommonNodes(): void {
   registerMathNode();
@@ -34,4 +36,5 @@ export function registerCommonNodes(): void {
   registerLogicNodes();
   registerLayoutNodes();
   registerGroupNodes();
+  registerCurveNodes();
 }

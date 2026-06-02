@@ -266,6 +266,54 @@ export const PIXEL_EMITTERS: Record<string, PixelEmitter> = {
     return `vec4(max(vec3(0.0), ${img}.rgb * (${img}.rgb + 0.0245786) - 0.000090537) / (${img}.rgb * (0.983729 * ${img}.rgb + 0.4329510) + 0.238081), ${img}.a)`;
   },
 
+  // ---------- Luminance Key (Phase 2C matte/keying pack) ----------
+  // Replaces the alpha channel with a smoothstep over the pixel's luma:
+  //   alpha = smoothstep(limit_min, limit_max, luma709(image.rgb))
+  // Luminance Key in Blender treats the source as opaque; we preserve RGB
+  // and produce a black/white alpha mask.
+  CompositorNodeLumaMatte: (node, env) => {
+    const img = env.input('Image');
+    const lo = (node as unknown as { limit_min: number }).limit_min ?? 0;
+    const hi = (node as unknown as { limit_max: number }).limit_max ?? 1;
+    return `vec4(${img}.rgb, smoothstep(${lo.toFixed(6)}, ${hi.toFixed(6)}, dot(${img}.rgb, vec3(0.2126, 0.7152, 0.0722))))`;
+  },
+
+  // ---------- Color Matte ----------
+  // Returns the image with alpha cleared (1.0 - pass) where the pixel's HSV
+  // is within (color_hue, color_saturation, color_value) tolerances of the
+  // key colour. Uses the `_color_matte_pass` helper from GLSL_PRELUDE so the
+  // expression collapses to a single vec4(…) call.
+  CompositorNodeColorMatte: (node, env) => {
+    const img = env.input('Image');
+    const key = env.input('Key Color');
+    const tolH = ((node as unknown as { color_hue: number }).color_hue ?? 0.01).toFixed(6);
+    const tolS = ((node as unknown as { color_saturation: number }).color_saturation ?? 0.1).toFixed(6);
+    const tolV = ((node as unknown as { color_value: number }).color_value ?? 0.1).toFixed(6);
+    return `vec4(${img}.rgb, ${img}.a * (1.0 - _color_matte_pass(${img}.rgb, ${key}.rgb, ${tolH}, ${tolS}, ${tolV})))`;
+  },
+
+  // ---------- Distance Matte (Euclidean distance in linear RGB) ----------
+  // alpha = old_alpha * smoothstep(tolerance, tolerance + falloff, |img-key|)
+  CompositorNodeDistanceMatte: (node, env) => {
+    const img = env.input('Image');
+    const key = env.input('Key Color');
+    const t = (node as unknown as { tolerance: number }).tolerance ?? 0.1;
+    const fall = (node as unknown as { falloff: number }).falloff ?? 0.1;
+    const tHi = (t + Math.max(1e-6, fall)).toFixed(6);
+    const tLo = t.toFixed(6);
+    return `vec4(${img}.rgb, ${img}.a * smoothstep(${tLo}, ${tHi}, distance(${img}.rgb, ${key}.rgb)))`;
+  },
+
+  // ---------- Chroma Matte (HSV hue+sat distance, value-agnostic) ----------
+  // Uses `_chroma_matte_alpha` from GLSL_PRELUDE.
+  CompositorNodeChromaMatte: (node, env) => {
+    const img = env.input('Image');
+    const key = env.input('Key Color');
+    const accept = ((node as unknown as { acceptance: number }).acceptance ?? 0.4).toFixed(6);
+    const cutoff = ((node as unknown as { cutoff: number }).cutoff ?? 0.1).toFixed(6);
+    return `vec4(${img}.rgb, ${img}.a * _chroma_matte_alpha(${img}.rgb, ${key}.rgb, ${cutoff}, ${accept}))`;
+  },
+
   // ---------- RGB / Value (literal inputs are handled by the planner;
   // these no-op emitters exist so the planner is happy when they show up
   // inside a fused chain.) ----------
@@ -327,5 +375,26 @@ vec4 _hsv_apply(vec4 c, float hueOff, float sat, float val, float fac){
   hsv.z *= val;
   vec3 out_rgb = _hsv2rgb(hsv);
   return vec4(mix(c.rgb, out_rgb, clamp(fac, 0.0, 1.0)), c.a);
+}
+// Color Matte: returns 1.0 if pixel HSV matches key HSV within the
+// per-channel tolerances; 0.0 otherwise. Hue distance wraps modulo 1.
+float _color_matte_pass(vec3 a_rgb, vec3 k_rgb, float tolH, float tolS, float tolV){
+  vec3 a = _rgb2hsv(a_rgb);
+  vec3 k = _rgb2hsv(k_rgb);
+  float dh = min(abs(a.x - k.x), 1.0 - abs(a.x - k.x));
+  float ds = abs(a.y - k.y);
+  float dv = abs(a.z - k.z);
+  return step(dh, tolH) * step(ds, tolS) * step(dv, tolV);
+}
+// Chroma Matte: alpha multiplier in [0, 1] from HSV hue+saturation distance.
+// Returns 0 inside the cutoff disk, 1 outside the acceptance disk, smooth
+// transition between.
+float _chroma_matte_alpha(vec3 a_rgb, vec3 k_rgb, float cutoff, float accept){
+  vec3 a = _rgb2hsv(a_rgb);
+  vec3 k = _rgb2hsv(k_rgb);
+  float dh = min(abs(a.x - k.x), 1.0 - abs(a.x - k.x));
+  float ds = abs(a.y - k.y);
+  float d = sqrt(dh * dh + ds * ds);
+  return smoothstep(cutoff, max(cutoff + 1e-6, accept), d);
 }
 `;

@@ -56,6 +56,10 @@ import { MapRangeNode } from '../nodes/common/MapRange';
 import { ClampNode } from '../nodes/common/Clamp';
 import { ColorRampNode } from '../nodes/common/ColorRamp';
 import {
+  ShaderNodeFloatCurve, ShaderNodeVectorCurve, ShaderNodeRGBCurve,
+  type CurveMappingCurve,
+} from '../nodes/common/Curves';
+import {
   CombineXYZNode, SeparateXYZNode, CombineColorNode, SeparateColorNode,
 } from '../nodes/common/CombineSeparate';
 import { BooleanMathNode, CompareNode, RandomValueNode, SwitchNode } from '../nodes/common/Logic';
@@ -731,6 +735,29 @@ export class ShaderEvaluator implements SystemEvaluator {
       cache.set(node.outputs[1]!.id, out[3]);
       return;
     }
+    // ----------------------------------------------------------------
+    //  Curves — RGB/Vector/Float (Phase 2C). Real CPU evaluator using
+    //  the shared `sampleCurve()` helper in nodes/common/Curves.ts.
+    // ----------------------------------------------------------------
+    if (node instanceof ShaderNodeFloatCurve) {
+      const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1;
+      const v = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0;
+      cache.set(node.outputs[0]!.id, ShaderNodeFloatCurve.compute(node.curve, v, fac));
+      return;
+    }
+    if (node instanceof ShaderNodeVectorCurve) {
+      const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1;
+      const v = (this.socketValue(node.inputs[1]!, cache) as Vec3) ?? [0, 0, 0];
+      cache.set(node.outputs[0]!.id, ShaderNodeVectorCurve.compute(node.curves, v, fac));
+      return;
+    }
+    if (node instanceof ShaderNodeRGBCurve) {
+      const fac = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1;
+      const c = (this.socketValue(node.inputs[1]!, cache) as RGBA) ?? [0.5, 0.5, 0.5, 1];
+      cache.set(node.outputs[0]!.id, ShaderNodeRGBCurve.compute(node.curves, c, fac));
+      return;
+    }
+    void ({} as CurveMappingCurve); // keep type import for d.ts
     // ----------------------------------------------------------------
     //  TexCoord — geometry-based coordinate outputs (CPU stubs)
     // ----------------------------------------------------------------

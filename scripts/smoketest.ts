@@ -65,6 +65,16 @@ import type { Field } from '../src/eval/geometry/Field';
 import { registerFalloffAddon, GeometryNodeRadialFalloff } from '../examples/falloff_addon';
 registerFalloffAddon();
 import { autoLayout, History, makeGroup, ungroup } from '../src/ui/operators';
+import {
+  GeometryNodeInputSceneTime, GeometryNodeIsViewport, GeometryNodeObjectInfo,
+  FunctionNodeInputBool, FunctionNodeInputInt, FunctionNodeInputColor,
+  FunctionNodeInputString, FunctionNodeInputRotation,
+  GeometryNodeInputMaterial, GeometryNodeInputObject,
+  GeometryNodeInputCollection, GeometryNodeInputImage,
+  GeometryNodeSplineLength, GeometryNodeCurveLength,
+  GeometryNodeSetCurveRadius, GeometryNodeSetSplineCyclic,
+  GeometryNodeSetSplineResolution, GeometryNodeCurveEndpointSelection,
+} from '../src';
 import { buildAddMenuSections, createNodeFromAddMenuEntry } from '../src/ui/AddMenu';
 import { GeometryNodeTree as _GNT, GeometryNodeGroup as _GNG } from '../src';
 import { NodeGroupInput as _NGI, NodeGroupOutput as _NGO } from '../src';
@@ -3132,6 +3142,381 @@ test('phase1: refreshGroupNodes uses _iterAllTrees (no stale refs crash)', () =>
   live.refreshGroupNodes();
   live.dispose();
   assert(true, 'refreshGroupNodes with stale WeakRefs did not crash');
+});
+
+// --------------------- Phase 2C: Scene & curve input/write pack -----------
+
+test('phase2c: SceneTime field reflects depsgraph clock', () => {
+  const t = new GeometryNodeTree('scene-time');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const setp = t.addNode(GeometryNodeSetPosition);
+  const time = t.addNode(GeometryNodeInputSceneTime);
+  t.addLink(cube.outputs[0]!, setp.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(setp.outputs[0]!, out.inputs[0]!);
+  t.depsgraph.setScene({ frame: 7, fps: 24, elapsed: 7 / 24 });
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(time.id), `SceneTime executed without errors: ${r.errors.get(time.id) ?? ''}`);
+});
+
+test('phase2c: IsViewport respects opts.is_viewport', () => {
+  const make = (isViewport: boolean) => {
+    const t = new GeometryNodeTree('isvp');
+    t.depsgraph.setEvaluator(new GeometryEvaluator({ is_viewport: isViewport }));
+    t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+    const cube = t.addNode(GeometryNodeMeshCube);
+    const out = t.addNode(NodeGroupOutput);
+    t.addLink(cube.outputs[0]!, out.inputs[0]!);
+    const vp = t.addNode(GeometryNodeIsViewport);
+    return { t, vp };
+  };
+  const { t: t1, vp: vp1 } = make(true);
+  const r1 = t1.depsgraph.evaluate()!;
+  assert(!r1.errors.has(vp1.id), 'IsViewport node did not error');
+  const { t: t2, vp: vp2 } = make(false);
+  const r2 = t2.depsgraph.evaluate()!;
+  assert(!r2.errors.has(vp2.id), 'IsViewport node executes when is_viewport=false');
+});
+
+test('phase2c: FunctionNodeInputBool/Int/Color/String/Rotation evaluate without error', () => {
+  const t = new GeometryNodeTree('constants');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(cube.outputs[0]!, out.inputs[0]!);
+  const ids = [
+    t.addNode(FunctionNodeInputBool).id,
+    t.addNode(FunctionNodeInputInt).id,
+    t.addNode(FunctionNodeInputColor).id,
+    t.addNode(FunctionNodeInputString).id,
+    t.addNode(FunctionNodeInputRotation).id,
+    t.addNode(GeometryNodeInputMaterial).id,
+    t.addNode(GeometryNodeInputObject).id,
+    t.addNode(GeometryNodeInputCollection).id,
+    t.addNode(GeometryNodeInputImage).id,
+  ];
+  const r = t.depsgraph.evaluate()!;
+  for (const id of ids) assert(!r.errors.has(id), `constant node ${id} executed without error`);
+});
+
+test('phase2c: ObjectInfo calls resolveObject and emits without error', () => {
+  const t = new GeometryNodeTree('obj-info');
+  const calls: string[] = [];
+  t.depsgraph.setEvaluator(new GeometryEvaluator({
+    resolveObject: (key) => {
+      calls.push(key);
+      return {
+        location: [1, 2, 3],
+        rotation: [0.1, 0.2, 0.3],
+        scale: [2, 2, 2],
+        random_seed: 42,
+      };
+    },
+  }));
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const cube = t.addNode(GeometryNodeMeshCube);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(cube.outputs[0]!, out.inputs[0]!);
+  const info = t.addNode(GeometryNodeObjectInfo);
+  (info.inputs[0]! as { default_value: string | null }).default_value = 'Cube_001';
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(info.id), `ObjectInfo ran: ${r.errors.get(info.id) ?? ''}`);
+  assert(calls.includes('Cube_001'), `resolveObject called with key Cube_001 (got ${JSON.stringify(calls)})`);
+});
+
+test('phase2c: SplineLength executes without error on a curve line', () => {
+  const t = new GeometryNodeTree('spline-len');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(line.outputs[0]!, out.inputs[0]!);
+  const sl = t.addNode(GeometryNodeSplineLength);
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(sl.id), `SplineLength ran: ${r.errors.get(sl.id) ?? ''}`);
+});
+
+test('phase2c: CurveLength scalar returns positive value for default line', () => {
+  const t = new GeometryNodeTree('curve-total');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Length', in_out: 'OUTPUT', socket_type: 'NodeSocketFloat' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const cl = t.addNode(GeometryNodeCurveLength);
+  t.addLink(line.outputs[0]!, cl.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(cl.outputs[0]!, out.inputs[0]!);
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(cl.id), `CurveLength ran: ${r.errors.get(cl.id) ?? ''}`);
+});
+
+test('phase2c: SetCurveRadius writes radius attribute on curve points', () => {
+  const t = new GeometryNodeTree('set-radius');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const set = t.addNode(GeometryNodeSetCurveRadius);
+  (set.inputs[2]! as { default_value: number }).default_value = 0.7;
+  t.addLink(line.outputs[0]!, set.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(set.outputs[0]!, out.inputs[0]!);
+  const r = t.depsgraph.evaluate()!;
+  const geo = r.output as Geometry;
+  assert(geo.curves, 'output has curves component');
+  const attr = geo.curves!.attributes.get('radius');
+  assert(attr, 'radius attribute exists after SetCurveRadius');
+  const data = attr!.data as Float32Array;
+  for (let i = 0; i < data.length; i++) {
+    if (Math.abs(data[i]! - 0.7) > 1e-6) throw new Error(`radius[${i}] should be 0.7, got ${data[i]}`);
+  }
+});
+
+test('phase2c: SetSplineCyclic flips the per-spline cyclic flag', () => {
+  const t = new GeometryNodeTree('set-cyclic');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const set = t.addNode(GeometryNodeSetSplineCyclic);
+  (set.inputs[2]! as { default_value: boolean }).default_value = true;
+  t.addLink(line.outputs[0]!, set.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(set.outputs[0]!, out.inputs[0]!);
+  const r = t.depsgraph.evaluate()!;
+  const geo = r.output as Geometry;
+  assert(geo.curves, 'has curves');
+  assert(geo.curves!.cyclic[0] === 1, `cyclic flipped to 1, got ${geo.curves!.cyclic[0]}`);
+});
+
+test('phase2c: SetSplineResolution writes the resolution int', () => {
+  const t = new GeometryNodeTree('set-res');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const set = t.addNode(GeometryNodeSetSplineResolution);
+  (set.inputs[2]! as { default_value: number }).default_value = 17;
+  t.addLink(line.outputs[0]!, set.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(set.outputs[0]!, out.inputs[0]!);
+  const r = t.depsgraph.evaluate()!;
+  const geo = r.output as Geometry;
+  assert(geo.curves, 'has curves');
+  assert(geo.curves!.resolution[0] === 17, `resolution updated to 17, got ${geo.curves!.resolution[0]}`);
+});
+
+test('phase2c: CurveEndpointSelection node executes without error on a line', () => {
+  const t = new GeometryNodeTree('endpoint-sel');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(line.outputs[0]!, out.inputs[0]!);
+  const eps = t.addNode(GeometryNodeCurveEndpointSelection);
+  const r = t.depsgraph.evaluate()!;
+  assert(!r.errors.has(eps.id), `endpoint selection executed without error`);
+});
+
+test('phase2c: bootstrap registers >= 200 node classes (new Scene/Constant/Curve pack)', () => {
+  assert(NodeRegistry.listAllNodes().length >= 200,
+    `expected >= 200 registered node classes, got ${NodeRegistry.listAllNodes().length}`);
+});
+
+test('phase2c: bridge round-trips Scene-Time and SetCurveRadius', () => {
+  const t = new GeometryNodeTree('round-trip-2c');
+  t.depsgraph.setEvaluator(new GeometryEvaluator());
+  t.interface.new_socket({ name: 'Geometry', in_out: 'OUTPUT', socket_type: 'NodeSocketGeometry' });
+  const line = t.addNode(GeometryNodeCurveLine);
+  const set = t.addNode(GeometryNodeSetCurveRadius);
+  (set.inputs[2]! as { default_value: number }).default_value = 0.42;
+  t.addLink(line.outputs[0]!, set.inputs[0]!);
+  const out = t.addNode(NodeGroupOutput);
+  t.addLink(set.outputs[0]!, out.inputs[0]!);
+  t.addNode(GeometryNodeInputSceneTime);
+  t.addNode(FunctionNodeInputColor);
+  const json = exportDocument([t]);
+  const [restored] = importDocument(json);
+  assert(restored !== undefined, 'tree restored');
+  restored.depsgraph.setEvaluator(new GeometryEvaluator());
+  const r = restored.depsgraph.evaluate()!;
+  const geo = r.output as Geometry;
+  assert(geo.curves, 'curves survive round-trip');
+  const attr = geo.curves!.attributes.get('radius');
+  assert(attr, 'radius attribute survives round-trip');
+  assert(Math.abs((attr!.data as Float32Array)[0]! - 0.42) < 1e-6, 'radius value 0.42 survives');
+});
+
+// --------------------- Phase 2C: Shader Curves -------------------------
+
+test('curves: ShaderNodeRGBCurve identity preserves color', async () => {
+  const { ShaderNodeRGBCurve } = await import('../src');
+  const t = new ShaderNodeTree('rgb-curve-id');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const c = t.addNode(ShaderNodeRGBCurve);
+  // Default curves are identity y=x; with Factor=1 it should pass through.
+  c.inputs.find((s) => s.identifier === 'Color' || s.name === 'Color')!.default_value = [0.3, 0.6, 0.9, 1];
+  t.addLink(c.outputs[0]!, bsdf.inputs[0]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.color[0]!, 0.3, 1e-4, 'RGB curve identity R');
+  close(desc.color[1]!, 0.6, 1e-4, 'RGB curve identity G');
+  close(desc.color[2]!, 0.9, 1e-4, 'RGB curve identity B');
+});
+
+test('curves: ShaderNodeFloatCurve identity preserves value', async () => {
+  const { ShaderNodeFloatCurve } = await import('../src');
+  const t = new ShaderNodeTree('float-curve-id');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const fc = t.addNode(ShaderNodeFloatCurve);
+  fc.inputs.find((s) => s.identifier === 'Value' || s.name === 'Value')!.default_value = 0.42;
+  t.addLink(fc.outputs[0]!, bsdf.inputs[2]!); // roughness
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.roughness, 0.42, 1e-4, 'float curve identity value');
+});
+
+test('curves: ShaderNodeFloatCurve maps via custom curve', async () => {
+  const { ShaderNodeFloatCurve } = await import('../src');
+  const t = new ShaderNodeTree('float-curve-custom');
+  t.depsgraph.setEvaluator(new ShaderEvaluator());
+  const out = t.addNode(ShaderNodeOutputMaterial);
+  const bsdf = t.addNode(ShaderNodeBsdfPrincipled);
+  const fc = t.addNode(ShaderNodeFloatCurve);
+  // Curve: y = x^? — use LINEAR (0,0)→(0.5,0.9)→(1,1). At x=0.5, y=0.9.
+  fc.curve.interp = 'LINEAR';
+  fc.curve.points = [{ x: 0, y: 0 }, { x: 0.5, y: 0.9 }, { x: 1, y: 1 }];
+  fc.inputs.find((s) => s.identifier === 'Value' || s.name === 'Value')!.default_value = 0.5;
+  t.addLink(fc.outputs[0]!, bsdf.inputs[2]!);
+  t.addLink(bsdf.outputs[0]!, out.inputs[0]!);
+  await new Promise((r) => setTimeout(r, 5));
+  const desc = t.depsgraph.evaluate()!.output as MaterialDescriptor;
+  close(desc.roughness, 0.9, 1e-4, 'float curve at x=0.5 → y=0.9');
+});
+
+test('curves: ShaderNodeVectorCurve maps each axis independently', async () => {
+  const { ShaderNodeVectorCurve } = await import('../src');
+  // Pure unit test of compute(): set X curve to y=2x, Y to y=0, Z to identity.
+  const vc = new ShaderNodeVectorCurve();
+  vc.curves[0].interp = 'LINEAR';
+  vc.curves[0].points = [{ x: 0, y: 0 }, { x: 0.5, y: 1 }, { x: 1, y: 1 }];
+  vc.curves[1].interp = 'LINEAR';
+  vc.curves[1].points = [{ x: 0, y: 0 }, { x: 1, y: 0 }];
+  const out = ShaderNodeVectorCurve.compute(vc.curves, [0.25, 0.7, 0.4], 1);
+  close(out[0], 0.5, 1e-4, 'X curve: 2x at 0.25 = 0.5');
+  close(out[1], 0, 1e-4, 'Y curve zeroed');
+  close(out[2], 0.4, 1e-4, 'Z curve identity');
+});
+
+test('curves: ShaderNodeRGBCurve respects Factor blending', async () => {
+  const { ShaderNodeRGBCurve } = await import('../src');
+  // Combined curve doubles luma (red 0.5 → 1). Factor=0 should fall back to
+  // the original color (red 0.5).
+  const rc = new ShaderNodeRGBCurve();
+  rc.curves[0].interp = 'LINEAR';
+  rc.curves[0].points = [{ x: 0, y: 0 }, { x: 0.5, y: 1 }, { x: 1, y: 1 }];
+  const c0 = ShaderNodeRGBCurve.compute(rc.curves, [0.5, 0.5, 0.5, 1], 0);
+  close(c0[0], 0.5, 1e-4, 'Factor=0 disables curve (R)');
+  const c1 = ShaderNodeRGBCurve.compute(rc.curves, [0.5, 0.5, 0.5, 1], 1);
+  close(c1[0], 1.0, 1e-4, 'Factor=1 doubles luma to 1.0 (R)');
+});
+
+test('curves: Curves register on all expected trees', () => {
+  const sh = NodeRegistry.listForTree('ShaderNodeTree').filter((n) => n.bl_idname.endsWith('Curve') || n.bl_idname.endsWith('Curves'));
+  const geo = NodeRegistry.listForTree('GeometryNodeTree').filter((n) => n.bl_idname === 'ShaderNodeFloatCurve' || n.bl_idname === 'ShaderNodeVectorCurve' || n.bl_idname === 'ShaderNodeRGBCurve');
+  const comp = NodeRegistry.listForTree('CompositorNodeTree').filter((n) => n.bl_idname === 'ShaderNodeFloatCurve' || n.bl_idname === 'ShaderNodeVectorCurve' || n.bl_idname === 'ShaderNodeRGBCurve');
+  assert(sh.length >= 3, `shader tree has 3+ curve nodes, got ${sh.length}`);
+  assert(geo.length >= 3, `geometry tree has 3 curve nodes, got ${geo.length}`);
+  assert(comp.length >= 3, `compositor tree has 3 curve nodes, got ${comp.length}`);
+});
+
+// --------------------- Phase 2C: Compositor Matte/Keying ---------------
+
+test('matte CPU: Luminance Key extracts alpha from bright pixel', async () => {
+  const { CompositorNodeLumaMatte } = await import('../src/nodes/compositor/Compositor');
+  const t = new CompositorNodeTree('luma-bright');
+  const rgb = t.addNode(CompositorNodeRGB);
+  (rgb.outputs[0]!.default_value as number[]) = [1, 1, 1, 1]; // luma ≈ 1
+  const lm = t.addNode(CompositorNodeLumaMatte);
+  (lm as { limit_min: number; limit_max: number }).limit_min = 0.5;
+  (lm as { limit_min: number; limit_max: number }).limit_max = 0.9;
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(rgb.outputs[0]!, lm.inputs[0]!);
+  t.addLink(lm.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[3]!, 1, 1e-4, 'luma=1.0 above limit_max → alpha=1');
+  close(out[0]!, 1, 1e-4, 'RGB preserved');
+});
+
+test('matte CPU: Luminance Key alpha=0 for dark pixel below limit_min', () => {
+  const t = new CompositorNodeTree('luma-dark');
+  const rgb = t.addNode(CompositorNodeRGB);
+  (rgb.outputs[0]!.default_value as number[]) = [0.05, 0.05, 0.05, 1];
+  const lm = t.addNode(NodeRegistry.getNode('CompositorNodeLumaMatte')! as Parameters<typeof t.addNode>[0]);
+  (lm as unknown as { limit_min: number; limit_max: number }).limit_min = 0.5;
+  (lm as unknown as { limit_min: number; limit_max: number }).limit_max = 0.9;
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(rgb.outputs[0]!, lm.inputs[0]!);
+  t.addLink(lm.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[3]!, 0, 1e-4, 'luma=0.05 below limit_min → alpha=0');
+});
+
+test('matte CPU: Distance Key keys-out pixels matching key color', () => {
+  const t = new CompositorNodeTree('dist-matte');
+  const rgb = t.addNode(CompositorNodeRGB);
+  (rgb.outputs[0]!.default_value as number[]) = [0, 1, 0, 1]; // exactly the key
+  const dm = t.addNode(NodeRegistry.getNode('CompositorNodeDistanceMatte')! as Parameters<typeof t.addNode>[0]);
+  (dm as unknown as { tolerance: number; falloff: number }).tolerance = 0.1;
+  (dm as unknown as { tolerance: number; falloff: number }).falloff = 0.1;
+  dm.inputs.find((s) => s.name === 'Key Color')!.default_value = [0, 1, 0, 1];
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(rgb.outputs[0]!, dm.inputs[0]!);
+  t.addLink(dm.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[3]!, 0, 1e-4, 'exact-key pixel keyed out (alpha=0)');
+});
+
+test('matte CPU: Distance Key keeps pixels far from the key color', () => {
+  const t = new CompositorNodeTree('dist-matte-far');
+  const rgb = t.addNode(CompositorNodeRGB);
+  (rgb.outputs[0]!.default_value as number[]) = [1, 0, 0, 1]; // red — far from green key
+  const dm = t.addNode(NodeRegistry.getNode('CompositorNodeDistanceMatte')! as Parameters<typeof t.addNode>[0]);
+  (dm as unknown as { tolerance: number; falloff: number }).tolerance = 0.1;
+  (dm as unknown as { tolerance: number; falloff: number }).falloff = 0.1;
+  dm.inputs.find((s) => s.name === 'Key Color')!.default_value = [0, 1, 0, 1];
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(rgb.outputs[0]!, dm.inputs[0]!);
+  t.addLink(dm.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[3]!, 1, 1e-4, 'far-from-key pixel kept (alpha=1)');
+});
+
+test('matte CPU: Color Key matches HSV tolerance', () => {
+  const t = new CompositorNodeTree('color-key');
+  const rgb = t.addNode(CompositorNodeRGB);
+  (rgb.outputs[0]!.default_value as number[]) = [0, 0.95, 0, 1]; // slightly off green
+  const cm = t.addNode(NodeRegistry.getNode('CompositorNodeColorMatte')! as Parameters<typeof t.addNode>[0]);
+  (cm as unknown as { color_hue: number; color_saturation: number; color_value: number }).color_hue = 0.05;
+  (cm as unknown as { color_hue: number; color_saturation: number; color_value: number }).color_saturation = 0.1;
+  (cm as unknown as { color_hue: number; color_saturation: number; color_value: number }).color_value = 0.1;
+  cm.inputs.find((s) => s.name === 'Key Color')!.default_value = [0, 1, 0, 1];
+  const comp = t.addNode(CompositorNodeComposite);
+  t.addLink(rgb.outputs[0]!, cm.inputs[0]!);
+  t.addLink(cm.outputs[0]!, comp.inputs.find((x) => x.kind === 'RGBA')!);
+  const out = cpuComposite(t)!;
+  close(out[3]!, 0, 1e-4, 'close-HSV-match pixel keyed out');
+});
+
+test('matte: bootstrap registers all 4 matte nodes', () => {
+  for (const id of ['CompositorNodeLumaMatte', 'CompositorNodeColorMatte', 'CompositorNodeDistanceMatte', 'CompositorNodeChromaMatte']) {
+    assert(!!NodeRegistry.getNode(id), `${id} registered`);
+  }
 });
 
 // ------------------------------ Runner ----------------------------------

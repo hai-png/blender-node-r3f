@@ -273,6 +273,65 @@ function evalNode(node: Node, ctx: CpuCtx): void {
       set('Image', [tonemap(img[0]), tonemap(img[1]), tonemap(img[2]), img[3]]);
       return;
     }
+    case 'CompositorNodeLumaMatte': {
+      const img = inputRGBA(node, 'Image', ctx);
+      const lo = (node as unknown as { limit_min?: number }).limit_min ?? 0;
+      const hi = (node as unknown as { limit_max?: number }).limit_max ?? 1;
+      const luma = img[0]! * 0.2126 + img[1]! * 0.7152 + img[2]! * 0.0722;
+      const t = lo === hi ? (luma >= hi ? 1 : 0) : Math.max(0, Math.min(1, (luma - lo) / (hi - lo)));
+      const smooth = t * t * (3 - 2 * t);
+      set('Image', [img[0]!, img[1]!, img[2]!, smooth] as RGBA);
+      set('Matte', [smooth, smooth, smooth, 1] as RGBA);
+      return;
+    }
+    case 'CompositorNodeColorMatte': {
+      const img = inputRGBA(node, 'Image', ctx);
+      const key = inputRGBA(node, 'Key Color', ctx);
+      const tolH = (node as unknown as { color_hue?: number }).color_hue ?? 0.01;
+      const tolS = (node as unknown as { color_saturation?: number }).color_saturation ?? 0.1;
+      const tolV = (node as unknown as { color_value?: number }).color_value ?? 0.1;
+      const aHsv = rgb2hsv(img[0]!, img[1]!, img[2]!);
+      const kHsv = rgb2hsv(key[0]!, key[1]!, key[2]!);
+      const dh = Math.min(Math.abs(aHsv[0] - kHsv[0]), 1 - Math.abs(aHsv[0] - kHsv[0]));
+      const ds = Math.abs(aHsv[1] - kHsv[1]);
+      const dv = Math.abs(aHsv[2] - kHsv[2]);
+      const pass = dh <= tolH && ds <= tolS && dv <= tolV ? 1 : 0;
+      const alpha = img[3]! * (1 - pass);
+      set('Image', [img[0]!, img[1]!, img[2]!, alpha] as RGBA);
+      set('Matte', [alpha, alpha, alpha, 1] as RGBA);
+      return;
+    }
+    case 'CompositorNodeDistanceMatte': {
+      const img = inputRGBA(node, 'Image', ctx);
+      const key = inputRGBA(node, 'Key Color', ctx);
+      const tol = (node as unknown as { tolerance?: number }).tolerance ?? 0.1;
+      const fall = Math.max(1e-6, (node as unknown as { falloff?: number }).falloff ?? 0.1);
+      const d = Math.hypot(img[0]! - key[0]!, img[1]! - key[1]!, img[2]! - key[2]!);
+      const t = Math.max(0, Math.min(1, (d - tol) / fall));
+      const smooth = t * t * (3 - 2 * t);
+      const alpha = img[3]! * smooth;
+      set('Image', [img[0]!, img[1]!, img[2]!, alpha] as RGBA);
+      set('Matte', [alpha, alpha, alpha, 1] as RGBA);
+      return;
+    }
+    case 'CompositorNodeChromaMatte': {
+      const img = inputRGBA(node, 'Image', ctx);
+      const key = inputRGBA(node, 'Key Color', ctx);
+      const accept = (node as unknown as { acceptance?: number }).acceptance ?? 0.4;
+      const cutoff = (node as unknown as { cutoff?: number }).cutoff ?? 0.1;
+      const aHsv = rgb2hsv(img[0]!, img[1]!, img[2]!);
+      const kHsv = rgb2hsv(key[0]!, key[1]!, key[2]!);
+      const dh = Math.min(Math.abs(aHsv[0] - kHsv[0]), 1 - Math.abs(aHsv[0] - kHsv[0]));
+      const ds = Math.abs(aHsv[1] - kHsv[1]);
+      const d = Math.hypot(dh, ds);
+      const hi = Math.max(cutoff + 1e-6, accept);
+      const t = Math.max(0, Math.min(1, (d - cutoff) / (hi - cutoff)));
+      const smooth = t * t * (3 - 2 * t);
+      const alpha = img[3]! * smooth;
+      set('Image', [img[0]!, img[1]!, img[2]!, alpha] as RGBA);
+      set('Matte', [alpha, alpha, alpha, 1] as RGBA);
+      return;
+    }
     case 'CompositorNodeZcombine': {
       // Z-buffer combine: pick Image1 where Z1 < Z2, else Image2.
       const img1 = inputRGBA(node, 'Image', ctx);

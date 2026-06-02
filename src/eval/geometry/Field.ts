@@ -22,7 +22,8 @@
  * the *captured* values even if a later Set Position changes position.
  */
 import type { AttributeDomain } from '../../core/types';
-import type { Geometry, Attribute, ScalarTypedArray } from './Geometry';
+import type { Geometry, Attribute, ScalarTypedArray, AttributeDataType } from './Geometry';
+import { newAttribute as _newAttribute } from './Geometry';
 
 export type FieldKind = 'FLOAT' | 'INT' | 'BOOL' | 'VECTOR' | 'COLOR';
 
@@ -482,4 +483,324 @@ export function isField(value: unknown): value is Field {
     && typeof value === 'object'
     && 'kind' in (value as object)
     && typeof (value as Field).eval === 'function';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Curve-domain field inputs (Phase 2C)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Per-spline arc length (cumulative edge length sum) and per-spline point
+ * count. The Blender Spline-Length node returns these as CURVE-domain
+ * fields; when materialised against a POINT context we broadcast.
+ */
+export function splineLengthField(which: 'LENGTH' | 'POINT_COUNT'): Field {
+  const isLen = which === 'LENGTH';
+  return {
+    kind: isLen ? 'FLOAT' : 'INT',
+    eval(ctx) {
+      const c = ctx.geometry.curves;
+      const numCurves = c?.numCurves ?? 0;
+      // Pre-compute per-curve values.
+      const perCurve = isLen ? new Float32Array(numCurves) : new Int32Array(numCurves);
+      if (c) {
+        for (let i = 0; i < numCurves; i++) {
+          const s = c.curveOffsets[i] ?? 0;
+          const e = c.curveOffsets[i + 1] ?? s;
+          if (!isLen) {
+            (perCurve as Int32Array)[i] = e - s;
+            continue;
+          }
+          let len = 0;
+          for (let j = s + 1; j < e; j++) {
+            const ax = c.positions[(j - 1) * 3]!, ay = c.positions[(j - 1) * 3 + 1]!, az = c.positions[(j - 1) * 3 + 2]!;
+            const bx = c.positions[j * 3]!, by = c.positions[j * 3 + 1]!, bz = c.positions[j * 3 + 2]!;
+            len += Math.hypot(bx - ax, by - ay, bz - az);
+          }
+          if (c.cyclic[i]) {
+            const ax = c.positions[(e - 1) * 3]!, ay = c.positions[(e - 1) * 3 + 1]!, az = c.positions[(e - 1) * 3 + 2]!;
+            const bx = c.positions[s * 3]!, by = c.positions[s * 3 + 1]!, bz = c.positions[s * 3 + 2]!;
+            len += Math.hypot(bx - ax, by - ay, bz - az);
+          }
+          (perCurve as Float32Array)[i] = len;
+        }
+      }
+      // Materialise against the requested domain.
+      if (ctx.domain === 'CURVE') return perCurve;
+      // POINT (or any other) → broadcast each curve's value to its points.
+      const out: ScalarTypedArray = isLen ? new Float32Array(ctx.size) : new Int32Array(ctx.size);
+      if (c) {
+        for (let i = 0; i < numCurves; i++) {
+          const s = c.curveOffsets[i] ?? 0;
+          const e = c.curveOffsets[i + 1] ?? s;
+          const v = (perCurve as ScalarTypedArray)[i] ?? 0;
+          for (let j = s; j < e && j < ctx.size; j++) {
+            if (isLen) (out as Float32Array)[j] = v as number;
+            else (out as Int32Array)[j] = v as number;
+          }
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * Convenience: full curve length, materialised as a single scalar wrapped
+ * in a constant FLOAT field.
+ */
+export function totalCurveLength(geometry: Geometry): Field {
+  let total = 0;
+  const c = geometry.curves;
+  if (c) {
+    for (let i = 0; i < c.numCurves; i++) {
+      const s = c.curveOffsets[i] ?? 0;
+      const e = c.curveOffsets[i + 1] ?? s;
+      for (let j = s + 1; j < e; j++) {
+        const ax = c.positions[(j - 1) * 3]!, ay = c.positions[(j - 1) * 3 + 1]!, az = c.positions[(j - 1) * 3 + 2]!;
+        const bx = c.positions[j * 3]!, by = c.positions[j * 3 + 1]!, bz = c.positions[j * 3 + 2]!;
+        total += Math.hypot(bx - ax, by - ay, bz - az);
+      }
+      if (c.cyclic[i]) {
+        const ax = c.positions[(e - 1) * 3]!, ay = c.positions[(e - 1) * 3 + 1]!, az = c.positions[(e - 1) * 3 + 2]!;
+        const bx = c.positions[s * 3]!, by = c.positions[s * 3 + 1]!, bz = c.positions[s * 3 + 2]!;
+        total += Math.hypot(bx - ax, by - ay, bz - az);
+      }
+    }
+  }
+  return constField(total, 'FLOAT');
+}
+
+/**
+ * Per-point tangent vector along the spline. Uses central differences in
+ * the interior, forward/backward at endpoints. Cyclic splines wrap.
+ * Materialises against POINT domain; for CURVE domain returns the first
+ * point's tangent (Blender's documented fallback).
+ */
+export function curveTangentField(): Field {
+  return {
+    kind: 'VECTOR',
+    eval(ctx) {
+      const out = new Float32Array(ctx.size * 3);
+      const c = ctx.geometry.curves;
+      if (!c) return out;
+      if (ctx.domain === 'CURVE') {
+        for (let i = 0; i < c.numCurves; i++) {
+          const s = c.curveOffsets[i] ?? 0;
+          const e = c.curveOffsets[i + 1] ?? s;
+          if (e - s < 2) continue;
+          const dx = c.positions[(s + 1) * 3]! - c.positions[s * 3]!;
+          const dy = c.positions[(s + 1) * 3 + 1]! - c.positions[s * 3 + 1]!;
+          const dz = c.positions[(s + 1) * 3 + 2]! - c.positions[s * 3 + 2]!;
+          const len = Math.hypot(dx, dy, dz) || 1;
+          out[i * 3] = dx / len; out[i * 3 + 1] = dy / len; out[i * 3 + 2] = dz / len;
+        }
+        return out;
+      }
+      for (let i = 0; i < c.numCurves; i++) {
+        const s = c.curveOffsets[i] ?? 0;
+        const e = c.curveOffsets[i + 1] ?? s;
+        const cyc = !!c.cyclic[i];
+        for (let j = s; j < e && j < ctx.size; j++) {
+          const prev = j === s ? (cyc ? e - 1 : j) : j - 1;
+          const next = j === e - 1 ? (cyc ? s : j) : j + 1;
+          const dx = c.positions[next * 3]! - c.positions[prev * 3]!;
+          const dy = c.positions[next * 3 + 1]! - c.positions[prev * 3 + 1]!;
+          const dz = c.positions[next * 3 + 2]! - c.positions[prev * 3 + 2]!;
+          const len = Math.hypot(dx, dy, dz) || 1;
+          out[j * 3] = dx / len; out[j * 3 + 1] = dy / len; out[j * 3 + 2] = dz / len;
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/** Per-spline cyclic flag, broadcast to POINT on POINT-domain materialise. */
+export function splineCyclicField(): Field {
+  return {
+    kind: 'BOOL',
+    eval(ctx) {
+      const c = ctx.geometry.curves;
+      if (!c) return new Uint8Array(ctx.size);
+      if (ctx.domain === 'CURVE') return new Uint8Array(c.cyclic);
+      const out = new Uint8Array(ctx.size);
+      for (let i = 0; i < c.numCurves; i++) {
+        const s = c.curveOffsets[i] ?? 0;
+        const e = c.curveOffsets[i + 1] ?? s;
+        const v = c.cyclic[i] ? 1 : 0;
+        for (let j = s; j < e && j < ctx.size; j++) out[j] = v;
+      }
+      return out;
+    },
+  };
+}
+
+/** Per-spline render resolution. Broadcasts like cyclic. */
+export function splineResolutionField(): Field {
+  return {
+    kind: 'INT',
+    eval(ctx) {
+      const c = ctx.geometry.curves;
+      const out = new Int32Array(ctx.size);
+      if (!c) return out;
+      if (ctx.domain === 'CURVE') {
+        const r = new Int32Array(c.numCurves);
+        for (let i = 0; i < c.numCurves; i++) r[i] = c.resolution[i] ?? 12;
+        return r;
+      }
+      for (let i = 0; i < c.numCurves; i++) {
+        const s = c.curveOffsets[i] ?? 0;
+        const e = c.curveOffsets[i + 1] ?? s;
+        const v = c.resolution[i] ?? 12;
+        for (let j = s; j < e && j < ctx.size; j++) out[j] = v;
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * Curve parameter — for each POINT, the cumulative arc-length (Length),
+ * the normalized factor in [0, 1] (Factor), or the per-spline index (Index).
+ */
+export function curveParameterField(which: 'FACTOR' | 'LENGTH' | 'INDEX'): Field {
+  const isIdx = which === 'INDEX';
+  return {
+    kind: isIdx ? 'INT' : 'FLOAT',
+    eval(ctx) {
+      const c = ctx.geometry.curves;
+      const out: ScalarTypedArray = isIdx ? new Int32Array(ctx.size) : new Float32Array(ctx.size);
+      if (!c) return out;
+      for (let i = 0; i < c.numCurves; i++) {
+        const s = c.curveOffsets[i] ?? 0;
+        const e = c.curveOffsets[i + 1] ?? s;
+        const np = e - s;
+        if (np === 0) continue;
+        if (which === 'INDEX') {
+          for (let j = s, k = 0; j < e && j < ctx.size; j++, k++) (out as Int32Array)[j] = k;
+          continue;
+        }
+        // Compute per-point cumulative length and total.
+        const cum = new Float32Array(np);
+        let total = 0;
+        for (let k = 1; k < np; k++) {
+          const a = (s + k - 1) * 3, b = (s + k) * 3;
+          total += Math.hypot(
+            c.positions[b]! - c.positions[a]!,
+            c.positions[b + 1]! - c.positions[a + 1]!,
+            c.positions[b + 2]! - c.positions[a + 2]!,
+          );
+          cum[k] = total;
+        }
+        if (which === 'LENGTH') {
+          for (let k = 0; k < np && s + k < ctx.size; k++) (out as Float32Array)[s + k] = cum[k] ?? 0;
+        } else {
+          const denom = total || 1;
+          for (let k = 0; k < np && s + k < ctx.size; k++) {
+            (out as Float32Array)[s + k] = (cum[k] ?? 0) / denom;
+          }
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * Endpoint selection — for each POINT, true iff its per-spline index is
+ * < startN or >= (np - endN). CURVE-domain materialisation: always true.
+ */
+export function endpointSelectionField(startN: number, endN: number): Field {
+  return {
+    kind: 'BOOL',
+    eval(ctx) {
+      const c = ctx.geometry.curves;
+      const out = new Uint8Array(ctx.size);
+      if (!c) return out;
+      if (ctx.domain === 'CURVE') { out.fill(1); return out; }
+      for (let i = 0; i < c.numCurves; i++) {
+        const s = c.curveOffsets[i] ?? 0;
+        const e = c.curveOffsets[i + 1] ?? s;
+        const np = e - s;
+        for (let k = 0; k < np && s + k < ctx.size; k++) {
+          out[s + k] = (k < startN || k >= np - endN) ? 1 : 0;
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mutators for curve write nodes (Phase 2C)                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Set a per-POINT attribute on a curve geometry. Selection-gated: where
+ * selection is < 0.5, the previous value (or default) is preserved.
+ *
+ * Used by Set Curve Radius / Set Curve Tilt and any future per-point write
+ * node on the curve domain. Mirrors Blender's `Set Curve Radius`-style
+ * "Selection + Value" socket pair.
+ */
+export function setPointAttribute(
+  geo: Geometry,
+  attrName: string,
+  data_type: AttributeDataType,
+  selection: Field,
+  value: Field,
+): Geometry {
+  const c = geo.curves;
+  if (!c) return geo;
+  const out = geo.cloneOwning();
+  const oc = out.curves!;
+  const ctx: FieldContext = { geometry: out, domain: 'POINT', size: oc.numPoints };
+  const sel = selection.eval(ctx);
+  const valBuf = value.eval(ctx);
+  const existing = oc.attributes.get(attrName);
+  const attr = existing ?? _newAttribute(attrName, 'POINT', data_type, oc.numPoints);
+  if (!existing) {
+    if (attrName === 'radius') (attr.data as Float32Array).fill(1);
+    oc.attributes.set(attrName, attr);
+  }
+  const data = attr.data as Float32Array;
+  for (let i = 0; i < oc.numPoints; i++) {
+    const s = (sel[i] as number) > 0.5;
+    if (!s) continue;
+    data[i] = (valBuf[i] as number) ?? 0;
+  }
+  return out;
+}
+
+/** Set per-CURVE cyclic flag, selection-gated. */
+export function setSplineCyclic(geo: Geometry, selection: Field, cyclic: Field): Geometry {
+  const c = geo.curves;
+  if (!c) return geo;
+  const out = geo.cloneOwning();
+  const oc = out.curves!;
+  const ctx: FieldContext = { geometry: out, domain: 'CURVE', size: oc.numCurves };
+  const sel = selection.eval(ctx);
+  const buf = cyclic.eval(ctx);
+  for (let i = 0; i < oc.numCurves; i++) {
+    if ((sel[i] as number) <= 0.5) continue;
+    oc.cyclic[i] = (buf[i] as number) ? 1 : 0;
+  }
+  return out;
+}
+
+/** Set per-CURVE resolution int, selection-gated. */
+export function setSplineResolution(geo: Geometry, selection: Field, resolution: Field): Geometry {
+  const c = geo.curves;
+  if (!c) return geo;
+  const out = geo.cloneOwning();
+  const oc = out.curves!;
+  const ctx: FieldContext = { geometry: out, domain: 'CURVE', size: oc.numCurves };
+  const sel = selection.eval(ctx);
+  const buf = resolution.eval(ctx);
+  for (let i = 0; i < oc.numCurves; i++) {
+    if ((sel[i] as number) <= 0.5) continue;
+    oc.resolution[i] = Math.max(1, Math.floor((buf[i] as number) ?? 12)) | 0;
+  }
+  return out;
 }

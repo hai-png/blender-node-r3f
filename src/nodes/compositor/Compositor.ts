@@ -647,6 +647,105 @@ export class CompositorNodeTonemap extends CompNode {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Matte / Keying (Phase 2C — see RESEARCH.md §4.4)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Luminance Key — alpha = smoothstep(limit_min, limit_max, luma(rgb)).
+ * Used as a quick alpha-from-luma extractor. Single Image input, single
+ * Image+Alpha output (Image preserves rgb, alpha is the matte).
+ */
+export class CompositorNodeLumaMatte extends CompNode {
+  static override bl_idname = 'CompositorNodeLumaMatte';
+  static override bl_label = 'Luminance Key';
+  static override category = 'Matte';
+  static override comp_kind = 'PIXEL';
+  static override properties = {
+    limit_min: FloatProperty({ default: 0, min: 0, max: 1, name: 'Low' }),
+    limit_max: FloatProperty({ default: 1, min: 0, max: 1, name: 'High' }),
+  };
+  declare limit_min: number;
+  declare limit_max: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0, 0, 0, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+    this.addOutput(NodeSocketFloat, 'Matte');
+  }
+}
+
+/**
+ * Color Matte — alpha = 0 inside a HSV tolerance box around the Key Color,
+ * 1 outside (Blender semantics: pass = matched pixels are *removed*).
+ */
+export class CompositorNodeColorMatte extends CompNode {
+  static override bl_idname = 'CompositorNodeColorMatte';
+  static override bl_label = 'Color Key';
+  static override category = 'Matte';
+  static override comp_kind = 'PIXEL';
+  static override properties = {
+    color_hue: FloatProperty({ default: 0.01, min: 0, max: 1, name: 'H' }),
+    color_saturation: FloatProperty({ default: 0.1, min: 0, max: 1, name: 'S' }),
+    color_value: FloatProperty({ default: 0.1, min: 0, max: 1, name: 'V' }),
+  };
+  declare color_hue: number;
+  declare color_saturation: number;
+  declare color_value: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0, 0, 0, 1] });
+    this.addInput(NodeSocketColor, 'Key Color', { default_value: [0, 1, 0, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+    this.addOutput(NodeSocketFloat, 'Matte');
+  }
+}
+
+/**
+ * Distance Matte — Euclidean RGB distance between Image and Key, with a
+ * tolerance + falloff range. Inside `tolerance`: keyed out (alpha=0).
+ * Beyond `tolerance + falloff`: kept (alpha=1). Smooth in between.
+ */
+export class CompositorNodeDistanceMatte extends CompNode {
+  static override bl_idname = 'CompositorNodeDistanceMatte';
+  static override bl_label = 'Distance Key';
+  static override category = 'Matte';
+  static override comp_kind = 'PIXEL';
+  static override properties = {
+    tolerance: FloatProperty({ default: 0.1, min: 0, max: 1, name: 'Tolerance' }),
+    falloff: FloatProperty({ default: 0.1, min: 0, max: 1, name: 'Falloff' }),
+  };
+  declare tolerance: number;
+  declare falloff: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0, 0, 0, 1] });
+    this.addInput(NodeSocketColor, 'Key Color', { default_value: [0, 1, 0, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+    this.addOutput(NodeSocketFloat, 'Matte');
+  }
+}
+
+/**
+ * Chroma Matte — Hue+Saturation distance keying (value-agnostic).
+ * `acceptance` is the outer disc radius, `cutoff` the inner.
+ */
+export class CompositorNodeChromaMatte extends CompNode {
+  static override bl_idname = 'CompositorNodeChromaMatte';
+  static override bl_label = 'Chroma Key';
+  static override category = 'Matte';
+  static override comp_kind = 'PIXEL';
+  static override properties = {
+    acceptance: FloatProperty({ default: 0.4, min: 0, max: 1, name: 'Acceptance' }),
+    cutoff: FloatProperty({ default: 0.1, min: 0, max: 1, name: 'Cutoff' }),
+  };
+  declare acceptance: number;
+  declare cutoff: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketColor, 'Image', { default_value: [0, 0, 0, 1] });
+    this.addInput(NodeSocketColor, 'Key Color', { default_value: [0, 1, 0, 1] });
+    this.addOutput(NodeSocketColor, 'Image');
+    this.addOutput(NodeSocketFloat, 'Matte');
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Registration                                                      */
 /* ------------------------------------------------------------------ */
 let _registered = false;
@@ -666,6 +765,9 @@ export function registerCompositorNodes(): void {
     CompositorNodeCombineColor, CompositorNodeSeparateColor, CompositorNodeValToRGB,
     CompositorNodeSplitViewer,
     CompositorNodeColorBalance, CompositorNodeHueCorrect, CompositorNodeTonemap,
+    // Phase 2C matte/keying pack:
+    CompositorNodeLumaMatte, CompositorNodeColorMatte, CompositorNodeDistanceMatte,
+    CompositorNodeChromaMatte,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

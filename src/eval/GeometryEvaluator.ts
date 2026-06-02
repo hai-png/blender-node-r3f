@@ -29,6 +29,9 @@ import {
   attributeField, constField, indexField, idField, normalField, positionField,
   radiusField, anonField, nextAnonymousId, liftToField, isField, mapField, zipField,
   interpolateAttribute,
+  splineLengthField, totalCurveLength, curveTangentField, splineCyclicField,
+  splineResolutionField, curveParameterField, endpointSelectionField,
+  setPointAttribute, setSplineCyclic, setSplineResolution,
 } from './geometry/Field';
 import {
   transformGeometry, joinGeometries, setPosition, storeAttributeOn, boundingBox, convexHull,
@@ -47,6 +50,9 @@ import { MixNode } from '../nodes/common/MixColor';
 import { MapRangeNode } from '../nodes/common/MapRange';
 import { ClampNode } from '../nodes/common/Clamp';
 import { ColorRampNode } from '../nodes/common/ColorRamp';
+import {
+  ShaderNodeFloatCurve, ShaderNodeVectorCurve, ShaderNodeRGBCurve,
+} from '../nodes/common/Curves';
 import {
   CombineXYZNode, SeparateXYZNode, CombineColorNode, SeparateColorNode,
 } from '../nodes/common/CombineSeparate';
@@ -91,6 +97,22 @@ import {
   GeometryNodeAccumulateField, GeometryNodeFieldOnDomain, GeometryNodeFieldAtIndex,
   GeometryNodeAttributeDomainSize,
 } from '../nodes/geometry/FieldUtils';
+import {
+  GeometryNodeInputSceneTime, GeometryNodeIsViewport, GeometryNodeSelfObject,
+  GeometryNodeInputActiveCamera, GeometryNodeObjectInfo, GeometryNodeImageInfo,
+  FunctionNodeInputBool, FunctionNodeInputInt, FunctionNodeInputColor,
+  FunctionNodeInputString, FunctionNodeInputRotation,
+  GeometryNodeInputMaterial, GeometryNodeInputImage, GeometryNodeInputObject,
+  GeometryNodeInputCollection,
+} from '../nodes/geometry/SceneInputs';
+import {
+  GeometryNodeSplineLength, GeometryNodeCurveLength, GeometryNodeInputTangent,
+  GeometryNodeInputCurveTilt, GeometryNodeInputSplineCyclic,
+  GeometryNodeInputSplineResolution, GeometryNodeCurveParameter,
+  GeometryNodeCurveEndpointSelection,
+  GeometryNodeSetCurveRadius, GeometryNodeSetCurveTilt,
+  GeometryNodeSetSplineCyclic, GeometryNodeSetSplineResolution,
+} from '../nodes/geometry/CurveRead';
 import { runZone, type ZoneEvalContext } from './zones/ZoneRunner';
 import type { ZoneIterContext } from './zones/types';
 
@@ -176,8 +198,48 @@ function dimsForFieldKind(kind: FieldKind): number {
   return kind === 'VECTOR' ? 3 : kind === 'COLOR' ? 4 : 1;
 }
 
+/**
+ * Resolver hooks the host can supply to satisfy Scene-input nodes.
+ * All are optional; missing hooks make the corresponding node emit Blender's
+ * documented defaults (zero / identity / no-op).
+ */
+export interface GeometryEvaluatorOptions {
+  /** Image bytes for ShaderNodeTexImage when consumed in a Geometry tree. */
+  resolveImage?: (imageSrc: string) => ImageData | null;
+  /**
+   * Image metadata for GeometryNodeImageInfo. Returning `null` keeps the
+   * documented Blender fallbacks (0 width/height/frame-count, fps=24).
+   */
+  resolveImageInfo?: (imageSrc: string, frame: number) => {
+    width: number; height: number; has_alpha: boolean;
+    frame_count: number; fps: number;
+  } | null;
+  /**
+   * Object metadata for GeometryNodeObjectInfo. Location/rotation/scale are
+   * arrays; `geometry` is an optional Geometry blob produced by another tree
+   * or imported via the bridge.
+   */
+  resolveObject?: (objectKey: string) => {
+    location: [number, number, number];
+    rotation: [number, number, number]; // euler XYZ radians
+    scale: [number, number, number];
+    geometry?: Geometry;
+    /** Stable identifier used to derive the deterministic Random output. */
+    random_seed?: number;
+  } | null;
+  /** Self-object reference returned by GeometryNodeSelfObject. */
+  resolveSelfObject?: () => string | null;
+  /** Active-camera reference returned by GeometryNodeInputActiveCamera. */
+  resolveActiveCamera?: () => string | null;
+  /**
+   * Hint whether the evaluator is running for viewport (true) or render
+   * (false). Drives GeometryNodeIsViewport. Defaults to `true`.
+   */
+  is_viewport?: boolean;
+}
+
 export class GeometryEvaluator implements SystemEvaluator {
-  constructor(private opts: { resolveImage?: (imageSrc: string) => ImageData | null } = {}) {}
+  constructor(private opts: GeometryEvaluatorOptions = {}) {}
 
   /**
    * Persistent socket-output cache across `evaluate()` calls.
@@ -898,6 +960,72 @@ export class GeometryEvaluator implements SystemEvaluator {
       } satisfies Field);
       return;
     }
+    /* ---------------- Curve nodes (Phase 2C) ---------------- */
+    if (node instanceof ShaderNodeFloatCurve) {
+      const facF = this.socketField(node.inputs[0]!, cache);
+      const valF = this.socketField(node.inputs[1]!, cache);
+      const curve = node.curve;
+      cache.set(node.outputs[0]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const fac = facF.eval(ctx) as Float32Array;
+          const val = valF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = ShaderNodeFloatCurve.compute(curve, val[i] ?? 0, fac[i] ?? 1);
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeVectorCurve) {
+      const facF = this.socketField(node.inputs[0]!, cache);
+      const vecF = this.socketField(node.inputs[1]!, cache);
+      const curves = node.curves;
+      cache.set(node.outputs[0]!.id, {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const fac = facF.eval(ctx) as Float32Array;
+          const vec = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const v = ShaderNodeVectorCurve.compute(
+              curves,
+              [vec[i * 3] ?? 0, vec[i * 3 + 1] ?? 0, vec[i * 3 + 2] ?? 0],
+              fac[i] ?? 1,
+            );
+            out[i * 3] = v[0]; out[i * 3 + 1] = v[1]; out[i * 3 + 2] = v[2];
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof ShaderNodeRGBCurve) {
+      const facF = this.socketField(node.inputs[0]!, cache);
+      const colF = this.socketField(node.inputs[1]!, cache);
+      const curves = node.curves;
+      cache.set(node.outputs[0]!.id, {
+        kind: 'COLOR',
+        eval(ctx) {
+          const fac = facF.eval(ctx) as Float32Array;
+          const col = colF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 4);
+          for (let i = 0; i < ctx.size; i++) {
+            const c = ShaderNodeRGBCurve.compute(
+              curves,
+              [col[i * 4] ?? 0, col[i * 4 + 1] ?? 0, col[i * 4 + 2] ?? 0, col[i * 4 + 3] ?? 1],
+              fac[i] ?? 1,
+            );
+            out[i * 4] = c[0]; out[i * 4 + 1] = c[1]; out[i * 4 + 2] = c[2]; out[i * 4 + 3] = c[3];
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+
     if (node instanceof CombineXYZNode) {
       const x = this.socketField(node.inputs[0]!, cache);
       const y = this.socketField(node.inputs[1]!, cache);
@@ -1477,6 +1605,167 @@ export class GeometryEvaluator implements SystemEvaluator {
           return out;
         },
       } satisfies Field);
+      return;
+    }
+
+    /* ---------------- Scene & constant input nodes (Phase 2C) ---------------- */
+    if (node instanceof GeometryNodeInputSceneTime) {
+      const scene = node.tree.depsgraph.scene;
+      cache.set(node.outputs[0]!.id, constField(scene.elapsed, 'FLOAT'));
+      cache.set(node.outputs[1]!.id, constField(scene.frame, 'FLOAT'));
+      return;
+    }
+    if (node instanceof GeometryNodeIsViewport) {
+      const flag = this.opts.is_viewport !== false; // default true
+      cache.set(node.outputs[0]!.id, constField(flag, 'BOOL'));
+      return;
+    }
+    if (node instanceof GeometryNodeSelfObject) {
+      const key = this.opts.resolveSelfObject?.() ?? null;
+      // Object sockets carry strings; lift as a CONSTANT field for uniformity.
+      cache.set(node.outputs[0]!.id, key);
+      return;
+    }
+    if (node instanceof GeometryNodeInputActiveCamera) {
+      cache.set(node.outputs[0]!.id, this.opts.resolveActiveCamera?.() ?? null);
+      return;
+    }
+    if (node instanceof GeometryNodeObjectInfo) {
+      const dummy = Geometry.empty();
+      const key = this.socketSingle<string | null>(node.inputs[0]!, cache, dummy);
+      const info = key && this.opts.resolveObject ? this.opts.resolveObject(key) : null;
+      const loc: Vec3 = info ? info.location : [0, 0, 0];
+      const rot: Vec3 = info ? info.rotation : [0, 0, 0];
+      const scl: Vec3 = info ? info.scale : [1, 1, 1];
+      cache.set(node.outputs[0]!.id, constField(loc, 'VECTOR'));
+      // Rotation socket carries a {quat, euler}; field-lift the euler scalar
+      // triplet — downstream Rotation consumers see a length-3 buffer.
+      cache.set(node.outputs[1]!.id, constField(rot, 'VECTOR'));
+      cache.set(node.outputs[2]!.id, constField(scl, 'VECTOR'));
+      cache.set(node.outputs[3]!.id, info?.geometry ?? Geometry.empty());
+      // Random: deterministic hash of (random_seed | first char of key).
+      let seed = info?.random_seed ?? 0;
+      if (!seed && key) for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) | 0;
+      const random = Math.abs(Math.sin(seed * 12.9898 + 78.233) * 43758.5453);
+      cache.set(node.outputs[4]!.id, constField(random - Math.floor(random), 'FLOAT'));
+      return;
+    }
+    if (node instanceof GeometryNodeImageInfo) {
+      const dummy = Geometry.empty();
+      const key = this.socketSingle<string | null>(node.inputs[0]!, cache, dummy);
+      const frame = Math.max(1, Math.floor(this.socketSingle<number>(node.inputs[1]!, cache, dummy) || 1));
+      const info = key && this.opts.resolveImageInfo ? this.opts.resolveImageInfo(key, frame) : null;
+      cache.set(node.outputs[0]!.id, constField(info?.width ?? 0, 'INT'));
+      cache.set(node.outputs[1]!.id, constField(info?.height ?? 0, 'INT'));
+      cache.set(node.outputs[2]!.id, constField(info?.has_alpha ?? false, 'BOOL'));
+      cache.set(node.outputs[3]!.id, constField(info?.frame_count ?? 1, 'INT'));
+      cache.set(node.outputs[4]!.id, constField(info?.fps ?? 24, 'FLOAT'));
+      return;
+    }
+    if (node instanceof FunctionNodeInputBool) {
+      cache.set(node.outputs[0]!.id, constField(node.boolean, 'BOOL'));
+      return;
+    }
+    if (node instanceof FunctionNodeInputInt) {
+      cache.set(node.outputs[0]!.id, constField(node.integer, 'INT'));
+      return;
+    }
+    if (node instanceof FunctionNodeInputColor) {
+      cache.set(node.outputs[0]!.id, constField([...node.value], 'COLOR'));
+      return;
+    }
+    if (node instanceof FunctionNodeInputString) {
+      // String sockets aren't fields per se — carry the raw value through.
+      cache.set(node.outputs[0]!.id, node.string);
+      return;
+    }
+    if (node instanceof FunctionNodeInputRotation) {
+      cache.set(node.outputs[0]!.id, constField([...node.rotation_euler], 'VECTOR'));
+      return;
+    }
+    if (node instanceof GeometryNodeInputMaterial) {
+      cache.set(node.outputs[0]!.id, node.material || null);
+      return;
+    }
+    if (node instanceof GeometryNodeInputImage) {
+      cache.set(node.outputs[0]!.id, node.image || null);
+      return;
+    }
+    if (node instanceof GeometryNodeInputObject) {
+      cache.set(node.outputs[0]!.id, node.object || null);
+      return;
+    }
+    if (node instanceof GeometryNodeInputCollection) {
+      cache.set(node.outputs[0]!.id, node.collection || null);
+      return;
+    }
+
+    /* ---------------- Curve read/write (Phase 2C) ---------------- */
+    if (node instanceof GeometryNodeSplineLength) {
+      cache.set(node.outputs[0]!.id, splineLengthField('LENGTH'));
+      cache.set(node.outputs[1]!.id, splineLengthField('POINT_COUNT'));
+      return;
+    }
+    if (node instanceof GeometryNodeCurveLength) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, totalCurveLength(geo));
+      return;
+    }
+    if (node instanceof GeometryNodeInputTangent) {
+      cache.set(node.outputs[0]!.id, curveTangentField());
+      return;
+    }
+    if (node instanceof GeometryNodeInputCurveTilt) {
+      cache.set(node.outputs[0]!.id, attributeField('tilt', 'FLOAT'));
+      return;
+    }
+    if (node instanceof GeometryNodeInputSplineCyclic) {
+      cache.set(node.outputs[0]!.id, splineCyclicField());
+      return;
+    }
+    if (node instanceof GeometryNodeInputSplineResolution) {
+      cache.set(node.outputs[0]!.id, splineResolutionField());
+      return;
+    }
+    if (node instanceof GeometryNodeCurveParameter) {
+      cache.set(node.outputs[0]!.id, curveParameterField('FACTOR'));
+      cache.set(node.outputs[1]!.id, curveParameterField('LENGTH'));
+      cache.set(node.outputs[2]!.id, curveParameterField('INDEX'));
+      return;
+    }
+    if (node instanceof GeometryNodeCurveEndpointSelection) {
+      const dummy = Geometry.empty();
+      const startN = Math.max(0, Math.floor(this.socketSingle<number>(node.inputs[0]!, cache, dummy) || 0));
+      const endN = Math.max(0, Math.floor(this.socketSingle<number>(node.inputs[1]!, cache, dummy) || 0));
+      cache.set(node.outputs[0]!.id, endpointSelectionField(startN, endN));
+      return;
+    }
+    if (node instanceof GeometryNodeSetCurveRadius) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const radius = this.socketField(node.inputs[2]!, cache);
+      cache.set(node.outputs[0]!.id, setPointAttribute(geo, 'radius', 'FLOAT', sel, radius));
+      return;
+    }
+    if (node instanceof GeometryNodeSetCurveTilt) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const tilt = this.socketField(node.inputs[2]!, cache);
+      cache.set(node.outputs[0]!.id, setPointAttribute(geo, 'tilt', 'FLOAT', sel, tilt));
+      return;
+    }
+    if (node instanceof GeometryNodeSetSplineCyclic) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const cyclic = this.socketField(node.inputs[2]!, cache);
+      cache.set(node.outputs[0]!.id, setSplineCyclic(geo, sel, cyclic));
+      return;
+    }
+    if (node instanceof GeometryNodeSetSplineResolution) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const res = this.socketField(node.inputs[2]!, cache);
+      cache.set(node.outputs[0]!.id, setSplineResolution(geo, sel, res));
       return;
     }
 
