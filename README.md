@@ -3,12 +3,6 @@
 A **Blender-compatible node system** for three.js + react-three-fiber. Mirrors `bpy.types.Node`, `NodeSocket`, `NodeTree`, `NodeTreeInterface`, `bpy.props.*`, `bpy.utils.register_class`, and `nodeitems_utils` closely enough that Blender Python addons that ship as node-group `.blend` files can be **ported** to TypeScript with minimal *structural* change. Porting is mechanical but **manual** — there is no automatic Python→TS translator; class structure transliterates 1:1 and per-node behaviour is supplied by an `executeGeo(ctx)` hook (see [`examples/falloff_addon.ts`](examples/falloff_addon.ts)).
 
 > **Status**: broad **M0–M8 prototype/subset implemented**, with active gap-closure in progress. All four node systems (Shader/Geometry/Compositor/Texture) evaluate, including **recursive node groups in every system**, node **mute**, **reroute**, interface reactivity, an M5-style **compositor** WebGL pipeline (+ a headless CPU pixel evaluator), the **texture** sampler graph with `DataTexture` baking, geometry **field utilities**, a worked **ported-addon example** through the `bpy` shim, and headless editor **operators** (undo/redo, make-group/ungroup, auto-layout). **215 unique node classes** register at runtime. **168 headless smoke tests pass; strict `tsc` clean; `vite build` clean.** 
-## Documents
-
-| Document | Purpose |
-|---|---|
-| [`docs/RESEARCH.md`](docs/RESEARCH.md) | Deep research into Blender's node system — data model, evaluation per system, group nodes, zones, sockets, field model, references. |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Concrete TypeScript architecture mapping every Blender concept onto our modules. |
 
 ## Quick start
 
@@ -151,7 +145,6 @@ R3F viewport                ─►  demo/Viewport.tsx  (ShaderPreview / Geometry
 Library build               ─►  tsup.config.ts → dist/{index,tsl}.{esm,cjs}.js + .d.ts
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full module specification.
 
 ## License
 
