@@ -463,6 +463,93 @@ export class InstancesComponent {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Volume                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * VolumeComponent — sparse voxel grid representation.
+ *
+ * Mirrors Blender's Volume component: a regular 3D grid of scalar density
+ * values with an origin, voxel size, and dimensions. Used by Mesh to Volume,
+ * Volume to Mesh, and Points to Volume nodes.
+ */
+export class VolumeComponent {
+  /** Density grid — one scalar per voxel, size = dimX * dimY * dimZ. */
+  data: Float32Array;
+  /** Grid dimensions. */
+  dimX: number;
+  dimY: number;
+  dimZ: number;
+  /** World-space origin of the (0,0,0) voxel corner. */
+  origin: Vec3;
+  /** Size of each voxel in world units. */
+  voxelSize: number;
+  attributes = new Map<string, Attribute>();
+
+  constructor(dimX: number, dimY: number, dimZ: number, voxelSize: number, origin: Vec3 = [0, 0, 0]) {
+    this.dimX = dimX;
+    this.dimY = dimY;
+    this.dimZ = dimZ;
+    this.voxelSize = voxelSize;
+    this.origin = origin;
+    this.data = new Float32Array(dimX * dimY * dimZ);
+  }
+
+  get numVoxels(): number { return this.dimX * this.dimY * this.dimZ; }
+
+  /** World position of voxel (ix, iy, iz). */
+  voxelPos(ix: number, iy: number, iz: number): Vec3 {
+    return [
+      this.origin[0] + (ix + 0.5) * this.voxelSize,
+      this.origin[1] + (iy + 0.5) * this.voxelSize,
+      this.origin[2] + (iz + 0.5) * this.voxelSize,
+    ];
+  }
+
+  /** Linear index for voxel coordinates. */
+  index(ix: number, iy: number, iz: number): number {
+    return ix + iy * this.dimX + iz * this.dimX * this.dimY;
+  }
+
+  /** Get density at voxel coordinates (clamped). */
+  get(ix: number, iy: number, iz: number): number {
+    if (ix < 0 || ix >= this.dimX || iy < 0 || iy >= this.dimY || iz < 0 || iz >= this.dimZ) return 0;
+    return this.data[this.index(ix, iy, iz)] ?? 0;
+  }
+
+  /** Set density at voxel coordinates. */
+  set(ix: number, iy: number, iz: number, value: number): void {
+    if (ix < 0 || ix >= this.dimX || iy < 0 || iy >= this.dimY || iz < 0 || iz >= this.dimZ) return;
+    this.data[this.index(ix, iy, iz)] = value;
+  }
+
+  /** Trilinear sample at world position. */
+  sampleWorld(wx: number, wy: number, wz: number): number {
+    const lx = (wx - this.origin[0]) / this.voxelSize - 0.5;
+    const ly = (wy - this.origin[1]) / this.voxelSize - 0.5;
+    const lz = (wz - this.origin[2]) / this.voxelSize - 0.5;
+    const ix = Math.floor(lx), iy = Math.floor(ly), iz = Math.floor(lz);
+    const fx = lx - ix, fy = ly - iy, fz = lz - iz;
+    const c000 = this.get(ix, iy, iz), c100 = this.get(ix + 1, iy, iz);
+    const c010 = this.get(ix, iy + 1, iz), c110 = this.get(ix + 1, iy + 1, iz);
+    const c001 = this.get(ix, iy, iz + 1), c101 = this.get(ix + 1, iy, iz + 1);
+    const c011 = this.get(ix, iy + 1, iz + 1), c111 = this.get(ix + 1, iy + 1, iz + 1);
+    const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+    return lerp(
+      lerp(lerp(c000, c100, fx), lerp(c010, c110, fx), fy),
+      lerp(lerp(c001, c101, fx), lerp(c011, c111, fx), fy),
+      fz,
+    );
+  }
+
+  clone(): VolumeComponent {
+    const v = new VolumeComponent(this.dimX, this.dimY, this.dimZ, this.voxelSize, [...this.origin] as Vec3);
+    v.data = new Float32Array(this.data);
+    return v;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Top-level Geometry                                                */
 /* ------------------------------------------------------------------ */
 
@@ -471,6 +558,7 @@ export class Geometry {
   curves?: CurvesComponent;
   points?: PointCloudComponent;
   instances?: InstancesComponent;
+  volume?: VolumeComponent;
 
   static empty(): Geometry { return new Geometry(); }
 
@@ -481,6 +569,7 @@ export class Geometry {
     g.curves = this.curves;
     g.points = this.points;
     g.instances = this.instances;
+    g.volume = this.volume;
     return g;
   }
 
@@ -498,6 +587,7 @@ export class Geometry {
       }));
       g.instances = ic;
     }
+    if (this.volume) g.volume = this.volume.clone();
     return g;
   }
 

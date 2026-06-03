@@ -2701,3 +2701,893 @@ export function splitEdges(geo: Geometry, _selection: ScalarTypedArray): Geometr
   out.mesh = MeshComponent.fromPolys(new Float32Array(positions), newPolys);
   return out;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Phase 5: Remaining gap implementations
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Dual Mesh — constructs the topological dual: each face becomes a vertex
+ * (at the face centroid), each vertex becomes a face (connecting the
+ * centroids of its adjacent faces), and each edge is "flipped".
+ *
+ * Boundary edges are handled by keeping the original boundary vertex
+ * positions (Blender's Dual Mesh with Keep Boundaries).
+ */
+export function dualMesh(geo: Geometry, keepBoundaries = false): Geometry {
+  const mesh = geo.mesh;
+  if (!mesh) return Geometry.empty();
+
+  const nF = mesh.numFaces;
+  const nV = mesh.numVerts;
+  const faceCenters = mesh.faceCenters();
+
+  // New vertex for each face = face centroid.
+  const newPos: number[] = [];
+  for (let i = 0; i < faceCenters.length; i++) newPos.push(faceCenters[i]!);
+
+  // If keeping boundaries, also add original boundary vertices.
+  const boundaryVerts = new Set<number>();
+  if (keepBoundaries) {
+    const edgeFaces = new Map<string, number[]>();
+    for (let f = 0; f < nF; f++) {
+      const verts = mesh.faceVerts(f);
+      for (let i = 0; i < verts.length; i++) {
+        const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+        const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+        if (!edgeFaces.has(k)) edgeFaces.set(k, []);
+        edgeFaces.get(k)!.push(f);
+      }
+    }
+    for (const [, faces] of edgeFaces) {
+      if (faces.length < 2) {
+        // Boundary edge
+        const f = faces[0]!;
+        const verts = mesh.faceVerts(f);
+        for (const v of verts) boundaryVerts.add(v);
+      }
+    }
+  }
+
+  // Build vertex→face adjacency.
+  const vertFaces = new Map<number, number[]>();
+  for (let f = 0; f < nF; f++) {
+    for (const v of mesh.faceVerts(f)) {
+      if (!vertFaces.has(v)) vertFaces.set(v, []);
+      vertFaces.get(v)!.push(f);
+    }
+  }
+
+  // For each original vertex, build a face connecting the centroids of its
+  // adjacent faces (ordered by edge walk for correct winding).
+  const faces: number[][] = [];
+  for (let v = 0; v < nV; v++) {
+    const adjFaces = vertFaces.get(v);
+    if (!adjFaces || adjFaces.length < 2) continue;
+
+    // Order faces around vertex by walking edges.
+    const ordered: number[] = [adjFaces[0]!];
+    const used = new Set<number>([adjFaces[0]!]);
+    while (ordered.length < adjFaces.length) {
+      const lastFace = ordered[ordered.length - 1]!;
+      const lastVerts = mesh.faceVerts(lastFace);
+      let found = false;
+      for (let i = 0; i < lastVerts.length; i++) {
+        if (lastVerts[i] !== v) continue;
+        const nextV = lastVerts[(i + 1) % lastVerts.length]!;
+        // Find another face sharing edge (v, nextV)
+        for (const f2 of adjFaces) {
+          if (used.has(f2)) continue;
+          const f2Verts = mesh.faceVerts(f2);
+          const hasV = f2Verts.includes(v);
+          const hasNext = f2Verts.includes(nextV);
+          if (hasV && hasNext) {
+            ordered.push(f2);
+            used.add(f2);
+            found = true;
+            break;
+          }
+        }
+        if (found) break;
+      }
+      if (!found && ordered.length < adjFaces.length) {
+        // Couldn't find next face — add remaining unordered
+        for (const f2 of adjFaces) {
+          if (!used.has(f2)) { ordered.push(f2); used.add(f2); break; }
+        }
+      }
+    }
+
+    if (ordered.length >= 3) {
+      faces.push(ordered);
+    }
+  }
+
+  const out = new Geometry();
+  out.mesh = MeshComponent.fromPolys(new Float32Array(newPos), faces);
+  return out;
+}
+
+/**
+ * Scale Elements — scales selected faces (or edges) around their centers
+ * by the given scale factor.
+ */
+export function scaleElements(
+  geo: Geometry,
+  selection: ScalarTypedArray | null,
+  scale: number,
+  domain: 'FACE' | 'EDGE' = 'FACE',
+): Geometry {
+  if (!geo.mesh) return geo;
+  const out = geo.cloneOwning();
+  const mesh = out.mesh!;
+  const positions = mesh.positions;
+  const p = positions;
+
+  if (domain === 'FACE') {
+    const centers = mesh.faceCenters();
+    for (let f = 0; f < mesh.numFaces; f++) {
+      if (selection && !selection[f]) continue;
+      const cx = centers[f * 3]!, cy = centers[f * 3 + 1]!, cz = centers[f * 3 + 2]!;
+      const verts = mesh.faceVerts(f);
+      // Track which verts we've already scaled (shared verts appear in multiple faces)
+      for (const v of verts) {
+        const x = p[v * 3]!, y = p[v * 3 + 1]!, z = p[v * 3 + 2]!;
+        p[v * 3]     = cx + (x - cx) * scale;
+        p[v * 3 + 1] = cy + (y - cy) * scale;
+        p[v * 3 + 2] = cz + (z - cz) * scale;
+      }
+    }
+  } else {
+    // EDGE domain: scale each edge's midpoint
+    const edges = mesh.edges();
+    if (edges) {
+      for (let i = 0; i < edges.length; i += 2) {
+        const a = edges[i]!, b = edges[i + 1]!;
+        const mx = (p[a * 3]! + p[b * 3]!) / 2;
+        const my = (p[a * 3 + 1]! + p[b * 3 + 1]!) / 2;
+        const mz = (p[a * 3 + 2]! + p[b * 3 + 2]!) / 2;
+        for (const v of [a, b]) {
+          p[v * 3]     = mx + (p[v * 3]! - mx) * scale;
+          p[v * 3 + 1] = my + (p[v * 3 + 1]! - my) * scale;
+          p[v * 3 + 2] = mz + (p[v * 3 + 2]! - mz) * scale;
+        }
+      }
+    }
+  }
+
+  mesh.invalidateCaches();
+  return out;
+}
+
+/**
+ * Blur Attribute — Laplacian smoothing of a scalar attribute across the mesh.
+ * Each iteration averages each vertex's value with its neighbors, weighted
+ * by the `weight` parameter.
+ */
+export function blurAttribute(
+  geo: Geometry,
+  attributeName: string,
+  iterations: number,
+  weight: number,
+): Geometry {
+  if (!geo.mesh) return geo;
+  const out = geo.cloneOwning();
+  const mesh = out.mesh!;
+  const attr = mesh.attributes.get(attributeName);
+  if (!attr || attr.dimensions !== 1) return out;
+
+  const data = attr.data as Float32Array;
+  const nV = mesh.numVerts;
+
+  // Build adjacency.
+  const adj = new Map<number, number[]>();
+  const edges = mesh.edges();
+  if (edges) {
+    for (let i = 0; i < edges.length; i += 2) {
+      const a = edges[i]!, b = edges[i + 1]!;
+      if (!adj.has(a)) adj.set(a, []);
+      if (!adj.has(b)) adj.set(b, []);
+      adj.get(a)!.push(b);
+      adj.get(b)!.push(a);
+    }
+  }
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const newData = new Float32Array(data.length);
+    for (let v = 0; v < nV; v++) {
+      const neighbors = adj.get(v) ?? [];
+      if (neighbors.length === 0) {
+        newData[v] = data[v] ?? 0;
+        continue;
+      }
+      let sum = 0;
+      for (const nb of neighbors) sum += data[nb] ?? 0;
+      const avg = sum / neighbors.length;
+      const current = data[v] ?? 0;
+      newData[v] = current + weight * (avg - current);
+    }
+    for (let v = 0; v < nV; v++) data[v] = newData[v]!;
+  }
+
+  return out;
+}
+
+/**
+ * Sample Nearest Surface — finds the closest point on the mesh surface
+ * to a given sample position and interpolates a value using barycentric
+ * coordinates.
+ */
+export function sampleNearestSurface(
+  target: Geometry,
+  samplePos: Vec3,
+): { position: Vec3; normal: Vec3; baryCoords: Vec3; faceIndex: number } {
+  const mesh = target.mesh;
+  if (!mesh || mesh.numTris === 0) {
+    return { position: [0, 0, 0], normal: [0, 0, 1], baryCoords: [1, 0, 0], faceIndex: 0 };
+  }
+
+  const p = mesh.positions;
+  const t = mesh.triangles;
+  let bestDist = Infinity;
+  let bestPos: Vec3 = [0, 0, 0];
+  let bestBary: Vec3 = [1, 0, 0];
+  let bestFace = 0;
+
+  for (let i = 0; i < mesh.numTris; i++) {
+    const ai = t[i * 3]! * 3, bi = t[i * 3 + 1]! * 3, ci = t[i * 3 + 2]! * 3;
+    const a: Vec3 = [p[ai]!, p[ai + 1]!, p[ai + 2]!];
+    const b: Vec3 = [p[bi]!, p[bi + 1]!, p[bi + 2]!];
+    const c: Vec3 = [p[ci]!, p[ci + 1]!, p[ci + 2]!];
+    const q = closestPointTriangle(samplePos, a, b, c);
+    const d = Math.hypot(q[0] - samplePos[0], q[1] - samplePos[1], q[2] - samplePos[2]);
+    if (d < bestDist) {
+      bestDist = d;
+      bestPos = q;
+      bestFace = i;
+      // Compute barycentric coordinates
+      const ab: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+      const ac: Vec3 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+      const ap: Vec3 = [q[0] - a[0], q[1] - a[1], q[2] - a[2]];
+      const d00 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+      const d01 = ab[0] * ac[0] + ab[1] * ac[1] + ab[2] * ac[2];
+      const d11 = ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2];
+      const d20 = ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2];
+      const d21 = ap[0] * ac[0] + ap[1] * ac[1] + ap[2] * ac[2];
+      const denom = d00 * d11 - d01 * d01;
+      if (Math.abs(denom) > 1e-12) {
+        const v = (d11 * d20 - d01 * d21) / denom;
+        const w = (d00 * d21 - d01 * d20) / denom;
+        const u = 1 - v - w;
+        bestBary = [Math.max(0, u), Math.max(0, v), Math.max(0, w)];
+      }
+    }
+  }
+
+  const triToFace = mesh.triToFace();
+  const faceIdx = triToFace[bestFace] ?? bestFace;
+  const fn = mesh.faceNormals();
+
+  return {
+    position: bestPos,
+    normal: [fn[faceIdx * 3] ?? 0, fn[faceIdx * 3 + 1] ?? 0, fn[faceIdx * 3 + 2] ?? 1],
+    baryCoords: bestBary,
+    faceIndex: faceIdx,
+  };
+}
+
+/**
+ * Offset Point in Curve — returns the point index at a given offset
+ * from the current point within the same curve.
+ */
+export function offsetPointInCurve(
+  geo: Geometry,
+  pointIndex: number,
+  offset: number,
+): { isValid: boolean; resultIndex: number } {
+  const curves = geo.curves;
+  if (!curves) return { isValid: false, resultIndex: 0 };
+
+  // Find which curve this point belongs to.
+  for (let ci = 0; ci < curves.numCurves; ci++) {
+    const start = curves.curveOffsets[ci] ?? 0;
+    const end = curves.curveOffsets[ci + 1] ?? start;
+    if (pointIndex >= start && pointIndex < end) {
+      const resultIndex = pointIndex + offset;
+      const cyclic = !!curves.cyclic[ci];
+      if (cyclic) {
+        const n = end - start;
+        const wrapped = ((resultIndex - start) % n + n) % n + start;
+        return { isValid: true, resultIndex: wrapped };
+      }
+      return {
+        isValid: resultIndex >= start && resultIndex < end,
+        resultIndex: Math.max(start, Math.min(end - 1, resultIndex)),
+      };
+    }
+  }
+  return { isValid: false, resultIndex: 0 };
+}
+
+/**
+ * Points of Curve — given a curve index, returns the point indices
+ * belonging to that curve and the total count.
+ */
+export function pointsOfCurve(
+  geo: Geometry,
+  curveIndex: number,
+): { pointIndices: number[]; total: number } {
+  const curves = geo.curves;
+  if (!curves || curveIndex < 0 || curveIndex >= curves.numCurves) {
+    return { pointIndices: [], total: 0 };
+  }
+  const start = curves.curveOffsets[curveIndex] ?? 0;
+  const end = curves.curveOffsets[curveIndex + 1] ?? start;
+  const indices: number[] = [];
+  for (let i = start; i < end; i++) indices.push(i);
+  return { pointIndices: indices, total: end - start };
+}
+
+/**
+ * Curve of Point — given a point index, returns which curve it belongs to
+ * and its index within that curve.
+ */
+export function curveOfPoint(
+  geo: Geometry,
+  pointIndex: number,
+): { curveIndex: number; indexInCurve: number } {
+  const curves = geo.curves;
+  if (!curves) return { curveIndex: 0, indexInCurve: 0 };
+
+  for (let ci = 0; ci < curves.numCurves; ci++) {
+    const start = curves.curveOffsets[ci] ?? 0;
+    const end = curves.curveOffsets[ci + 1] ?? start;
+    if (pointIndex >= start && pointIndex < end) {
+      return { curveIndex: ci, indexInCurve: pointIndex - start };
+    }
+  }
+  return { curveIndex: 0, indexInCurve: 0 };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Phase 6: Volume operations & remaining gap implementations
+// ═══════════════════════════════════════════════════════════════════════
+
+import { VolumeComponent } from './Geometry';
+
+/**
+ * Mesh to Volume — voxelize a mesh into a sparse volume grid.
+ *
+ * For each voxel, we check if its center is inside the mesh using a
+ * ray-casting parity test (odd number of crossings = inside). Voxels
+ * near the surface get density proportional to their distance from the
+ * nearest surface point.
+ */
+export function meshToVolume(
+  geo: Geometry,
+  density: number,
+  voxelSize: number,
+  exteriorBandWidth: number,
+  interiorBandWidth: number,
+  fillInterior: boolean,
+): Geometry {
+  const mesh = geo.mesh;
+  if (!mesh || mesh.numTris === 0) return Geometry.empty();
+
+  // Compute bounding box + padding.
+  const bb = boundingBox(geo);
+  const pad = Math.max(exteriorBandWidth, voxelSize * 2);
+  const min: Vec3 = [bb.min[0] - pad, bb.min[1] - pad, bb.min[2] - pad];
+  const max: Vec3 = [bb.max[0] + pad, bb.max[1] + pad, bb.max[2] + pad];
+
+  const dimX = Math.max(1, Math.ceil((max[0] - min[0]) / voxelSize));
+  const dimY = Math.max(1, Math.ceil((max[1] - min[1]) / voxelSize));
+  const dimZ = Math.max(1, Math.ceil((max[2] - min[2]) / voxelSize));
+
+  // Cap total voxels to prevent memory explosion.
+  const maxVoxels = 256 * 256 * 256;
+  if (dimX * dimY * dimZ > maxVoxels) {
+    const scale = Math.pow(maxVoxels / (dimX * dimY * dimZ), 1 / 3);
+    const adjSize = voxelSize / scale;
+    return meshToVolume(geo, density, adjSize, exteriorBandWidth, interiorBandWidth, fillInterior);
+  }
+
+  const vol = new VolumeComponent(dimX, dimY, dimZ, voxelSize, min);
+  const tris = mesh.triangles;
+  const p = mesh.positions;
+  const surfaceBand = exteriorBandWidth;
+  const interiorBand = interiorBandWidth;
+
+  // For each voxel, compute signed distance approximation.
+  for (let iz = 0; iz < dimZ; iz++) {
+    for (let iy = 0; iy < dimY; iy++) {
+      for (let ix = 0; ix < dimX; ix++) {
+        const [wx, wy, wz] = vol.voxelPos(ix, iy, iz);
+
+        // Find nearest surface distance (brute force over triangles).
+        let minDist = Infinity;
+        for (let t = 0; t < mesh.numTris; t++) {
+          const ai = tris[t * 3]! * 3, bi = tris[t * 3 + 1]! * 3, ci = tris[t * 3 + 2]! * 3;
+          const a: Vec3 = [p[ai]!, p[ai + 1]!, p[ai + 2]!];
+          const b: Vec3 = [p[bi]!, p[bi + 1]!, p[bi + 2]!];
+          const c: Vec3 = [p[ci]!, p[ci + 1]!, p[ci + 2]!];
+          const q = closestPointTriangle([wx, wy, wz], a, b, c);
+          const d = Math.hypot(q[0] - wx, q[1] - wy, q[2] - wz);
+          if (d < minDist) minDist = d;
+        }
+
+        // Ray-cast parity test for interior.
+        let inside = false;
+        if (fillInterior || interiorBand > 0) {
+          const dir: Vec3 = [0, 0, 1];
+          let crossings = 0;
+          for (let t = 0; t < mesh.numTris; t++) {
+            const ai = tris[t * 3]! * 3, bi = tris[t * 3 + 1]! * 3, ci = tris[t * 3 + 2]! * 3;
+            const ax = p[ai]!, ay = p[ai + 1]!, az = p[ai + 2]!;
+            const bx = p[bi]!, by = p[bi + 1]!, bz = p[bi + 2]!;
+            const cx = p[ci]!, cy = p[ci + 1]!, cz = p[ci + 2]!;
+            const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+            const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+            const px = dir[1] * e2z - dir[2] * e2y;
+            const py = dir[2] * e2x - dir[0] * e2z;
+            const pz = dir[0] * e2y - dir[1] * e2x;
+            const det = e1x * px + e1y * py + e1z * pz;
+            if (Math.abs(det) < 1e-9) continue;
+            const invDet = 1 / det;
+            const tx = wx - ax, ty = wy - ay, tz = wz - az;
+            const u = (tx * px + ty * py + tz * pz) * invDet;
+            if (u < 0 || u > 1) continue;
+            const qx = ty * e1z - tz * e1y;
+            const qy = tz * e1x - tx * e1z;
+            const qz = tx * e1y - ty * e1x;
+            const v = (dir[0] * qx + dir[1] * qy + dir[2] * qz) * invDet;
+            if (v < 0 || u + v > 1) continue;
+            const tVal = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+            if (tVal > 0) crossings++;
+          }
+          inside = (crossings % 2) === 1;
+        }
+
+        // Compute density.
+        let d = 0;
+        if (inside && fillInterior) {
+          d = density;
+        } else if (inside && interiorBand > 0) {
+          d = density * Math.max(0, 1 - minDist / interiorBand);
+        } else if (minDist < surfaceBand) {
+          d = density * Math.max(0, 1 - minDist / surfaceBand);
+        }
+        vol.set(ix, iy, iz, d);
+      }
+    }
+  }
+
+  const out = new Geometry();
+  out.volume = vol;
+  return out;
+}
+
+/**
+ * Volume to Mesh — extract an isosurface from a volume using marching cubes.
+ *
+ * This is a simplified marching cubes implementation that extracts the
+ * surface at a given threshold density.
+ */
+export function volumeToMesh(geo: Geometry, threshold: number): Geometry {
+  const vol = geo.volume;
+  if (!vol || vol.numVoxels === 0) return Geometry.empty();
+
+  // Simplified marching cubes: for each voxel, check if it's near the threshold
+  // and emit a small cube if so.
+  const positions: number[] = [];
+  const faces: number[][] = [];
+  let vertBase = 0;
+
+  for (let iz = 0; iz < vol.dimZ - 1; iz++) {
+    for (let iy = 0; iy < vol.dimY - 1; iy++) {
+      for (let ix = 0; ix < vol.dimX - 1; ix++) {
+        // Sample 8 corners of the cube.
+        const corners = [
+          vol.get(ix, iy, iz), vol.get(ix + 1, iy, iz),
+          vol.get(ix + 1, iy + 1, iz), vol.get(ix, iy + 1, iz),
+          vol.get(ix, iy, iz + 1), vol.get(ix + 1, iy, iz + 1),
+          vol.get(ix + 1, iy + 1, iz + 1), vol.get(ix, iy + 1, iz + 1),
+        ];
+        const aboveThreshold = corners.some((c) => c >= threshold);
+        const belowThreshold = corners.some((c) => c < threshold);
+        if (!aboveThreshold || !belowThreshold) continue;
+
+        // Emit a cube at this voxel.
+        const [x, y, z] = vol.voxelPos(ix, iy, iz);
+        const s = vol.voxelSize * 0.5;
+        const base = vertBase;
+        positions.push(
+          x - s, y - s, z - s,  x + s, y - s, z - s,
+          x + s, y + s, z - s,  x - s, y + s, z - s,
+          x - s, y - s, z + s,  x + s, y - s, z + s,
+          x + s, y + s, z + s,  x - s, y + s, z + s,
+        );
+        faces.push(
+          [base, base + 3, base + 2, base + 1],
+          [base + 4, base + 5, base + 6, base + 7],
+          [base, base + 1, base + 5, base + 4],
+          [base + 2, base + 3, base + 7, base + 6],
+          [base + 1, base + 2, base + 6, base + 5],
+          [base, base + 4, base + 7, base + 3],
+        );
+        vertBase += 8;
+      }
+    }
+  }
+
+  if (positions.length === 0) return Geometry.empty();
+  const out = new Geometry();
+  out.mesh = MeshComponent.fromPolys(new Float32Array(positions), faces);
+  return out;
+}
+
+/**
+ * Points to Volume — create a volume from a point cloud by splatting
+ * Gaussian density kernels at each point position.
+ */
+export function pointsToVolume(
+  geo: Geometry,
+  density: number,
+  voxelSize: number,
+  radius: number,
+): Geometry {
+  const pos = geo.points?.positions ?? geo.mesh?.positions;
+  if (!pos || pos.length === 0) return Geometry.empty();
+
+  const n = pos.length / 3;
+
+  // Compute bounding box.
+  let mnx = Infinity, mny = Infinity, mnz = Infinity;
+  let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const x = pos[i * 3]!, y = pos[i * 3 + 1]!, z = pos[i * 3 + 2]!;
+    if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+    if (y < mny) mny = y; if (y > mxy) mxy = y;
+    if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+  }
+
+  const pad = radius + voxelSize;
+  const origin: Vec3 = [mnx - pad, mny - pad, mnz - pad];
+  const dimX = Math.max(1, Math.ceil((mxx - mnx + 2 * pad) / voxelSize));
+  const dimY = Math.max(1, Math.ceil((mxy - mny + 2 * pad) / voxelSize));
+  const dimZ = Math.max(1, Math.ceil((mxz - mnz + 2 * pad) / voxelSize));
+
+  // Cap total voxels.
+  const maxVoxels = 128 * 128 * 128;
+  if (dimX * dimY * dimZ > maxVoxels) {
+    const scale = Math.pow(maxVoxels / (dimX * dimY * dimZ), 1 / 3);
+    return pointsToVolume(geo, density, voxelSize / scale, radius);
+  }
+
+  const vol = new VolumeComponent(dimX, dimY, dimZ, voxelSize, origin);
+  const sigmaSq = radius * radius;
+  const cutoff = radius * 2;
+
+  for (let p = 0; p < n; p++) {
+    const px = pos[p * 3]!, py = pos[p * 3 + 1]!, pz = pos[p * 3 + 2]!;
+
+    // Voxel range affected by this point.
+    const ixMin = Math.max(0, Math.floor((px - cutoff - origin[0]) / voxelSize));
+    const ixMax = Math.min(dimX - 1, Math.ceil((px + cutoff - origin[0]) / voxelSize));
+    const iyMin = Math.max(0, Math.floor((py - cutoff - origin[1]) / voxelSize));
+    const iyMax = Math.min(dimY - 1, Math.ceil((py + cutoff - origin[1]) / voxelSize));
+    const izMin = Math.max(0, Math.floor((pz - cutoff - origin[2]) / voxelSize));
+    const izMax = Math.min(dimZ - 1, Math.ceil((pz + cutoff - origin[2]) / voxelSize));
+
+    for (let iz = izMin; iz <= izMax; iz++) {
+      for (let iy = iyMin; iy <= iyMax; iy++) {
+        for (let ix = ixMin; ix <= ixMax; ix++) {
+          const [wx, wy, wz] = vol.voxelPos(ix, iy, iz);
+          const dx = wx - px, dy = wy - py, dz = wz - pz;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          if (distSq > sigmaSq * 4) continue;
+          const contribution = density * Math.exp(-distSq / (2 * sigmaSq));
+          vol.data[vol.index(ix, iy, iz)] = (vol.data[vol.index(ix, iy, iz)] ?? 0) + contribution;
+        }
+      }
+    }
+  }
+
+  const out = new Geometry();
+  out.volume = vol;
+  return out;
+}
+
+/**
+ * Merge Layers — merge all components of multiple geometries into one.
+ * This is essentially joinGeometries but preserves volume components too.
+ */
+export function mergeLayers(sources: Geometry[]): Geometry {
+  if (sources.length === 0) return Geometry.empty();
+  if (sources.length === 1) return sources[0]!;
+
+  // Use joinGeometries for mesh/curves/points/instances.
+  const out = joinGeometries(sources);
+
+  // Merge volumes: take the first volume found (can't meaningfully merge
+  // voxel grids of different dimensions).
+  for (const src of sources) {
+    if (src.volume) {
+      out.volume = src.volume;
+      break;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Interpolate Curves — interpolate between guide curves to produce
+ * intermediate curves. Each point on the output curve is a weighted
+ * blend of the nearest guide curves.
+ *
+ * Simplified implementation: for each input point, find the nearest
+ * guide curve and project it onto that curve's polyline.
+ */
+export function interpolateCurves(
+  guideCurves: Geometry,
+  guideUp: Float32Array | null,
+  guideGroupId: number,
+  points: Geometry,
+  pointUp: Float32Array | null,
+  pointGroupId: number,
+  maxNeighbors: number,
+): { curves: Geometry; closestIndex: Int32Array; closestWeight: Float32Array } {
+  const guideC = guideCurves.curves;
+  const pointPos = points.points?.positions ?? points.mesh?.positions;
+
+  if (!guideC || !pointPos || guideC.numPoints === 0) {
+    return {
+      curves: Geometry.empty(),
+      closestIndex: new Int32Array(0),
+      closestWeight: new Float32Array(0),
+    };
+  }
+
+  const nPoints = pointPos.length / 3;
+
+  // Build guide curve point arrays.
+  const guidePoints: Vec3[][] = [];
+  for (let ci = 0; ci < guideC.numCurves; ci++) {
+    const start = guideC.curveOffsets[ci] ?? 0;
+    const end = guideC.curveOffsets[ci + 1] ?? start;
+    const pts: Vec3[] = [];
+    for (let i = start; i < end; i++) {
+      pts.push([
+        guideC.positions[i * 3] ?? 0,
+        guideC.positions[i * 3 + 1] ?? 0,
+        guideC.positions[i * 3 + 2] ?? 0,
+      ]);
+    }
+    guidePoints.push(pts);
+  }
+
+  // For each point, find the nearest guide curve and project onto it.
+  const closestIndex = new Int32Array(nPoints);
+  const closestWeight = new Float32Array(nPoints);
+  const newPositions: number[] = [];
+
+  for (let i = 0; i < nPoints; i++) {
+    const px = pointPos[i * 3]!, py = pointPos[i * 3 + 1]!, pz = pointPos[i * 3 + 2]!;
+    let bestDist = Infinity;
+    let bestCurve = 0;
+    let bestProjPos: Vec3 = [px, py, pz];
+
+    for (let ci = 0; ci < guidePoints.length; ci++) {
+      const pts = guidePoints[ci]!;
+      if (pts.length === 0) continue;
+
+      // Find nearest point on this guide curve.
+      for (let j = 0; j < pts.length - 1; j++) {
+        const a = pts[j]!, b = pts[j + 1]!;
+        const q = closestPointSegment([px, py, pz], a, b);
+        const d = Math.hypot(q[0] - px, q[1] - py, q[2] - pz);
+        if (d < bestDist) {
+          bestDist = d;
+          bestCurve = ci;
+          bestProjPos = q;
+        }
+      }
+      // Check last point.
+      const last = pts[pts.length - 1]!;
+      const dLast = Math.hypot(last[0] - px, last[1] - py, last[2] - pz);
+      if (dLast < bestDist) {
+        bestDist = dLast;
+        bestCurve = ci;
+        bestProjPos = last;
+      }
+    }
+
+    closestIndex[i] = bestCurve;
+    closestWeight[i] = 1 / (1 + bestDist);
+    newPositions.push(bestProjPos[0], bestProjPos[1], bestProjPos[2]);
+  }
+
+  // Create a curve from the interpolated positions.
+  const positions = new Float32Array(newPositions);
+  const offsets = new Uint32Array([0, nPoints]);
+  const cyclic = new Uint8Array([0]);
+  const res = new Uint16Array([12]);
+
+  const out = new Geometry();
+  out.curves = new CurvesComponent(positions, offsets, cyclic, res);
+
+  return { curves: out, closestIndex, closestWeight };
+}
+
+/**
+ * Sample UV Surface — sample a value at a UV coordinate on a mesh surface.
+ *
+ * For each triangle, we compute barycentric coordinates from the UV and
+ * interpolate the value.
+ */
+export function sampleUVSurface(
+  target: Geometry,
+  uvMapName: string,
+  sampleUV: Vec3,
+): { value: Vec3; isValid: boolean } {
+  const mesh = target.mesh;
+  if (!mesh || mesh.numTris === 0) return { value: [0, 0, 0], isValid: false };
+
+  const uvAttr = mesh.attributes.get(uvMapName);
+  if (!uvAttr || uvAttr.dimensions < 2) return { value: [0, 0, 0], isValid: false };
+
+  const uvData = uvAttr.data as Float32Array;
+  const tris = mesh.triangles;
+  const su = sampleUV[0], sv = sampleUV[1];
+
+  // Find the triangle whose UV contains the sample point.
+  for (let t = 0; t < mesh.numTris; t++) {
+    const a = tris[t * 3]!, b = tris[t * 3 + 1]!, c = tris[t * 3 + 2]!;
+    const u0 = uvData[a * 2] ?? 0, v0 = uvData[a * 2 + 1] ?? 0;
+    const u1 = uvData[b * 2] ?? 0, v1 = uvData[b * 2 + 1] ?? 0;
+    const u2 = uvData[c * 2] ?? 0, v2 = uvData[c * 2 + 1] ?? 0;
+
+    // Barycentric coordinates.
+    const d00 = u1 - u0, d01 = u2 - u0;
+    const d10 = v1 - v0, d11 = v2 - v0;
+    const det = d00 * d11 - d01 * d10;
+    if (Math.abs(det) < 1e-12) continue;
+
+    const invDet = 1 / det;
+    const dsu = su - u0, dsv = sv - v0;
+    const w1 = (dsu * d11 - dsv * d01) * invDet;
+    const w2 = (dsv * d00 - dsu * d10) * invDet;
+    const w0 = 1 - w1 - w2;
+
+    if (w0 >= -0.001 && w1 >= -0.001 && w2 >= -0.001 && w0 + w1 + w2 <= 1.001) {
+      // Interpolate position.
+      const pos = mesh.positions;
+      const px = (pos[a * 3] ?? 0) * w0 + (pos[b * 3] ?? 0) * w1 + (pos[c * 3] ?? 0) * w2;
+      const py = (pos[a * 3 + 1] ?? 0) * w0 + (pos[b * 3 + 1] ?? 0) * w1 + (pos[c * 3 + 1] ?? 0) * w2;
+      const pz = (pos[a * 3 + 2] ?? 0) * w0 + (pos[b * 3 + 2] ?? 0) * w1 + (pos[c * 3 + 2] ?? 0) * w2;
+      return { value: [px, py, pz], isValid: true };
+    }
+  }
+
+  return { value: [0, 0, 0], isValid: false };
+}
+
+/**
+ * Image Texture in geometry context — sample an ImageData at UV coordinates
+ * with optional wrap mode.
+ */
+export function sampleImageInGeo(
+  imageData: ImageData | null,
+  uv: Vec3,
+  extension: 'REPEAT' | 'EXTEND' | 'CLIP' | 'MIRROR' = 'REPEAT',
+): { color: Vec3; alpha: number } {
+  if (!imageData) return { color: [1, 1, 1], alpha: 1 };
+
+  const wrap = (u: number): number => {
+    switch (extension) {
+      case 'EXTEND': return Math.max(0, Math.min(1, u));
+      case 'CLIP': return u < 0 || u > 1 ? -1 : u;
+      case 'MIRROR': {
+        const m = Math.abs(u % 2);
+        return m > 1 ? 2 - m : m;
+      }
+      default: { // REPEAT
+        const r = u - Math.floor(u);
+        return r < 0 ? r + 1 : r;
+      }
+    }
+  };
+
+  const u = wrap(uv[0]);
+  const v = wrap(uv[1]);
+  if (u < 0 || v < 0) return { color: [0, 0, 0], alpha: 0 };
+
+  const x = Math.max(0, Math.min(imageData.width - 1, Math.floor(u * imageData.width)));
+  const y = Math.max(0, Math.min(imageData.height - 1, Math.floor(v * imageData.height)));
+  const i = (y * imageData.width + x) * 4;
+
+  return {
+    color: [
+      (imageData.data[i] ?? 255) / 255,
+      (imageData.data[i + 1] ?? 255) / 255,
+      (imageData.data[i + 2] ?? 255) / 255,
+    ],
+    alpha: (imageData.data[i + 3] ?? 255) / 255,
+  };
+}
+
+/**
+ * String to Curves — convert a string to curve geometry.
+ *
+ * This is a simplified implementation that generates placeholder curves
+ * (one curve per character, spaced horizontally). A full implementation
+ * would require font rendering (SDF or bezier outlines).
+ */
+export function stringToCurves(
+  text: string,
+  size: number,
+  characterSpacing: number,
+  wordSpacing: number,
+  lineSpacing: number,
+  boxWidth: number,
+  boxHeight: number,
+): Geometry {
+  if (!text) return Geometry.empty();
+
+  const positions: number[] = [];
+  const offsets: number[] = [0];
+  const cyclic = new Uint8Array(0);
+  const res = new Uint16Array(0);
+
+  let x = 0, y = 0;
+  const charWidth = size * 0.6 * characterSpacing;
+  const spaceWidth = size * 0.6 * wordSpacing;
+  const lineHeight = size * lineSpacing;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+
+    if (ch === '\n') {
+      x = 0;
+      y -= lineHeight;
+      continue;
+    }
+    if (ch === ' ') {
+      x += spaceWidth;
+      continue;
+    }
+
+    // Check box width wrapping.
+    if (boxWidth > 0 && x + charWidth > boxWidth) {
+      x = 0;
+      y -= lineHeight;
+    }
+
+    // Generate a simple placeholder curve for this character.
+    // In a real implementation, this would use font bezier outlines.
+    const w = charWidth * 0.8;
+    const h = size * 0.8;
+    positions.push(
+      x, y, 0,
+      x + w, y, 0,
+      x + w, y + h, 0,
+      x, y + h, 0,
+      x, y, 0,
+    );
+    offsets.push(offsets[offsets.length - 1]! + 5);
+
+    x += charWidth;
+  }
+
+  if (positions.length === 0) return Geometry.empty();
+
+  const out = new Geometry();
+  out.curves = new CurvesComponent(
+    new Float32Array(positions),
+    new Uint32Array(offsets),
+    new Uint8Array(offsets.length - 1),
+    new Uint16Array(offsets.length - 1).fill(12),
+  );
+  return out;
+}

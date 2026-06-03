@@ -5,11 +5,9 @@
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
-
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-
   "exports": {
     ".": {
       "import": {
@@ -32,26 +30,23 @@
       }
     }
   },
-
   "files": [
     "dist",
     "src",
     "README.md",
     "LICENSE"
   ],
-
   "scripts": {
-    "dev":          "vite",
-    "build:lib":    "tsup",
-    "build:demo":   "tsc -p . --noEmit && vite build",
-    "build":        "npm run build:lib && npm run build:demo",
-    "preview":      "vite preview",
-    "typecheck":    "tsc -p . --noEmit",
+    "dev": "vite",
+    "build:lib": "tsup",
+    "build:demo": "tsc -p . --noEmit && vite build",
+    "build": "npm run build:lib && npm run build:demo",
+    "preview": "vite preview",
+    "typecheck": "tsc -p . --noEmit",
     "typecheck:lib": "tsc -p tsconfig.lib.json --noEmit",
-    "test":         "tsx scripts/smoketest.ts",
-    "ci":           "npm run typecheck && npm test && npm run build"
+    "test": "tsx scripts/smoketest.ts",
+    "ci": "npm run typecheck && npm test && npm run build"
   },
-
   "peerDependencies": {
     "@react-three/drei": ">=9",
     "@react-three/fiber": ">=8",
@@ -61,20 +56,27 @@
     "three": ">=0.169",
     "zustand": ">=5"
   },
-
   "peerDependenciesMeta": {
-    "@react-three/drei": { "optional": true },
-    "@react-three/fiber": { "optional": true },
-    "@xyflow/react": { "optional": true },
-    "react": { "optional": true },
-    "react-dom": { "optional": true }
+    "@react-three/drei": {
+      "optional": true
+    },
+    "@react-three/fiber": {
+      "optional": true
+    },
+    "@xyflow/react": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
-
   "dependencies": {
     "nanoid": "^5.0.7",
     "zod": "^3.23.8"
   },
-
   "devDependencies": {
     "@react-three/drei": "^9.114.0",
     "@react-three/fiber": "^8.17.10",
@@ -88,7 +90,7 @@
     "three": "^0.169.0",
     "tsup": "^8.4.0",
     "tsx": "^4.22.4",
-    "typescript": "^5.6.3",
+    "typescript": "^5.9.3",
     "vite": "^5.4.10",
     "zustand": "^5.0.0"
   }

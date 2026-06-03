@@ -968,6 +968,219 @@ export class ShaderEvaluator implements SystemEvaluator {
       cache.set(node.outputs[0]!.id, v);
       return;
     }
+    // ----------------------------------------------------------------
+    //  Additional shader nodes (Phase 4: filling remaining gaps)
+    // ----------------------------------------------------------------
+    if (node.bl_idname === 'ShaderNodeBlackbody') {
+      const temp = (this.socketValue(node.inputs[0]!, cache) as number) ?? 1500;
+      // CIE 1931 blackbody approximation (Tanner Helland's algorithm)
+      const t = temp / 100;
+      let r: number, g: number, b: number;
+      if (t <= 66) { r = 255; g = 99.4708025861 * Math.log(t) - 161.1195681661; }
+      else { r = 329.698727446 * Math.pow(t - 60, -0.1332047592); g = 288.1221695283 * Math.pow(t - 60, -0.0755148492); }
+      if (t >= 66) b = 255; else if (t <= 19) b = 0; else b = 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+      const srgb = (v: number) => { v = Math.max(0, Math.min(255, v)) / 255; return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055; };
+      cache.set(node.outputs[0]!.id, [srgb(r), srgb(g), srgb(b), 1] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeWavelength') {
+      const wl = (this.socketValue(node.inputs[0]!, cache) as number) ?? 500;
+      // Visible spectrum to sRGB approximation
+      let r = 0, g = 0, b = 0;
+      if (wl >= 380 && wl < 440) { r = -(wl - 440) / (440 - 380); b = 1; }
+      else if (wl >= 440 && wl < 490) { g = (wl - 440) / (490 - 440); b = 1; }
+      else if (wl >= 490 && wl < 510) { g = 1; b = -(wl - 510) / (510 - 490); }
+      else if (wl >= 510 && wl < 580) { r = (wl - 510) / (580 - 510); g = 1; }
+      else if (wl >= 580 && wl < 645) { r = 1; g = -(wl - 645) / (645 - 580); }
+      else if (wl >= 645 && wl <= 780) { r = 1; }
+      // Intensity falloff at edges
+      let factor = 1;
+      if (wl >= 380 && wl < 420) factor = 0.3 + 0.7 * (wl - 380) / (420 - 380);
+      else if (wl > 700 && wl <= 780) factor = 0.3 + 0.7 * (780 - wl) / (780 - 700);
+      const gamma = 0.8;
+      cache.set(node.outputs[0]!.id, [
+        Math.pow(r * factor, gamma), Math.pow(g * factor, gamma), Math.pow(b * factor, gamma), 1
+      ] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeRGBToBW') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
+      // ITU-R BT.709 luminance coefficients
+      cache.set(node.outputs[0]!.id, c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeShaderToRGB') {
+      // Pass through the shader descriptor's color as the color output
+      const shader = this.socketValue(node.inputs[0]!, cache) as MaterialDescriptor | undefined;
+      cache.set(node.outputs[0]!.id, shader?.color ?? [0, 0, 0, 1] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeNormal') {
+      const normal = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 1];
+      cache.set(node.outputs[0]!.id, normal);
+      cache.set(node.outputs[1]!.id, normal);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeTangent') {
+      cache.set(node.outputs[0]!.id, [1, 0, 0] as Vec3);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeWireframe') {
+      // CPU stub: return 0 (no wireframe in flat descriptor mode)
+      cache.set(node.outputs[0]!.id, 0);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeAmbientOcclusion') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [1, 1, 1, 1];
+      // CPU stub: approximate AO as 1.0 (no occlusion)
+      cache.set(node.outputs[0]!.id, c);
+      cache.set(node.outputs[1]!.id, 1);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeBevel') {
+      const v = this.socketValue(node.inputs[1]!, cache) as Vec3 ?? [0, 0, 1];
+      cache.set(node.outputs[0]!.id, v);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeVectorTransform') {
+      const v = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 0];
+      // CPU stub: pass-through (no actual transform conversion)
+      cache.set(node.outputs[0]!.id, v);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeVolumePrincipled') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
+      const density = (this.socketValue(node.inputs[1]!, cache) as number) ?? 1;
+      cache.set(node.outputs[0]!.id, {
+        ...DEFAULT,
+        color: [0, 0, 0, 1],
+        emissive: [c[0] * density * 0.1, c[1] * density * 0.1, c[2] * density * 0.1],
+        emissive_strength: density * 0.1,
+        opacity: Math.max(0, Math.min(1, 1 - density * 0.1)),
+      } as MaterialDescriptor);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeVertexColor') {
+      // CPU stub: return default white
+      cache.set(node.outputs[0]!.id, [1, 1, 1, 1] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeHairInfo') {
+      // CPU stub: return sensible defaults for hair info
+      cache.set(node.outputs[0]!.id, 0);       // Is Strand
+      cache.set(node.outputs[1]!.id, 0.5);     // Intercept
+      cache.set(node.outputs[2]!.id, [0, 0, 1] as Vec3); // Strand Normal
+      cache.set(node.outputs[3]!.id, 0);       // Random
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeParticleInfo') {
+      // CPU stub: zeros for all particle info outputs
+      for (const out of node.outputs) cache.set(out.id, out.kind === 'VALUE' ? 0 : out.default_value);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodePointInfo') {
+      // CPU stub: zeros for all point info outputs
+      for (const out of node.outputs) cache.set(out.id, out.kind === 'VALUE' ? 0 : out.default_value);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeVolumeInfo') {
+      // CPU stub
+      cache.set(node.outputs[0]!.id, 0);       // Color
+      cache.set(node.outputs[1]!.id, 0);       // Density
+      cache.set(node.outputs[2]!.id, 0);       // Temperature
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeOutputAOV') {
+      // AOV output — just pass through the color input
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeNewGeometry') {
+      // Same as ShaderNodeGeometry — return zeros
+      const zero3: Vec3 = [0, 0, 0];
+      for (const out of node.outputs) cache.set(out.id, zero3);
+      return;
+    }
+    // ----------------------------------------------------------------
+    //  Phase 7: Remaining shader nodes
+    // ----------------------------------------------------------------
+    if (node.bl_idname === 'ShaderNodeBsdfHair') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: 0.5 });
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeBsdfHairPrincipled') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0.5, 0.5, 0.5, 1];
+      const r = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0.5;
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0, roughness: r });
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeEeveeSpecular') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [1, 1, 1, 1];
+      const r = (this.socketValue(node.inputs[1]!, cache) as number) ?? 0.5;
+      cache.set(node.outputs[0]!.id, { ...DEFAULT, color: c, metalness: 0.5, roughness: r });
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeTexSky') {
+      const v = (this.socketValue(node.inputs[0]!, cache) as Vec3) ?? [0, 0, 1];
+      const l = Math.hypot(v[0], v[1], v[2]) || 1;
+      const ny = v[1] / l;
+      const t = Math.max(0, ny * 0.5 + 0.5);
+      cache.set(node.outputs[0]!.id, [0.3 + 0.3 * t, 0.5 + 0.3 * t, 0.8 * t + 0.2, 1] as RGBA);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeTexPointDensity') {
+      cache.set(node.outputs[0]!.id, [0.5, 0.5, 0.5, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, 0.5);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeAttributeColor') {
+      cache.set(node.outputs[0]!.id, [1, 1, 1, 1] as RGBA);
+      cache.set(node.outputs[1]!.id, [1, 1, 1] as Vec3);
+      cache.set(node.outputs[2]!.id, 1);
+      cache.set(node.outputs[3]!.id, 1);
+      return;
+    }
+    if (node.bl_idname === 'FunctionNodeFloatToInt') {
+      const v = this.socketValue(node.inputs[0]!, cache) as number ?? 0;
+      const mode = (node as unknown as { rounding_mode?: string }).rounding_mode ?? 'ROUND';
+      let result: number;
+      switch (mode) {
+        case 'FLOOR': result = Math.floor(v); break;
+        case 'CEIL': result = Math.ceil(v); break;
+        case 'TRUNC': result = Math.trunc(v); break;
+        default: result = Math.round(v);
+      }
+      cache.set(node.outputs[0]!.id, result);
+      return;
+    }
+    if (node.bl_idname === 'FunctionNodeRotateEuler') {
+      const v = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 0];
+      const axis = this.socketValue(node.inputs[1]!, cache) as Vec3 ?? [0, 0, 1];
+      const angle = (this.socketValue(node.inputs[2]!, cache) as number) ?? 0;
+      const l = Math.hypot(axis[0], axis[1], axis[2]) || 1;
+      const ux = axis[0] / l, uy = axis[1] / l, uz = axis[2] / l;
+      const c = Math.cos(angle), s = Math.sin(angle), ci = 1 - c;
+      const rx = v[0] * (c + ux * ux * ci) + v[1] * (ux * uy * ci - uz * s) + v[2] * (ux * uz * ci + uy * s);
+      const ry = v[0] * (uy * ux * ci + uz * s) + v[1] * (c + uy * uy * ci) + v[2] * (uy * uz * ci - ux * s);
+      const rz = v[0] * (uz * ux * ci - uy * s) + v[1] * (uz * uy * ci + ux * s) + v[2] * (c + uz * uz * ci);
+      cache.set(node.outputs[0]!.id, [rx, ry, rz] as Vec3);
+      return;
+    }
+    if (node.bl_idname === 'FunctionNodeAlignEulerToVector') {
+      const euler = this.socketValue(node.inputs[0]!, cache) as Vec3 ?? [0, 0, 0];
+      const vector = this.socketValue(node.inputs[1]!, cache) as Vec3 ?? [0, 0, 1];
+      const l = Math.hypot(vector[0], vector[1], vector[2]) || 1;
+      const nx = vector[0] / l, ny = vector[1] / l, nz = vector[2] / l;
+      const pitch = Math.asin(Math.max(-1, Math.min(1, -nx)));
+      const yaw = Math.atan2(ny, nz);
+      cache.set(node.outputs[0]!.id, [euler[0] + pitch, euler[1], euler[2] + yaw] as Vec3);
+      return;
+    }
+    if (node.bl_idname === 'ShaderNodeScript') {
+      const c = this.socketValue(node.inputs[0]!, cache) as RGBA ?? [0, 0, 0, 1];
+      cache.set(node.outputs[0]!.id, c);
+      return;
+    }
     // unknown node — propagate defaults
     for (const out of node.outputs) cache.set(out.id, out.default_value);
   }

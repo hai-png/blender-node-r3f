@@ -328,6 +328,136 @@ export class TextureEvaluator implements SystemEvaluator {
           });
           break;
         }
+
+        // ──────── Legacy texture nodes ────────
+        case 'TextureNodeClouds': {
+          const coords = inVector(node, 'Coords', ctx);
+          const scale = Number(p.scale ?? 5);
+          const detail = Number(p.detail ?? 2);
+          const hard = String(p.noise_type ?? 'SOFT') === 'HARD';
+          const fBm = (x: number, y: number): number => {
+            const octaves = Math.min(8, Math.max(1, Math.round(detail) + 1));
+            let sum = 0, amp = 1, norm = 0, freq = 1;
+            for (let i = 0; i < octaves; i++) {
+              const n = valueNoise(x * freq, y * freq);
+              sum += (hard ? (n > 0.5 ? 1 : 0) : n) * amp;
+              norm += amp; amp *= 0.5; freq *= 2;
+            }
+            return norm > 0 ? sum / norm : 0;
+          };
+          const f: ScalarFn = (u, v) => { const [x, y] = coords(u, v); return fBm(x * scale, y * scale); };
+          if (String(p.cloud_type ?? 'GRAYSCALE') === 'COLOR') {
+            setColor(node, 'Color', (u, v) => {
+              const [x, y] = coords(u, v);
+              const r = fBm(x * scale + 3.7, y * scale);
+              const g = fBm(x * scale, y * scale + 7.3);
+              const b = fBm(x * scale + 11.1, y * scale + 5.9);
+              return [r, g, b, 1];
+            });
+          } else {
+            setColor(node, 'Color', (u, v) => { const x = f(u, v); return [x, x, x, 1]; });
+          }
+          setScalar(node, 'Fac', f);
+          break;
+        }
+        case 'TextureNodeStucci': {
+          const coords = inVector(node, 'Coords', ctx);
+          const scale = Number(p.scale ?? 5);
+          const turb = Number(p.turbulence ?? 2);
+          const f: ScalarFn = (u, v) => {
+            const [x, y] = coords(u, v);
+            const sx = x * scale, sy = y * scale;
+            const n = valueNoise(sx, sy);
+            const t = turb > 0 ? valueNoise(sx + 3.7, sy + 7.3) * turb : 0;
+            const raw = n + t * 0.1;
+            const type = String(p.stucci_type ?? 'PLASTIC');
+            if (type === 'WALL_IN') return Math.max(0, raw * 2 - 1);
+            if (type === 'WALL_OUT') return Math.min(1, raw * 2);
+            return raw;
+          };
+          setColor(node, 'Color', (u, v) => { const x = f(u, v); return [x, x, x, 1]; });
+          setScalar(node, 'Fac', f);
+          break;
+        }
+        case 'TextureNodeMarble': {
+          const coords = inVector(node, 'Coords', ctx);
+          const scale = Number(p.scale ?? 5);
+          const turb = Number(p.turbulence ?? 5);
+          const depth = Number(p.noise_depth ?? 2);
+          const type = String(p.marble_type ?? 'SOFT');
+          const fBm = (x: number, y: number): number => {
+            const octaves = Math.min(8, Math.max(1, Math.round(depth) + 1));
+            let sum = 0, amp = 1, norm = 0, freq = 1;
+            for (let i = 0; i < octaves; i++) {
+              sum += valueNoise(x * freq, y * freq) * amp;
+              norm += amp; amp *= 0.5; freq *= 2;
+            }
+            return norm > 0 ? sum / norm : 0;
+          };
+          const f: ScalarFn = (u, v) => {
+            const [x, y] = coords(u, v);
+            const n = fBm(x * scale + 3.7, y * scale + 7.3);
+            const distortion = turb * n;
+            const phase = (x + y) * scale + distortion;
+            const wave = Math.sin(phase * Math.PI);
+            if (type === 'SHARP') return wave > 0.3 ? 1 : 0;
+            if (type === 'SHARPER') return wave > 0.1 ? 1 : 0;
+            return 0.5 + 0.5 * wave;
+          };
+          setColor(node, 'Color', (u, v) => { const x = f(u, v); return [x, x, x, 1]; });
+          setScalar(node, 'Fac', f);
+          break;
+        }
+        case 'TextureNodeWood': {
+          const coords = inVector(node, 'Coords', ctx);
+          const scale = Number(p.scale ?? 5);
+          const turb = Number(p.turbulence ?? 5);
+          const type = String(p.wood_type ?? 'BANDS');
+          const fBm = (x: number, y: number): number => {
+            const octaves = Math.min(8, Math.max(1, Math.round(Number(p.noise_depth ?? 2)) + 1));
+            let sum = 0, amp = 1, norm = 0, freq = 1;
+            for (let i = 0; i < octaves; i++) {
+              sum += valueNoise(x * freq, y * freq) * amp;
+              norm += amp; amp *= 0.5; freq *= 2;
+            }
+            return norm > 0 ? sum / norm : 0;
+          };
+          const f: ScalarFn = (u, v) => {
+            const [x, y] = coords(u, v);
+            const sx = x * scale, sy = y * scale;
+            const n = fBm(sx + 3.7, sy + 7.3);
+            const distortion = turb * n * 0.1;
+            const isNoise = type === 'BANDNOISE' || type === 'RINGNOISE';
+            const isRing = type === 'RINGS' || type === 'RINGNOISE';
+            let base: number;
+            if (isRing) {
+              base = Math.sqrt((x - 0.5) * (x - 0.5) + (y - 0.5) * (y - 0.5)) * scale;
+            } else {
+              base = (x + y) * scale * 0.5;
+            }
+            if (isNoise) base += distortion;
+            const wave = Math.sin(base * Math.PI * 2);
+            return 0.5 + 0.5 * wave;
+          };
+          setColor(node, 'Color', (u, v) => { const x = f(u, v); return [x, x, x, 1]; });
+          setScalar(node, 'Fac', f);
+          break;
+        }
+        case 'TextureNodeDistortedNoise': {
+          const coords = inVector(node, 'Coords', ctx);
+          const scale = Number(p.scale ?? 5);
+          const dist = Number(p.distortion ?? 1);
+          const f: ScalarFn = (u, v) => {
+            const [x, y] = coords(u, v);
+            const sx = x * scale, sy = y * scale;
+            const dx = valueNoise(sx + 3.7, sy + 7.3) * dist;
+            const dy = valueNoise(sx + 11.1, sy + 13.7) * dist;
+            return valueNoise(sx + dx, sy + dy);
+          };
+          setColor(node, 'Color', (u, v) => { const x = f(u, v); return [x, x, x, 1]; });
+          setScalar(node, 'Fac', f);
+          break;
+        }
         default:
           break;
       }

@@ -183,6 +183,104 @@ export class TextureNodeCoordinates extends TexNode {
 }
 
 let _registered = false;
+
+/* ──────────────────────────────────────────────────────────────────── */
+/*  Legacy texture nodes (Blender Internal, still widely used)         */
+/* ──────────────────────────────────────────────────────────────────── */
+
+export class TextureNodeClouds extends TexNode {
+  static override bl_idname = 'TextureNodeClouds';
+  static override bl_label = 'Clouds';
+  static override category = 'Patterns';
+  static override properties = {
+    noise_type: EnumProperty({ items: [['SOFT', 'Soft', ''], ['HARD', 'Hard', '']], default: 'SOFT' }),
+    cloud_type: EnumProperty({ items: [['GRAYSCALE', 'Grayscale', ''], ['COLOR', 'Color', '']], default: 'GRAYSCALE' }),
+    scale: FloatProperty({ default: 5, name: 'Scale' }),
+    detail: FloatProperty({ default: 2, name: 'Detail' }),
+    noise_basis: EnumProperty({ items: [['BLENDER', 'Blender', ''], ['PERLIN', 'Perlin', ''], ['VORONOI_F1', 'Voronoi F1', '']], default: 'BLENDER' }),
+  };
+  declare noise_type: string; declare cloud_type: string;
+  declare scale: number; declare detail: number; declare noise_basis: string;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketVector, 'Coords');
+    this.addOutput(NodeSocketColor, 'Color');
+    this.addOutput(NodeSocketFloat, 'Fac');
+  }
+}
+
+export class TextureNodeStucci extends TexNode {
+  static override bl_idname = 'TextureNodeStucci';
+  static override bl_label = 'Stucci';
+  static override category = 'Patterns';
+  static override properties = {
+    stucci_type: EnumProperty({ items: [['PLASTIC', 'Plastic', ''], ['WALL_IN', 'Wall In', ''], ['WALL_OUT', 'Wall Out', '']], default: 'PLASTIC' }),
+    scale: FloatProperty({ default: 5, name: 'Scale' }),
+    turbulence: FloatProperty({ default: 2, name: 'Turbulence' }),
+  };
+  declare stucci_type: string; declare scale: number; declare turbulence: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketVector, 'Coords');
+    this.addOutput(NodeSocketColor, 'Color');
+    this.addOutput(NodeSocketFloat, 'Fac');
+  }
+}
+
+export class TextureNodeMarble extends TexNode {
+  static override bl_idname = 'TextureNodeMarble';
+  static override bl_label = 'Marble';
+  static override category = 'Patterns';
+  static override properties = {
+    marble_type: EnumProperty({ items: [['SOFT', 'Soft', ''], ['SHARP', 'Sharp', ''], ['SHARPER', 'Sharper', '']], default: 'SOFT' }),
+    scale: FloatProperty({ default: 5, name: 'Scale' }),
+    turbulence: FloatProperty({ default: 5, name: 'Turbulence' }),
+    noise_depth: FloatProperty({ default: 2, name: 'Depth' }),
+  };
+  declare marble_type: string; declare scale: number;
+  declare turbulence: number; declare noise_depth: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketVector, 'Coords');
+    this.addOutput(NodeSocketColor, 'Color');
+    this.addOutput(NodeSocketFloat, 'Fac');
+  }
+}
+
+export class TextureNodeWood extends TexNode {
+  static override bl_idname = 'TextureNodeWood';
+  static override bl_label = 'Wood';
+  static override category = 'Patterns';
+  static override properties = {
+    wood_type: EnumProperty({ items: [['BANDS', 'Bands', ''], ['RINGS', 'Rings', ''], ['BANDNOISE', 'Band Noise', ''], ['RINGNOISE', 'Ring Noise', '']], default: 'BANDS' }),
+    noise_basis: EnumProperty({ items: [['BLENDER', 'Blender', ''], ['PERLIN', 'Perlin', '']], default: 'BLENDER' }),
+    scale: FloatProperty({ default: 5, name: 'Scale' }),
+    turbulence: FloatProperty({ default: 5, name: 'Turbulence' }),
+    noise_depth: FloatProperty({ default: 2, name: 'Depth' }),
+  };
+  declare wood_type: string; declare noise_basis: string;
+  declare scale: number; declare turbulence: number; declare noise_depth: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketVector, 'Coords');
+    this.addOutput(NodeSocketColor, 'Color');
+    this.addOutput(NodeSocketFloat, 'Fac');
+  }
+}
+
+export class TextureNodeDistortedNoise extends TexNode {
+  static override bl_idname = 'TextureNodeDistortedNoise';
+  static override bl_label = 'Distorted Noise';
+  static override category = 'Patterns';
+  static override properties = {
+    noise_basis: EnumProperty({ items: [['BLENDER', 'Blender', ''], ['PERLIN', 'Perlin', ''], ['VORONOI_F1', 'Voronoi F1', '']], default: 'BLENDER' }),
+    distortion: FloatProperty({ default: 1, name: 'Distortion' }),
+    scale: FloatProperty({ default: 5, name: 'Scale' }),
+  };
+  declare noise_basis: string; declare distortion: number; declare scale: number;
+  override init(_ctx: NodeInitContext): void {
+    this.addInput(NodeSocketVector, 'Coords');
+    this.addOutput(NodeSocketColor, 'Color');
+    this.addOutput(NodeSocketFloat, 'Fac');
+  }
+}
+
 export function registerTextureNodes(): void {
   if (_registered) return;
   _registered = true;
@@ -190,6 +288,9 @@ export function registerTextureNodes(): void {
     TextureNodeOutput, TextureNodeNoise, TextureNodeChecker, TextureNodeVoronoi,
     TextureNodeWave, TextureNodeMagic, TextureNodeBlend, TextureNodeImage,
     TextureNodeMath, TextureNodeMixRGB, TextureNodeValToRGB, TextureNodeCoordinates,
+    // Legacy texture nodes
+    TextureNodeClouds, TextureNodeStucci, TextureNodeMarble,
+    TextureNodeWood, TextureNodeDistortedNoise,
   ]) {
     NodeRegistry.register(cls as unknown as Parameters<typeof NodeRegistry.register>[0]);
   }

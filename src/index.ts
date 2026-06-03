@@ -43,7 +43,7 @@ export { TextureEvaluator, bakeToDataTexture, type SampleFn } from './eval/Textu
 export { cpuComposite } from './eval/compositor/CpuComposite';
 export { flattenTree, flatTopoOrder } from './eval/flatten';
 
-export { Geometry, MeshComponent, InstancesComponent, buildCube, buildUVSphere, buildIcosphere } from './eval/geometry/Geometry';
+export { Geometry, MeshComponent, InstancesComponent, VolumeComponent, buildCube, buildUVSphere, buildIcosphere } from './eval/geometry/Geometry';
 
 export { NodeRegistry, NodeCategory, NodeCategories, NodeItem } from './registry/NodeRegistry';
 

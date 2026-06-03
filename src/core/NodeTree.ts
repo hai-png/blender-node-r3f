@@ -343,6 +343,8 @@ export class NodeTree {
     // but ensure it's synced explicitly too.
     const zid = (input as unknown as { zone_id: string }).zone_id;
     (output as unknown as { zone_id: string }).zone_id = zid;
+    // Rebuild the zone index so the zone pair is O(1)-lookable.
+    this.rebuildZoneIndex();
     output.location = [input.location[0] + 320, input.location[1]];
     // Rebuild output sockets now that it can locate its pair.
     (output as unknown as { rebuildSockets?(): void }).rebuildSockets?.();

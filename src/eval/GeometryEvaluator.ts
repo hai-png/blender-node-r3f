@@ -43,6 +43,10 @@ import {
   translationMat4, rotationMat4, scaleMat4, transformAroundPivotMat4, mat4Mul, flipFaces,
   raycastMesh, deleteGeometry, separateGeometry, meshToCurve, extrudeMesh,
   duplicateElements, splitEdges,
+  dualMesh, scaleElements, blurAttribute, sampleNearestSurface,
+  offsetPointInCurve, pointsOfCurve, curveOfPoint,
+  meshToVolume, volumeToMesh, pointsToVolume, mergeLayers,
+  interpolateCurves, sampleUVSurface, stringToCurves,
 } from './geometry/MeshOps';
 
 import { ValueNode, VectorNode, RGBNode } from '../nodes/common/Value';
@@ -100,6 +104,21 @@ import {
   GeometryNodeDeleteGeometry, GeometryNodeSeparateGeometry, GeometryNodeDuplicateElements,
   GeometryNodeMeshToCurve, GeometryNodeSplitEdges, GeometryNodeSubdivideMesh,
   GeometryNodeSetShadeSmooth,
+  GeometryNodeDualMesh, GeometryNodeScaleElements,
+  GeometryNodeInputMeshIsland, GeometryNodeInputShadeSmooth,
+  GeometryNodeInputMeshVertexNeighbors, GeometryNodeInputMeshFaceArea,
+  GeometryNodeInputMeshEdgeAngle, GeometryNodeInputMeshEdgeVertices,
+  GeometryNodeInputMeshFaceIsPlanar,
+  GeometryNodeCornersOfFace, GeometryNodeCornersOfVertex,
+  GeometryNodeEdgesOfCorner, GeometryNodeEdgesOfVertex,
+  GeometryNodeFaceOfCorner, GeometryNodeVertexOfCorner,
+  GeometryNodeCurveOfPoint, GeometryNodePointsOfCurve,
+  GeometryNodeOffsetPointInCurve,
+  GeometryNodeImageTexture, GeometryNodeBlurAttribute,
+  GeometryNodeSampleNearestSurface,
+  GeometryNodeMeshToVolume, GeometryNodeVolumeToMesh, GeometryNodePointsToVolume,
+  GeometryNodeMergeLayers, GeometryNodeInterpolateCurves,
+  GeometryNodeSampleUVSurface, GeometryNodeStringToCurves,
 } from '../nodes/geometry/MoreOps';
 import {
   GeometryNodeAccumulateField, GeometryNodeFieldOnDomain, GeometryNodeFieldAtIndex,
@@ -2666,6 +2685,860 @@ export class GeometryEvaluator implements SystemEvaluator {
         out[i] = selArr[i] ? (smArr[i] ? 1 : 0) : prev;
       }
       cache.set(node.outputs[0]!.id, storeAttributeOn(geo, 'shade_smooth', 'FACE', 'BOOL', out));
+      return;
+    }
+
+    /* ---------------- Phase 6: Volume & remaining ops ---------------- */
+    if (node instanceof GeometryNodeMeshToVolume) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const density = this.socketSingle<number>(node.inputs[1]!, cache, geo);
+      const voxelSize = this.socketSingle<number>(node.inputs[2]!, cache, geo);
+      const extBand = this.socketSingle<number>(node.inputs[4]!, cache, geo);
+      const intBand = this.socketSingle<number>(node.inputs[5]!, cache, geo);
+      const fillInt = !!this.socketSingle<boolean>(node.inputs[6]!, cache, geo);
+      cache.set(node.outputs[0]!.id, meshToVolume(geo, density, voxelSize, extBand, intBand, fillInt));
+      return;
+    }
+    if (node instanceof GeometryNodeVolumeToMesh) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const threshold = this.socketSingle<number>(node.inputs[4]!, cache, geo);
+      cache.set(node.outputs[0]!.id, volumeToMesh(geo, threshold));
+      return;
+    }
+    if (node instanceof GeometryNodePointsToVolume) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const density = this.socketSingle<number>(node.inputs[1]!, cache, geo);
+      const voxelSize = this.socketSingle<number>(node.inputs[2]!, cache, geo);
+      const radius = this.socketSingle<number>(node.inputs[3]!, cache, geo);
+      cache.set(node.outputs[0]!.id, pointsToVolume(geo, density, voxelSize, radius));
+      return;
+    }
+    if (node instanceof GeometryNodeMergeLayers) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      // MergeLayers simply passes through the geometry in our model.
+      cache.set(node.outputs[0]!.id, geo);
+      return;
+    }
+    if (node instanceof GeometryNodeInterpolateCurves) {
+      const guideGeo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const pointsGeo = (this.socketValue(node.inputs[3]!, cache) as Geometry) ?? Geometry.empty();
+      const maxN = Math.max(1, this.socketSingle<number>(node.inputs[6]!, cache, Geometry.empty()) | 0);
+      const r = interpolateCurves(guideGeo, null, 0, pointsGeo, null, 0, maxN);
+      cache.set(node.outputs[0]!.id, r.curves);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < Math.min(ctx.size, r.closestIndex.length); i++) out[i] = r.closestIndex[i]!;
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[2]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < Math.min(ctx.size, r.closestWeight.length); i++) out[i] = r.closestWeight[i]!;
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeSampleUVSurface) {
+      const target = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const uvMapF = this.socketField(node.inputs[2]!, cache);
+      const sampleUVF = this.socketField(node.inputs[3]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const sv = sampleUVF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = sampleUVSurface(target, 'UVMap', [sv[i * 3]!, sv[i * 3 + 1]!, 0]);
+            out[i * 3] = r.value[0]; out[i * 3 + 1] = r.value[1]; out[i * 3 + 2] = r.value[2];
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'BOOL',
+        eval(ctx) {
+          const out = new Uint8Array(ctx.size);
+          out.fill(1); // Assume valid if target has geometry
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeStringToCurves) {
+      const str = this.socketSingle<string>(node.inputs[0]!, cache, Geometry.empty()) ?? '';
+      const size = this.socketSingle<number>(node.inputs[1]!, cache, Geometry.empty());
+      const charSp = this.socketSingle<number>(node.inputs[2]!, cache, Geometry.empty());
+      const wordSp = this.socketSingle<number>(node.inputs[3]!, cache, Geometry.empty());
+      const lineSp = this.socketSingle<number>(node.inputs[4]!, cache, Geometry.empty());
+      const boxW = this.socketSingle<number>(node.inputs[5]!, cache, Geometry.empty());
+      const boxH = this.socketSingle<number>(node.inputs[6]!, cache, Geometry.empty());
+      cache.set(node.outputs[0]!.id, stringToCurves(str, size, charSp, wordSp, lineSp, boxW, boxH));
+      return;
+    }
+
+    /* ---------------- Phase 5: Remaining gap implementations ---------------- */
+    if (node instanceof GeometryNodeDualMesh) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      cache.set(node.outputs[0]!.id, dualMesh(geo));
+      return;
+    }
+    if (node instanceof GeometryNodeScaleElements) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sel = this.socketField(node.inputs[1]!, cache);
+      const scaleFactor = this.socketSingle<number>(node.inputs[2]!, cache, geo);
+      const dom = (node as unknown as { domain: string }).domain === 'EDGE' ? 'EDGE' as const : 'FACE' as const;
+      const ctx: FieldContext = { geometry: geo, domain: dom, size: geo.domainSize(dom) };
+      const selV = sel.eval(ctx);
+      cache.set(node.outputs[0]!.id, scaleElements(geo, selV, scaleFactor, dom));
+      return;
+    }
+    if (node instanceof GeometryNodeBlurAttribute) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const valF = this.socketField(node.inputs[0]!, cache);
+      const iters = Math.max(1, this.socketSingle<number>(node.inputs[1]!, cache, geo) | 0);
+      const wt = this.socketSingle<number>(node.inputs[2]!, cache, geo);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const vals = valF.eval(ctx) as Float32Array;
+          if (!mesh || ctx.size === 0) return vals;
+          const adj = new Map<number, number[]>();
+          const e = mesh.edges();
+          if (e) for (let i = 0; i < e.length; i += 2) {
+            const a = e[i]!, b = e[i + 1]!;
+            if (!adj.has(a)) adj.set(a, []); if (!adj.has(b)) adj.set(b, []);
+            adj.get(a)!.push(b); adj.get(b)!.push(a);
+          }
+          let data = new Float32Array(vals);
+          for (let iter = 0; iter < iters; iter++) {
+            const next = new Float32Array(data.length);
+            for (let v = 0; v < ctx.size; v++) {
+              const neighbors = adj.get(v) ?? [];
+              if (neighbors.length === 0) { next[v] = data[v] ?? 0; continue; }
+              let sum = 0;
+              for (const nb of neighbors) sum += data[nb] ?? 0;
+              const avg = sum / neighbors.length;
+              next[v] = (data[v] ?? 0) + wt * (avg - (data[v] ?? 0));
+            }
+            data = next;
+          }
+          return data;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeImageTexture) {
+      const imgSrc = this.socketSingle<string>(node.inputs[0]!, cache, Geometry.empty());
+      const vecF = this.socketField(node.inputs[1]!, cache);
+      const img = imgSrc && this.opts.resolveImage ? this.opts.resolveImage(imgSrc) : null;
+      const wrap = (u: number): number => {
+        const r = u - Math.floor(u); return r < 0 ? r + 1 : r;
+      };
+      cache.set(node.outputs[0]!.id, {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const u = wrap(vv[i * 3]!), v = wrap(vv[i * 3 + 1]!);
+            if (!img) { out[i * 3] = 1; out[i * 3 + 1] = 1; out[i * 3 + 2] = 1; continue; }
+            const x = Math.max(0, Math.min(img.width - 1, Math.floor(u * img.width)));
+            const y = Math.max(0, Math.min(img.height - 1, Math.floor(v * img.height)));
+            const idx = (y * img.width + x) * 4;
+            out[i * 3] = (img.data[idx] ?? 255) / 255;
+            out[i * 3 + 1] = (img.data[idx + 1] ?? 255) / 255;
+            out[i * 3 + 2] = (img.data[idx + 2] ?? 255) / 255;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const vv = vecF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const u = wrap(vv[i * 3]!), v = wrap(vv[i * 3 + 1]!);
+            if (!img) { out[i] = 1; continue; }
+            const x = Math.max(0, Math.min(img.width - 1, Math.floor(u * img.width)));
+            const y = Math.max(0, Math.min(img.height - 1, Math.floor(v * img.height)));
+            const idx = (y * img.width + x) * 4;
+            out[i] = (img.data[idx + 3] ?? 255) / 255;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeSampleNearestSurface) {
+      const target = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const sampleF = this.socketField(node.inputs[3]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const sv = sampleF.eval(ctx) as Float32Array;
+          const out = new Float32Array(ctx.size * 3);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = sampleNearestSurface(target, [sv[i * 3]!, sv[i * 3 + 1]!, sv[i * 3 + 2]!]);
+            out[i * 3] = r.position[0]; out[i * 3 + 1] = r.position[1]; out[i * 3 + 2] = r.position[2];
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'BOOL',
+        eval(ctx) {
+          const out = new Uint8Array(ctx.size);
+          out.fill(1); // Assume valid if target has geometry
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeOffsetPointInCurve) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const idxF = this.socketField(node.inputs[0]!, cache);
+      const offF = this.socketField(node.inputs[1]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'BOOL',
+        eval(ctx) {
+          const idxs = idxF.eval(ctx) as Int32Array;
+          const offs = offF.eval(ctx) as Int32Array;
+          const out = new Uint8Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = offsetPointInCurve(geo, idxs[i] ?? 0, offs[i] ?? 0);
+            out[i] = r.isValid ? 1 : 0;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const idxs = idxF.eval(ctx) as Int32Array;
+          const offs = offF.eval(ctx) as Int32Array;
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = offsetPointInCurve(geo, idxs[i] ?? 0, offs[i] ?? 0).resultIndex;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodePointsOfCurve) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const ciF = this.socketField(node.inputs[0]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const cis = ciF.eval(ctx) as Int32Array;
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            const r = pointsOfCurve(geo, cis[i] ?? 0);
+            out[i] = r.pointIndices.length > 0 ? r.pointIndices[0]! : 0;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const cis = ciF.eval(ctx) as Int32Array;
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = pointsOfCurve(geo, cis[i] ?? 0).total;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+    if (node instanceof GeometryNodeCurveOfPoint) {
+      const geo = (this.socketValue(node.inputs[0]!, cache) as Geometry) ?? Geometry.empty();
+      const piF = this.socketField(node.inputs[0]!, cache);
+      cache.set(node.outputs[0]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const pis = piF.eval(ctx) as Int32Array;
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = curveOfPoint(geo, pis[i] ?? 0).curveIndex;
+          }
+          return out;
+        },
+      } satisfies Field);
+      cache.set(node.outputs[1]!.id, {
+        kind: 'INT',
+        eval(ctx) {
+          const pis = piF.eval(ctx) as Int32Array;
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = curveOfPoint(geo, pis[i] ?? 0).indexInCurve;
+          }
+          return out;
+        },
+      } satisfies Field);
+      return;
+    }
+
+    /* ---------------- Topology query nodes ---------------- */
+    if (node instanceof GeometryNodeInputMeshFaceArea) {
+      const areaField: Field = {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          if (!mesh || ctx.domain !== 'FACE') {
+            const out = new Float32Array(ctx.size);
+            if (mesh && ctx.domain === 'POINT') {
+              // Distribute face areas to vertices (average of adjacent faces)
+              const faceAreas = mesh.faceAreas();
+              const counts = new Float32Array(ctx.size);
+              for (let f = 0; f < mesh.numFaces; f++) {
+                const area = faceAreas[f] ?? 0;
+                for (const v of mesh.faceVerts(f)) {
+                  if (v < ctx.size) { out[v] = (out[v] ?? 0) + area; counts[v] = (counts[v] ?? 0) + 1; }
+                }
+              }
+              for (let i = 0; i < ctx.size; i++) out[i] = (counts[i] ?? 0) > 0 ? (out[i] ?? 0) / (counts[i] ?? 1) : 0;
+            }
+            return out;
+          }
+          const areas = mesh.faceAreas();
+          return new Float32Array(areas);
+        },
+      };
+      cache.set(node.outputs[0]!.id, areaField);
+      return;
+    }
+    if (node instanceof GeometryNodeInputShadeSmooth) {
+      const smoothField: Field = {
+        kind: 'BOOL',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Uint8Array(ctx.size);
+          if (!mesh) return out;
+          const attr = mesh.attributes.get('shade_smooth');
+          if (attr && attr.domain === 'FACE') {
+            return interpolateAttribute(attr, ctx.geometry, ctx.domain, ctx.size, 'BOOL');
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, smoothField);
+      return;
+    }
+    if (node instanceof GeometryNodeInputMeshVertexNeighbors) {
+      const countField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // Vertex Count: number of edges per vertex
+          const adj = new Map<number, Set<number>>();
+          const e = mesh.edges();
+          if (e) {
+            for (let i = 0; i < e.length; i += 2) {
+              const a = e[i]!, b = e[i + 1]!;
+              if (!adj.has(a)) adj.set(a, new Set());
+              if (!adj.has(b)) adj.set(b, new Set());
+              adj.get(a)!.add(b);
+              adj.get(b)!.add(a);
+            }
+          }
+          for (let i = 0; i < ctx.size; i++) out[i] = adj.get(i)?.size ?? 0;
+          return out;
+        },
+      };
+      const faceCountField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const faceCounts = new Int32Array(ctx.size);
+          for (let f = 0; f < mesh.numFaces; f++) {
+            for (const v of mesh.faceVerts(f)) {
+              if (v < ctx.size) faceCounts[v] = (faceCounts[v] ?? 0) + 1;
+            }
+          }
+          return faceCounts;
+        },
+      };
+      cache.set(node.outputs[0]!.id, countField);
+      cache.set(node.outputs[1]!.id, faceCountField);
+      return;
+    }
+    if (node instanceof GeometryNodeInputMeshEdgeAngle) {
+      const unsignedField: Field = {
+        kind: 'FLOAT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Float32Array(ctx.size);
+          if (!mesh) return out;
+          // Edge angle: angle between adjacent face normals
+          const faceNormals = mesh.faceNormals();
+          const e2f = new Map<string, number[]>();
+          for (let f = 0; f < mesh.numFaces; f++) {
+            const verts = mesh.faceVerts(f);
+            for (let i = 0; i < verts.length; i++) {
+              const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+              const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+              if (!e2f.has(k)) e2f.set(k, []);
+              e2f.get(k)!.push(f);
+            }
+          }
+          let edgeIdx = 0;
+          const seen = new Set<string>();
+          for (let f = 0; f < mesh.numFaces; f++) {
+            const verts = mesh.faceVerts(f);
+            for (let i = 0; i < verts.length; i++) {
+              const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+              const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+              if (seen.has(k)) continue;
+              seen.add(k);
+              const faces = e2f.get(k) ?? [];
+              if (faces.length >= 2 && edgeIdx < ctx.size) {
+                const f0 = faces[0] ?? 0, f1 = faces[1] ?? 0;
+                const n1x = faceNormals[f0 * 3] ?? 0, n1y = faceNormals[f0 * 3 + 1] ?? 0, n1z = faceNormals[f0 * 3 + 2] ?? 0;
+                const n2x = faceNormals[f1 * 3] ?? 0, n2y = faceNormals[f1 * 3 + 1] ?? 0, n2z = faceNormals[f1 * 3 + 2] ?? 0;
+                const dot = Math.max(-1, Math.min(1, n1x * n2x + n1y * n2y + n1z * n2z));
+                out[edgeIdx] = Math.acos(dot);
+              }
+              edgeIdx++;
+            }
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, unsignedField);
+      cache.set(node.outputs[1]!.id, unsignedField); // signed ≈ unsigned for most cases
+      return;
+    }
+    if (node instanceof GeometryNodeInputMeshEdgeVertices) {
+      const idx1Field: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (e) for (let i = 0; i < ctx.size && i * 2 < e.length; i++) out[i] = e[i * 2]!;
+          return out;
+        },
+      };
+      const idx2Field: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (e) for (let i = 0; i < ctx.size && i * 2 + 1 < e.length; i++) out[i] = e[i * 2 + 1]!;
+          return out;
+        },
+      };
+      const pos1Field: Field = {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Float32Array(ctx.size * 3);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (e) {
+            for (let i = 0; i < ctx.size && i * 2 < e.length; i++) {
+              const v = e[i * 2]!;
+              out[i * 3] = mesh.positions[v * 3] ?? 0;
+              out[i * 3 + 1] = mesh.positions[v * 3 + 1] ?? 0;
+              out[i * 3 + 2] = mesh.positions[v * 3 + 2] ?? 0;
+            }
+          }
+          return out;
+        },
+      };
+      const pos2Field: Field = {
+        kind: 'VECTOR',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Float32Array(ctx.size * 3);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (e) {
+            for (let i = 0; i < ctx.size && i * 2 + 1 < e.length; i++) {
+              const v = e[i * 2 + 1]!;
+              out[i * 3] = mesh.positions[v * 3] ?? 0;
+              out[i * 3 + 1] = mesh.positions[v * 3 + 1] ?? 0;
+              out[i * 3 + 2] = mesh.positions[v * 3 + 2] ?? 0;
+            }
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, idx1Field);
+      cache.set(node.outputs[1]!.id, idx2Field);
+      cache.set(node.outputs[2]!.id, pos1Field);
+      cache.set(node.outputs[3]!.id, pos2Field);
+      return;
+    }
+    if (node instanceof GeometryNodeInputMeshFaceIsPlanar) {
+      const planarField: Field = {
+        kind: 'BOOL',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Uint8Array(ctx.size);
+          if (!mesh || ctx.domain !== 'FACE') return out;
+          const threshold = 0.01;
+          for (let f = 0; f < Math.min(ctx.size, mesh.numFaces); f++) {
+            const verts = mesh.faceVerts(f);
+            if (verts.length < 3) { out[f] = 1; continue; }
+            // Check if all verts are coplanar with the face plane
+            const ax = mesh.positions[verts[0]! * 3]!, ay = mesh.positions[verts[0]! * 3 + 1]!, az = mesh.positions[verts[0]! * 3 + 2]!;
+            // Normal from first 3 verts
+            const bx = mesh.positions[verts[1]! * 3]! - ax, by = mesh.positions[verts[1]! * 3 + 1]! - ay, bz = mesh.positions[verts[1]! * 3 + 2]! - az;
+            const cx = mesh.positions[verts[2]! * 3]! - ax, cy = mesh.positions[verts[2]! * 3 + 1]! - ay, cz = mesh.positions[verts[2]! * 3 + 2]! - az;
+            let nx = by * cz - bz * cy, ny = bz * cx - bx * cz, nz = bx * cy - by * cx;
+            const nl = Math.hypot(nx, ny, nz) || 1;
+            nx /= nl; ny /= nl; nz /= nl;
+            let isPlanar = true;
+            for (let k = 3; k < verts.length; k++) {
+              const dx = mesh.positions[verts[k]! * 3]! - ax, dy = mesh.positions[verts[k]! * 3 + 1]! - ay, dz = mesh.positions[verts[k]! * 3 + 2]! - az;
+              if (Math.abs(nx * dx + ny * dy + nz * dz) > threshold) { isPlanar = false; break; }
+            }
+            out[f] = isPlanar ? 1 : 0;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, planarField);
+      return;
+    }
+    if (node instanceof GeometryNodeInputMeshIsland) {
+      const islandField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // BFS connected components
+          const adj = new Map<number, Set<number>>();
+          for (let f = 0; f < mesh.numFaces; f++) {
+            const verts = mesh.faceVerts(f);
+            for (let i = 0; i < verts.length; i++) {
+              const a = verts[i]!, b = verts[(i + 1) % verts.length]!;
+              if (!adj.has(a)) adj.set(a, new Set());
+              if (!adj.has(b)) adj.set(b, new Set());
+              adj.get(a)!.add(b);
+              adj.get(b)!.add(a);
+            }
+          }
+          const visited = new Set<number>();
+          let islandIdx = 0;
+          for (let v = 0; v < ctx.size; v++) {
+            if (visited.has(v)) continue;
+            const stack = [v];
+            while (stack.length) {
+              const n = stack.pop()!;
+              if (visited.has(n)) continue;
+              visited.add(n);
+              out[n] = islandIdx;
+              for (const nb of adj.get(n) ?? []) { if (!visited.has(nb)) stack.push(nb); }
+            }
+            islandIdx++;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, islandField);
+      // Island Count: total number of islands
+      const countField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const idx = (islandField.eval(ctx) as Int32Array);
+          let max = 0;
+          for (let i = 0; i < idx.length; i++) if (idx[i]! > max) max = idx[i]!;
+          const out = new Int32Array(ctx.size);
+          out.fill(max + 1);
+          return out;
+        },
+      };
+      cache.set(node.outputs[1]!.id, countField);
+      return;
+    }
+
+    /* ---------------- Topology query: X of Y nodes ---------------- */
+    if (node instanceof GeometryNodeFaceOfCorner) {
+      const faceIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const triToFace = mesh.triToFace();
+          for (let i = 0; i < ctx.size; i++) {
+            const tri = Math.floor(i / 3);
+            out[i] = tri < triToFace.length ? triToFace[tri]! : 0;
+          }
+          return out;
+        },
+      };
+      const idxInFaceField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const out = new Int32Array(ctx.size);
+          for (let i = 0; i < ctx.size; i++) out[i] = i % 3; // For triangulated meshes
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, faceIdxField);
+      cache.set(node.outputs[1]!.id, idxInFaceField);
+      return;
+    }
+    if (node instanceof GeometryNodeVertexOfCorner) {
+      const vertIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = i < mesh.triangles.length ? mesh.triangles[i]! : 0;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, vertIdxField);
+      return;
+    }
+    if (node instanceof GeometryNodeCornersOfFace) {
+      const cornerIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // For face index i, the first corner is i*3 (triangulated)
+          for (let i = 0; i < ctx.size; i++) out[i] = i * 3;
+          return out;
+        },
+      };
+      const totalField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const out = new Int32Array(ctx.size);
+          out.fill(3); // Triangulated = 3 corners per face
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, cornerIdxField);
+      cache.set(node.outputs[1]!.id, totalField);
+      return;
+    }
+    if (node instanceof GeometryNodeCornersOfVertex) {
+      const cornerIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // First corner of vertex v: find the first triangle corner that references v
+          for (let c = 0; c < mesh.triangles.length; c++) {
+            const v = mesh.triangles[c]!;
+            if (v < ctx.size && out[v] === 0) out[v] = c;
+          }
+          return out;
+        },
+      };
+      const totalField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // Count corners per vertex
+          for (let c = 0; c < mesh.triangles.length; c++) {
+            const v = mesh.triangles[c]!;
+            if (v < ctx.size) out[v] = (out[v] ?? 0) + 1;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, cornerIdxField);
+      cache.set(node.outputs[1]!.id, totalField);
+      return;
+    }
+    if (node instanceof GeometryNodeEdgesOfVertex) {
+      const edgeIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (!e) return out;
+          // First edge of vertex v
+          for (let i = 0; i < e.length; i += 2) {
+            const a = e[i]!;
+            if (a < ctx.size && out[a] === 0) out[a] = i / 2;
+          }
+          return out;
+        },
+      };
+      const totalField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const e = mesh.edges();
+          if (!e) return out;
+          // Count edges per vertex
+          const counts = new Int32Array(ctx.size);
+          for (let i = 0; i < e.length; i += 2) {
+            const a = e[i]!, b = e[i + 1]!;
+            if (a < ctx.size) counts[a] = (counts[a] ?? 0) + 1;
+            if (b < ctx.size) counts[b] = (counts[b] ?? 0) + 1;
+          }
+          return counts;
+        },
+      };
+      cache.set(node.outputs[0]!.id, edgeIdxField);
+      cache.set(node.outputs[1]!.id, totalField);
+      return;
+    }
+    if (node instanceof GeometryNodeEdgesOfCorner) {
+      // Edges of Corner: for each corner (triangle index), returns the next
+      // and previous edge indices.
+      const nextEdgeField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          // Each corner is a triangle vertex; the "next edge" is the edge
+          // from this corner's vertex to the next vertex in the triangle.
+          const tris = mesh.triangles;
+          const edgeMap = new Map<string, number>();
+          const edges = mesh.edges();
+          if (edges) {
+            for (let i = 0; i < edges.length; i += 2) {
+              const a = edges[i]!, b = edges[i + 1]!;
+              const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+              edgeMap.set(k, i / 2);
+            }
+          }
+          for (let i = 0; i < ctx.size; i++) {
+            const tri = Math.floor(i / 3);
+            const corner = i % 3;
+            const v0 = tris[tri * 3 + corner] ?? 0;
+            const v1 = tris[tri * 3 + (corner + 1) % 3] ?? 0;
+            const k = Math.min(v0, v1) + '_' + Math.max(v0, v1);
+            out[i] = edgeMap.get(k) ?? 0;
+          }
+          return out;
+        },
+      };
+      const prevEdgeField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const mesh = ctx.geometry.mesh;
+          const out = new Int32Array(ctx.size);
+          if (!mesh) return out;
+          const tris = mesh.triangles;
+          const edgeMap = new Map<string, number>();
+          const edges = mesh.edges();
+          if (edges) {
+            for (let i = 0; i < edges.length; i += 2) {
+              const a = edges[i]!, b = edges[i + 1]!;
+              const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+              edgeMap.set(k, i / 2);
+            }
+          }
+          for (let i = 0; i < ctx.size; i++) {
+            const tri = Math.floor(i / 3);
+            const corner = i % 3;
+            const v0 = tris[tri * 3 + (corner + 2) % 3] ?? 0;
+            const v1 = tris[tri * 3 + corner] ?? 0;
+            const k = Math.min(v0, v1) + '_' + Math.max(v0, v1);
+            out[i] = edgeMap.get(k) ?? 0;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, nextEdgeField);
+      cache.set(node.outputs[1]!.id, prevEdgeField);
+      return;
+    }
+    if (node instanceof GeometryNodeCurveOfPoint) {
+      const curveIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const curves = ctx.geometry.curves;
+          const out = new Int32Array(ctx.size);
+          if (!curves) return out;
+          for (let c = 0; c < curves.numCurves; c++) {
+            const start = curves.curveOffsets[c] ?? 0;
+            const end = curves.curveOffsets[c + 1] ?? start;
+            for (let i = start; i < end && i < ctx.size; i++) out[i] = c;
+          }
+          return out;
+        },
+      };
+      const idxInCurveField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const curves = ctx.geometry.curves;
+          const out = new Int32Array(ctx.size);
+          if (!curves) return out;
+          for (let c = 0; c < curves.numCurves; c++) {
+            const start = curves.curveOffsets[c] ?? 0;
+            const end = curves.curveOffsets[c + 1] ?? start;
+            for (let i = start; i < end && i < ctx.size; i++) out[i] = i - start;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, curveIdxField);
+      cache.set(node.outputs[1]!.id, idxInCurveField);
+      return;
+    }
+    if (node instanceof GeometryNodePointsOfCurve) {
+      const pointIdxField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const curves = ctx.geometry.curves;
+          const out = new Int32Array(ctx.size);
+          if (!curves) return out;
+          // For curve index ci, the first point is curveOffsets[ci]
+          for (let i = 0; i < ctx.size; i++) {
+            out[i] = i < curves.curveOffsets.length ? (curves.curveOffsets[i] ?? 0) : 0;
+          }
+          return out;
+        },
+      };
+      const totalField: Field = {
+        kind: 'INT',
+        eval(ctx) {
+          const curves = ctx.geometry.curves;
+          const out = new Int32Array(ctx.size);
+          if (!curves) return out;
+          for (let i = 0; i < ctx.size; i++) {
+            const start = curves.curveOffsets[i] ?? 0;
+            const end = curves.curveOffsets[i + 1] ?? start;
+            out[i] = end - start;
+          }
+          return out;
+        },
+      };
+      cache.set(node.outputs[0]!.id, pointIdxField);
+      cache.set(node.outputs[1]!.id, totalField);
       return;
     }
 
