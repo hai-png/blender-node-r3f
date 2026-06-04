@@ -14,7 +14,7 @@ import type { ValueCache, ExecCtx } from './NodeExecute';
 import { registerExecutor } from './NodeExecute';
 import type { Node } from '../core/Node';
 import type { Vec3, RGBA } from '../core/types';
-// (NodeSocket type re-imported transitively via Node; kept implicit to avoid unused.)
+import { rgbToHsv, hsvToRgb, rgbToHsl, hslToRgb } from './MathLib';
 
 import { ValueNode, RGBNode, VectorNode } from '../nodes/common/Value';
 import { MathNode } from '../nodes/common/Math';
@@ -44,69 +44,6 @@ function inp<T>(node: Node, name: string, cache: ValueCache, ctx: ExecCtx, fallb
 function out(node: Node, name: string, cache: ValueCache, value: unknown): void {
   const sock = node.outputs.find((s) => s.name === name || s.identifier === name);
   if (sock) cache.set(sock.id, value);
-}
-
-// ─── Color space conversions ────────────────────────────────────────────
-
-function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
-  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
-  let h = 0;
-  if (d > 0) {
-    if (max === r) h = ((g - b) / d) % 6;
-    else if (max === g) h = (b - r) / d + 2;
-    else h = (r - g) / d + 4;
-    h = (h * 60 + 360) % 360 / 360;
-  }
-  const s = max === 0 ? 0 : d / max;
-  return [h, s, max];
-}
-
-function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
-  const c = v * s;
-  const hp = h * 6;
-  const x = c * (1 - Math.abs((hp % 2) - 1));
-  const m = v - c;
-  let r = 0, g = 0, b = 0;
-  if (hp < 1) { r = c; g = x; }
-  else if (hp < 2) { r = x; g = c; }
-  else if (hp < 3) { g = c; b = x; }
-  else if (hp < 4) { g = x; b = c; }
-  else if (hp < 5) { r = x; b = c; }
-  else { r = c; b = x; }
-  return [r + m, g + m, b + m];
-}
-
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return [0, 0, l];
-  const d = max - min;
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h = 0;
-  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-  else if (max === g) h = (b - r) / d + 2;
-  else h = (r - g) / d + 4;
-  return [h / 6, s, l];
-}
-
-function hue2rgb(p: number, q: number, t: number): number {
-  if (t < 0) t += 1;
-  if (t > 1) t -= 1;
-  if (t < 1 / 6) return p + (q - p) * 6 * t;
-  if (t < 1 / 2) return q;
-  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-  return p;
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  if (s === 0) return [l, l, l];
-  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-  const p = 2 * l - q;
-  return [
-    hue2rgb(p, q, h + 1 / 3),
-    hue2rgb(p, q, h),
-    hue2rgb(p, q, h - 1 / 3),
-  ];
 }
 
 // ─── Registration ────────────────────────────────────────────────────────

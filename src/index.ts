@@ -62,6 +62,8 @@ import { registerGeometryNodes } from './nodes/geometry';
 import { registerCompositorNodes } from './nodes/compositor';
 import { registerTextureNodes } from './nodes/texture';
 import { registerCommonExecutors } from './eval/CommonExecutors';
+import { registerShaderExecutors } from './eval/shaders/ShaderNodeExecutors';
+import { registerGeometryExecutors } from './eval/geometry/GeometryNodeExecutors';
 import { NodeTree as _NodeTree } from './core/NodeTree';
 import { NodeRegistry as _NodeRegistry } from './registry/NodeRegistry';
 
@@ -88,6 +90,8 @@ export function bootstrapBuiltins(): void {
   // Wire registry-based executors for common nodes. Evaluators that opt into
   // dispatchNode() will use these instead of inlining instanceof chains.
   registerCommonExecutors();
+  registerShaderExecutors();
+  registerGeometryExecutors();
   // Install the registry hook so NodeTree.addZone() can find zone classes
   // without core/ depending on the registry module.
   _NodeTree._registryLookup = (id: string) => {

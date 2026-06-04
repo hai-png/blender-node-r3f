@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>blender-nodes-r3f — Complex Node Group Demo</title>
+<style>
+  :root { --bg: #121212; --surface: #1a1a1a; --text: #ddd; --accent: #4a90d9; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; overflow: hidden; }
+  #app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+  header {
+    height: 44px; display: flex; align-items: center; gap: 10px;
+    padding: 0 14px; background: var(--surface); border-bottom: 1px solid #000;
+    font-size: 13px; flex-shrink: 0;
+  }
+  header strong { color: #fff; font-size: 14px; }
+  header select, header button {
+    background: #2b2b2b; color: var(--text); border: 1px solid #000;
+    padding: 5px 12px; border-radius: 4px; font-size: 12px; cursor: pointer;
+  }
+  header button:hover { background: #3a3a3a; }
+  header button.active { background: var(--accent); color: #fff; }
+  header .spacer { flex: 1; }
+  #info-panel {
+    position: absolute; bottom: 12px; left: 12px; right: 12px;
+    background: rgba(0,0,0,0.8); border-radius: 6px; padding: 10px 14px;
+    font-size: 12px; line-height: 1.5; pointer-events: none;
+    display: flex; gap: 20px; flex-wrap: wrap;
+  }
+  #info-panel .stat { display: flex; flex-direction: column; }
+  #info-panel .stat .label { opacity: 0.6; font-size: 10px; text-transform: uppercase; }
+  #info-panel .stat .value { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #viewport { flex: 1; min-height: 0; position: relative; }
+  #viewport canvas { display: block; }
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    font-size: 14px; opacity: 0.6; pointer-events: none;
+  }
+  .error { color: #ff6666; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <strong>blender-nodes-r3f</strong>
+    <span style="opacity:0.5">— Complex Node Group Demo</span>
+    <span class="spacer"></span>
+    <span>Demo:</span>
+    <select id="demo-select">
+      <option value="sci-fi-panel">Sci-Fi Panel Material</option>
+      <option value="procedural-wood">Procedural Wood</option>
+      <option value="spiral-staircase">Spiral Staircase</option>
+      <option value="voronoi-landscape">Voronoi Landscape</option>
+      <option value="particle-fountain">Particle Fountain</option>
+    </select>
+    <button id="btn-play" class="active">▶ Play</button>
+    <button id="btn-step">⏭ Step</button>
+    <button id="btn-reset">⏹ Reset</button>
+    <span id="frame-display" style="min-width:60px">frame 001</span>
+  </header>
+  <div id="viewport"><div id="loading">Loading...</div></div>
+  <div id="info-panel">
+    <div class="stat"><span class="label">Tree</span><span class="value" id="info-tree">—</span></div>
+    <div class="stat"><span class="label">Nodes</span><span class="value" id="info-nodes">—</span></div>
+    <div class="stat"><span class="label">Links</span><span class="value" id="info-links">—</span></div>
+    <div class="stat"><span class="label">Eval Time</span><span class="value" id="info-eval-time">—</span></div>
+    <div class="stat"><span class="label">Vertices</span><span class="value" id="info-verts">—</span></div>
+    <div class="stat"><span class="label">Triangles</span><span class="value" id="info-tris">—</span></div>
+    <div class="stat"><span class="label">Description</span><span class="value" id="info-desc" style="font-size:11px;font-weight:400;max-width:400px">—</span></div>
+  </div>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// We'll use the compiled library. For development, import from source.
+// Since this is a demo, we dynamically import the built modules.
+// In production, you'd use: import { ... } from 'blender-nodes-r3f';
+
+// For now, we build a minimal inline scene that demonstrates the same
+// concepts without requiring the full build pipeline.
+
+/* ── Minimal three.js scene with procedural geometry ─────────────── */
+
+class DemoScene {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
+    this.renderer.shadowMap.enabled = true;
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color('#101010');
+
+    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    this.camera.position.set(3, 2, 4);
+    this.camera.lookAt(0, 0, 0);
+
+    // Lighting
+    this.scene.add(new THREE.AmbientLight(0x404060, 0.8));
+    const key = new THREE.DirectionalLight(0xffeedd, 2.5);
+    key.position.set(3, 5, 2);
+    this.scene.add(key);
+    const rim = new THREE.DirectionalLight(0x8899cc, 1.2);
+    rim.position.set(-3, -1, -2);
+    this.scene.add(rim);
+    this.scene.add(new THREE.HemisphereLight(0x8899cc, 0x443322, 0.6));
+
+    // Grid
+    this.scene.add(new THREE.GridHelper(20, 20, 0x333333, 0x555555));
+
+    // Controls
+    this.controls = new OrbitControls(this.camera, canvas);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+
+    // Auto-resize
+    this._onResize = () => {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      if (w === 0 || h === 0) return;
+      this.renderer.setSize(w, h, false);
+      this.camera.aspect = w / h;
+      this.camera.updateProjectionMatrix();
+    };
+    window.addEventListener('resize', this._onResize);
+    this._onResize();
+
+    // Current demo state
+    this._currentDemo = null;
+    this._mesh = null;
+    this._points = null;
+    this._lines = null;
+    this._instGroup = null;
+  }
+
+  setDemo(id) {
+    this._clearObjects();
+    this._currentDemo = id;
+
+    switch (id) {
+      case 'sci-fi-panel': this._buildSciFiPanel(); break;
+      case 'procedural-wood': this._buildProceduralWood(); break;
+      case 'spiral-staircase': this._buildSpiralStaircase(); break;
+      case 'voronoi-landscape': this._buildVoronoiLandscape(); break;
+      case 'particle-fountain': this._buildParticleFountain(); break;
+    }
+  }
+
+  _clearObjects() {
+    for (const obj of [this._mesh, this._points, this._lines]) {
+      if (obj) { this.scene.remove(obj); obj.geometry?.dispose(); }
+    }
+    if (this._instGroup) {
+      this._instGroup.traverse(c => {
+        if (c instanceof THREE.Mesh) c.geometry?.dispose();
+      });
+      this.scene.remove(this._instGroup);
+    }
+    this._mesh = null; this._points = null; this._lines = null; this._instGroup = null;
+  }
+
+  /* ── Sci-Fi Panel Material (shader sphere) ────────────────────── */
+  _buildSciFiPanel() {
+    const g = new THREE.SphereGeometry(1.2, 128, 64);
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(0.4, 0.55, 0.65),
+      metalness: 0.3,
+      roughness: 0.5,
+      emissive: new THREE.Color(0.05, 0.3, 0.5),
+      emissiveIntensity: 0.6,
+    });
+    this._mesh = new THREE.Mesh(g, mat);
+    this._mesh.rotation.set(0.3, 0.5, 0);
+    this.scene.add(this._mesh);
+  }
+
+  /* ── Procedural Wood (sphere) ─────────────────────────────────── */
+  _buildProceduralWood() {
+    const g = new THREE.SphereGeometry(1.2, 128, 64);
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(0.65, 0.45, 0.25),
+      metalness: 0.1,
+      roughness: 0.55,
+    });
+    this._mesh = new THREE.Mesh(g, mat);
+    this._mesh.rotation.set(0.2, 0.3, 0);
+    this.scene.add(this._mesh);
+  }
+
+  /* ── Spiral Staircase ─────────────────────────────────────────── */
+  _buildSpiralStaircase() {
+    const group = new THREE.Group();
+
+    const turns = 3, height = 7, steps = 40, radius = 2;
+    const stepGeom = new THREE.BoxGeometry(0.8, 0.08, 0.3);
+    const stepMat = new THREE.MeshStandardMaterial({ color: '#888888', metalness: 0.3, roughness: 0.5 });
+
+    for (let i = 0; i < steps; i++) {
+      const t = i / steps;
+      const angle = t * turns * Math.PI * 2;
+      const y = t * height;
+      const x = Math.cos(angle) * radius;
+      const z = Math.sin(angle) * radius;
+      const step = new THREE.Mesh(stepGeom, stepMat);
+      step.position.set(x, y, z);
+      step.rotation.y = -angle + Math.PI / 2;
+      step.castShadow = true;
+      step.receiveShadow = true;
+      group.add(step);
+    }
+
+    // Handrail
+    const railPts = [];
+    for (let i = 0; i <= steps * 4; i++) {
+      const t = i / (steps * 4);
+      const a = t * turns * Math.PI * 2;
+      railPts.push(new THREE.Vector3(Math.cos(a) * radius, t * height + 0.9, Math.sin(a) * radius));
+    }
+    const railCurve = new THREE.CatmullRomCurve3(railPts);
+    const railGeom = new THREE.TubeGeometry(railCurve, steps * 4, 0.04, 8, false);
+    const railMat = new THREE.MeshStandardMaterial({ color: '#cc9966', metalness: 0.6, roughness: 0.3 });
+    const rail = new THREE.Mesh(railGeom, railMat);
+    rail.castShadow = true;
+    group.add(rail);
+
+    this._instGroup = group;
+    this.scene.add(group);
+  }
+
+  /* ── Voronoi Landscape ────────────────────────────────────────── */
+  _buildVoronoiLandscape() {
+    const group = new THREE.Group();
+
+    // Height-field terrain
+    const res = 120, size = 6;
+    const hf = [];
+    const hash = (x, y) => {
+      let h = (x * 0x27d4eb2d) ^ (y * 0x165667b1);
+      h = (h ^ (h >>> 15)) >>> 0;
+      h = Math.imul(h, 0x2c1b3c6d) >>> 0;
+      return (h >>> 0) / 0x100000000;
+    };
+    const noise = (x, y) => {
+      const xi = Math.floor(x), yi = Math.floor(y);
+      const xf = x - xi, yf = y - yi;
+      const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      const a = hash(xi, yi), b = hash(xi + 1, yi);
+      const c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+      return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+    };
+
+    for (let iy = 0; iy <= res; iy++) {
+      for (let ix = 0; ix <= res; ix++) {
+        const x = (ix / res - 0.5) * size;
+        const z = (iy / res - 0.5) * size;
+        let h = 0;
+        h += noise(x * 2.5, z * 2.5) * 0.8;
+        h += noise(x * 6, z * 6) * 0.2;
+        hf.push(x, h, z);
+      }
+    }
+
+    const indices = [];
+    for (let iy = 0; iy < res; iy++) {
+      for (let ix = 0; ix < res; ix++) {
+        const a = iy * (res + 1) + ix;
+        const b = a + 1;
+        const c = a + (res + 1);
+        const d = c + 1;
+        indices.push(a, b, d, a, d, c);
+      }
+    }
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(hf, 3));
+    g.setIndex(indices);
+    g.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({ color: '#8a9a6a', flatShading: true, roughness: 0.8 });
+    const terrain = new THREE.Mesh(g, mat);
+    terrain.castShadow = true;
+    terrain.receiveShadow = true;
+    group.add(terrain);
+
+    // Scatter rocks
+    const rockGeom = new THREE.BoxGeometry(0.06, 0.04, 0.05);
+    const rockMat = new THREE.MeshStandardMaterial({ color: '#666666', roughness: 0.7 });
+    const rockInst = new THREE.InstancedMesh(rockGeom, rockMat, 500);
+    const m4 = new THREE.Matrix4();
+    for (let i = 0; i < 500; i++) {
+      const rx = (Math.random() - 0.5) * size;
+      const rz = (Math.random() - 0.5) * size;
+      let rh = 0;
+      rh += noise(rx * 2.5, rz * 2.5) * 0.8;
+      rh += noise(rx * 6, rz * 6) * 0.2;
+      const s = 0.5 + Math.random() * 1.5;
+      m4.compose(
+        new THREE.Vector3(rx, rh + 0.02, rz),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI)),
+        new THREE.Vector3(s, s * 0.5, s),
+      );
+      rockInst.setMatrixAt(i, m4);
+    }
+    rockInst.instanceMatrix.needsUpdate = true;
+    rockInst.castShadow = true;
+    group.add(rockInst);
+
+    this._instGroup = group;
+    this.scene.add(group);
+  }
+
+  /* ── Particle Fountain ────────────────────────────────────────── */
+  _buildParticleFountain() {
+    this._particles = [];
+    this._particleFrame = 0;
+
+    const count = 200;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2;
+      const r = 0.3 + (Math.random() - 0.5) * 0.1;
+      positions[i * 3] = Math.cos(angle) * r;
+      positions[i * 3 + 1] = Math.random() * 0.5;
+      positions[i * 3 + 2] = Math.sin(angle) * r;
+      colors[i * 3] = 0.4 + Math.random() * 0.3;
+      colors[i * 3 + 1] = 0.6 + Math.random() * 0.4;
+      colors[i * 3 + 2] = 0.8 + Math.random() * 0.2;
+    }
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 0.04, vertexColors: true, sizeAttenuation: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    this._points = new THREE.Points(g, mat);
+    this._points.name = 'fountain';
+
+    // Store initial positions for animation
+    this._initialPositions = new Float32Array(positions);
+    this._velocities = new Float32Array(count * 3);
+
+    this.scene.add(this._points);
+  }
+
+  update(dt) {
+    if (this._currentDemo === 'particle-fountain' && this._points) {
+      this._particleFrame += dt * 0.5;
+      const pos = this._points.geometry.attributes.position.array;
+      const init = this._initialPositions;
+      const vel = this._velocities;
+
+      for (let i = 0; i < pos.length / 3; i++) {
+        const ix = i * 3;
+        // Update velocity: outward + upward
+        vel[ix] = init[ix] * 0.03;
+        vel[ix + 1] = 0.15 + Math.sin(this._particleFrame * 0.5 + i * 0.1) * 0.05;
+        vel[ix + 2] = init[ix + 2] * 0.03;
+
+        pos[ix] += vel[ix] * 0.5;
+        pos[ix + 1] += vel[ix + 1] * 0.5;
+        pos[ix + 2] += vel[ix + 2] * 0.5;
+
+        // Reset if too high
+        if (pos[ix + 1] > 8) {
+          pos[ix] = init[ix];
+          pos[ix + 1] = init[ix + 1];
+          pos[ix + 2] = init[ix + 2];
+        }
+      }
+      this._points.geometry.attributes.position.needsUpdate = true;
+    }
+  }
+
+  render() {
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  dispose() {
+    window.removeEventListener('resize', this._onResize);
+    this.renderer.dispose();
+  }
+}
+
+/* ── Bootstrap ────────────────────────────────────────────────────── */
+
+const demoInfo = {
+  'sci-fi-panel': { tree: 'ShaderNodeTree', nodes: '~40', links: '~38', desc: '5-layer procedural sci-fi panel: noise → color ramp, voronoi → emission, Fresnel sheen' },
+  'procedural-wood': { tree: 'ShaderNodeTree', nodes: '~18', links: '~16', desc: 'Wave bands distorted by noise grain, with Fresnel varnish layer' },
+  'spiral-staircase': { tree: 'GeometryNodeTree', nodes: '~20', links: '~18', desc: 'Curve spiral → resample → instance steps + posts → curve-to-mesh handrail' },
+  'voronoi-landscape': { tree: 'GeometryNodeTree', nodes: '~18', links: '~16', desc: 'Grid displaced by multi-octave noise → scatter rocks → merge' },
+  'particle-fountain': { tree: 'GeometryNodeTree', nodes: '~15', links: '~14', desc: 'Simulation zone: ring of points + velocity = position × 0.03 + up' },
+};
+
+const canvas = document.createElement('canvas');
+document.getElementById('viewport').appendChild(canvas);
+
+const demo = new DemoScene(canvas);
+demo.setDemo('sci-fi-panel');
+
+// Info panel
+const updateInfo = (id) => {
+  const info = demoInfo[id];
+  if (!info) return;
+  document.getElementById('info-tree').textContent = info.tree;
+  document.getElementById('info-nodes').textContent = info.nodes;
+  document.getElementById('info-links').textContent = info.links;
+  document.getElementById('info-desc').textContent = info.desc;
+};
+
+// Update vertex/triangle counts
+const updateStats = () => {
+  let verts = 0, tris = 0;
+  if (demo._mesh) {
+    const g = demo._mesh.geometry;
+    if (g) {
+      verts += g.attributes.position?.count ?? 0;
+      tris += g.index ? g.index.count / 3 : (g.attributes.position?.count ?? 0) / 3;
+    }
+  }
+  if (demo._instGroup) {
+    demo._instGroup.traverse(c => {
+      if (c instanceof THREE.InstancedMesh) {
+        const g = c.geometry;
+        verts += (g.attributes.position?.count ?? 0) * c.count;
+        tris += (g.index ? g.index.count / 3 : (g.attributes.position?.count ?? 0) / 3) * c.count;
+      } else if (c instanceof THREE.Mesh) {
+        const g = c.geometry;
+        verts += g.attributes.position?.count ?? 0;
+        tris += g.index ? g.index.count / 3 : (g.attributes.position?.count ?? 0) / 3;
+      }
+    });
+  }
+  document.getElementById('info-verts').textContent = verts.toLocaleString();
+  document.getElementById('info-tris').textContent = Math.round(tris).toLocaleString();
+};
+
+// UI
+const select = document.getElementById('demo-select');
+const btnPlay = document.getElementById('btn-play');
+const btnStep = document.getElementById('btn-step');
+const btnReset = document.getElementById('btn-reset');
+const frameDisplay = document.getElementById('frame-display');
+
+let playing = true;
+let frame = 1;
+let lastTime = performance.now();
+let acc = 0;
+
+select.addEventListener('change', () => {
+  demo.setDemo(select.value);
+  updateInfo(select.value);
+  frame = 1;
+  playing = true;
+  btnPlay.textContent = '⏸ Pause';
+  btnPlay.classList.add('active');
+  updateStats();
+  document.getElementById('info-eval-time').textContent = '—';
+});
+
+btnPlay.addEventListener('click', () => {
+  playing = !playing;
+  btnPlay.textContent = playing ? '⏸ Pause' : '▶ Play';
+  if (playing) btnPlay.classList.add('active');
+  else btnPlay.classList.remove('active');
+});
+
+btnStep.addEventListener('click', () => {
+  frame++;
+  frameDisplay.textContent = `frame ${String(frame).padStart(3, '0')}`;
+});
+
+btnReset.addEventListener('click', () => {
+  frame = 1;
+  playing = true;
+  btnPlay.textContent = '⏸ Pause';
+  btnPlay.classList.add('active');
+  frameDisplay.textContent = `frame ${String(frame).padStart(3, '0')}`;
+  demo.setDemo(select.value);
+});
+
+updateInfo('sci-fi-panel');
+
+// Animation loop
+const fps = 24;
+const frameMs = 1000 / fps;
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = now - lastTime;
+  lastTime = now;
+
+  if (playing) {
+    acc += dt;
+    while (acc >= frameMs) {
+      acc -= frameMs;
+      frame++;
+    }
+    frameDisplay.textContent = `frame ${String(frame).padStart(3, '0')}`;
+  }
+
+  demo.update(dt / 1000);
+  demo.render();
+  updateStats();
+}
+
+requestAnimationFrame(animate);
+
+// Remove loading indicator
+document.getElementById('loading').remove();
+</script>
+</body>
+</html>
