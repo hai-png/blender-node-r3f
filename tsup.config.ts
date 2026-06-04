@@ -5,6 +5,7 @@
  *
  *   dist/index.{esm,cjs}.{js,d.ts}    — main public API
  *   dist/tsl.{esm,cjs}.{js,d.ts}      — TSL / WebGPU sub-entry (imports three/webgpu)
+ *   dist/bridge.{esm,cjs}.{js,d.ts}   — Blender bridge sub-entry
  *
  * Peer dependencies (three, react, @xyflow/react, zustand) are NOT bundled
  * so consumers bring their own versions.
@@ -19,6 +20,7 @@ export default defineConfig({
   entry: {
     index: 'src/index.ts',
     tsl: 'src/tsl.ts',
+    bridge: 'src/bridge.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,
